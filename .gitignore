@@ -1,0 +1,11 @@
+# OS files
+.DS_Store
+.idea/
+
+# node
+node_modules/
+
+# other
+AoPs-Scrape.iml
+env.js
+raw.json

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Get</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 1rem;
+            box-sizing: border-box;
+            font-family: sans-serif;
+            font-size: 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            padding: 1rem;
+            border: 2px solid grey;
+            border-radius: 1rem;
+            gap: 1rem;
+            height: 100%;
+            width: 100%;
+            overflow: auto;
+        }
+
+        #get-button {
+            border: 2px solid transparent;
+            color: rgb(24 67 35);
+            border-radius: 1rem;
+            background: rgb(221 234 224);
+            font-size: 1.5rem;
+            padding: 1rem;
+            opacity: 0.7;
+            transition: all 0.2s;
+            &:hover {
+                background: rgb(182 234 196);
+                border-color: rgb(24 67 35);
+                opacity: 0.85;
+            }
+            &:active {
+                opacity: 1;
+            }
+        }
+
+        #uh-oh-scrape {
+            border: 2px solid red;
+            background: rgb(250 154 175);
+            color: red;
+            font-size: 1.5rem;
+        }
+    </style>
+</head>
+<body>
+
+<script src="../env.js" type="module"></script>
+<script src="../contest_id.js" type="module"></script>
+
+<script src="../src/CleanupText.js" type="module"></script>
+<script src="../src/ForumSession.js" type="module"></script>
+
+
+<div class="container">
+    <label>ID
+<!-- 1167202 1035157 1189415-->
+        <input id="id-input" type="number" value="1035157" />
+    </label>
+    <label for="some-meths">Method</label>
+    <select id="some-meths">
+        <option value="test">Test</option>
+        <option value="forum">Forum</option>
+        <option value="all-tests">All Tests</option>
+    </select>
+    <button id="get-button">Retrieve</button>
+    <button id="uh-oh-scrape">Scrape ALL (use with caution)</button>
+    <div id="why-duh">
+        <json-viewer></json-viewer>
+    </div>
+</div>
+
+<script src="https://unpkg.com/@alenaksu/json-viewer@2.1.0/dist/json-viewer.bundle.js"></script>
+<script src="script.js" type="module" defer></script>
+
+</body>
+</html>
