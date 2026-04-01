@@ -7,8 +7,9 @@ async function main() {
     f = new ForumSession(
         ENV["AoPs-User"]["Anonymous"]["logged-in"],
         ENV["AoPs-User"]["Anonymous"]["user-id"],
-        ENV["AoPs-User"]["Anonymous"].sessionId
+        ENV["AoPs-User"]["Anonymous"]["session-id"]
     )
+    f.debug = true
     // console.log(await f.getTest(1035157))
     // console.log(await f.getTest)
 }

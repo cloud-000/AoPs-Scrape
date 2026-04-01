@@ -190,11 +190,11 @@ export const CONTEST_IDS = {
             "type": "collection",
             "name": "DMC",
             "id": 2332005
-        },
-        {
-            "name": "ZeMC",
-            "link": "https://benny-w.github.io/ZeMC/"
         }
+        /*{
+            "name": "ZeMC",
+            "link": "https://benny-w.github.io/ZeMC/",
+        }*/
     ],
     "NotMath": [
         {

@@ -7,8 +7,21 @@ export const FETCH_ = {
     FORUM: 2,
     ITEMS_CATEGORIES: 3,
 }
+// Spaghetti
+let addProblem = (p, sectionCounter, test) => {
+    if (sectionCounter >= 0) {
+        p.section = sectionCounter
+        test.problems[test.problems.length - 1].push(p)
+    } else {
+        test.problems.push(p)
+    }
+    ForumSession.onProblemAdd(p)
+}
+
 export class ForumSession {
     static MORE_INFO = null
+    static onProblemAdd(data) {}
+    static onTotalCount(data, name) {}
     static payload(f_type, params) {
         switch (f_type) {
             case FETCH_.TOPIC:
@@ -185,20 +198,29 @@ export class ForumSession {
             items.push(...response.new_items)
         }
         for (let i=0; i <items.length; ++i) {
-            if (items[i].item_type === "forum") {
+            if (
+                items[i].item_type === "forum" ||
+                items[i].item_type === "post"
+            ) {
                 // ignore forums
+                items[i] = null
                 continue;
             }
-            if (CONTEST_IDS.IGNORE.includes(items[i].item_id) || done.includes(items[i].item_id) ) {
+            if (CONTEST_IDS.IGNORE.includes(items[i].item_id) || done.includes(items[i].item_id)) {
                 // ignore already done things
                 this.log(`Ignoring: ${items[i].item_id}`)
-                break;
+                items[i] = null
+                continue;
             }
+        }
+        items = items.filter(item => (item !== null))
+
+        for (let i = 0; i < items.length; i++) {
             this.log(items[i])
             switch (items[i].item_type) {
                 case "folder":
                     this.log("========")
-                    let subTests = await this.getAllTests(items[i].item_id, type,shownDepth - 1, done)
+                    let subTests = await this.getAllTests(items[i].item_id, type, shownDepth - 1, done)
                     pCount += subTests.count
                     if (shownDepth > 0) {
                         tests.push(subTests)
@@ -212,8 +234,6 @@ export class ForumSession {
                     let t = (await this.getTest(items[i].item_id, type))
                     pCount += t.count
                     tests.push(t)
-                    break;
-                case "post":
                     break;
                 default:
                     this.log("What da " + items[i].item_type)
@@ -252,6 +272,7 @@ export class ForumSession {
             ForumSession.payload(FETCH_.CATEGORY_DATA, {"id": id})
         )).response
         this.log(response)
+        ForumSession.onTotalCount(response.category, "test")
         test.name = response.category.category_name;
         test.year = CleanupText.extractYear(test.name)
         let type = ForumSession.inferType(response.category.category_name, true)
@@ -264,15 +285,7 @@ export class ForumSession {
         let n = 0;
         let isPrevMulti = false;
         let pCount = 0;
-        let addProblem = (p) => {
-            if (sectionCounter >= 0) {
-                p.section = sectionCounter
-                test.problems[test.problems.length - 1].push(p)
-            } else {
-                test.problems.push(p)
-            }
-            pCount++;
-        }
+
         let item;
         let isOly = (type.computational === false)
         for (let i = 0; i < response.category.items.length; ++i) {
@@ -320,7 +333,8 @@ export class ForumSession {
                         if (type.choices) {
                             problem.choices = CleanupText.extractChoices(isMulti[j])
                         }
-                        addProblem(problem)
+                        addProblem(problem, sectionCounter, test)
+                        pCount++
                     }
                     n += isMulti.length
                 } else {
@@ -358,7 +372,8 @@ export class ForumSession {
                             problem.answer = 0
                         }
                     }
-                    addProblem(problem)
+                    addProblem(problem, sectionCounter, test)
+                    pCount++
                     n++
                 }
             }
