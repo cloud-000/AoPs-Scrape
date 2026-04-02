@@ -6,6 +6,7 @@
 node_modules/
 
 # other
+scrape_data/
 AoPs-Scrape.iml
 env.js
 raw.json

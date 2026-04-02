@@ -129,6 +129,19 @@ export const CONTEST_IDS = {
             "name": "EMCC",
             "id": 4718194,
             "link": "https://exetermathclub.com/archives"
+        },
+        {
+            "name": "Putnam",
+            "id": 3249,
+            "link": "https://kskedlaya.org/putnam-archive/"
+        },
+        {
+            "name": "mathleague.org",
+            "id": 134,
+            "type": "forum",
+            "rules": {
+                
+            }
         }
     ],
     "UserMocks": [
@@ -190,11 +203,26 @@ export const CONTEST_IDS = {
             "type": "collection",
             "name": "DMC",
             "id": 2332005
-        }
-        /*{
+        },
+        {
             "name": "ZeMC",
+            "ids": [
+                2505703,
+                3211241,
+                3623297,
+            ],
             "link": "https://benny-w.github.io/ZeMC/",
-        }*/
+        },
+        {
+            "name": "Solstice Math Olympiads",
+            "id": 3072130,
+            "type": "forum"
+        },
+        {
+            "name": "2025 DISCUS AMC",
+            "id": 4624886,
+            "type": "forum"
+        },
     ],
     "NotMath": [
         {

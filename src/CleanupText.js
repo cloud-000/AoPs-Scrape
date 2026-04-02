@@ -151,4 +151,36 @@ export class CleanupText {
         return match ? match[0] : null;
     }
 
+    // TODO
+    static parseForum(posts, rules, f) {
+        let tests = {}
+        let currentRule
+        let n
+        let name
+        for (let i = 0; i < posts.length; i++) {
+            let post = posts[i];
+            currentRule = null
+            for (let rule of rules) {
+                if (rule.regex.test(post.topic_title)) {
+                    let matches = rule.regex.match(post.topic_title)
+                    matches = rule.matches.map(j => matches[j])
+                    n = rule.n ? rule.n.apply(null, [matches]) : matches[0]
+                    name = rule.name.apply(null, [matches, CleanupText.extractYear(post["category_name"])])
+                    currentRule = rule
+                    break
+                }
+            }
+            if (currentRule == null) {
+                continue;
+            }
+            if (!tests[name]) {
+                tests[name] = {problems: []}
+            }
+            if (n == null) {
+                // test[name].push(f.getProblem())
+            }
+
+        }
+        return tests
+    }
 }

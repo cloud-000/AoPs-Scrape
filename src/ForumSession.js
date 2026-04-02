@@ -21,7 +21,6 @@ let addProblem = (p, sectionCounter, test) => {
 export class ForumSession {
     static MORE_INFO = null
     static onProblemAdd(data) {}
-    static onTotalCount(data, name) {}
     static payload(f_type, params) {
         switch (f_type) {
             case FETCH_.TOPIC:
@@ -214,7 +213,6 @@ export class ForumSession {
             }
         }
         items = items.filter(item => (item !== null))
-
         for (let i = 0; i < items.length; i++) {
             this.log(items[i])
             switch (items[i].item_type) {
@@ -266,13 +264,13 @@ export class ForumSession {
     async getTest(id, testType=null) {
         let test = {
             sections: [],
-            problems: []
+            problems: [],
+            id: id
         }
         let response = (await this.sendRequest(
             ForumSession.payload(FETCH_.CATEGORY_DATA, {"id": id})
         )).response
         this.log(response)
-        ForumSession.onTotalCount(response.category, "test")
         test.name = response.category.category_name;
         test.year = CleanupText.extractYear(test.name)
         let type = ForumSession.inferType(response.category.category_name, true)
