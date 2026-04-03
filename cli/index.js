@@ -71,6 +71,25 @@ async function main() {
             let tests_data = []
             let problems_data = []
             let s_id = 0, t_id = 0, p_id = 0
+            let addProblem = (problem, test) => {
+                problems_data.push({
+                    id: p_id,
+                    test_id: t_id,
+                    // series_id: s_id,
+                    // redirect: null
+                    // created_at
+                    statement: problem.statement,
+                    n: problem.n,
+                    answer_index: (problem.answer === null) ? -1 : problem.answer,
+                    answers: problem.choices ? problem.choices : [],
+                    difficulty: 0,
+                    quality: 0,
+                    verified: false,
+                    aops_id: problem["topic_id"],
+                    topic: "O",
+                    is_computational: test.computational || false,
+                })
+            }
             for (let series of data) {
                 series_data.push({
                     id: s_id,
@@ -93,23 +112,26 @@ async function main() {
                             is_computational: test.computational,
                         })
                         for (let problem of test.problems[i]) {
-                            problems_data.push({
-                                id: p_id,
-                                test_id: t_id,
-                                // series_id: s_id,
-                                // redirect: null
-                                // created_at
-                                statement: problem.statement,
-                                n: problem.n,
-                                answer_index: (problem.answer === null) ? -1 : problem.answer,
-                                answers: problem.choices ? problem.choices : [],
-                                difficulty: 0,
-                                quality: 0,
-                                verified: false,
-                                aops_id: problem["topic_id"],
-                                topic: "O",
-                                is_computational: test.computational || false,
-                            })
+                            addProblem(problem, test)
+                            p_id++
+                        }
+                        t_id++
+                    }
+                    if (test.sections.length === 0) {
+                        tests_data.push({
+                            id: t_id,
+                            series: s_id,
+                            name: test.name,
+                            year: test.year,
+                            links: [],
+                            quality: 0,
+                            difficulty: 0,
+                            // user_id: null
+                            aops_id: test.id,
+                            is_computational: test.computational,
+                        })
+                        for (let problem of test.problems) {
+                            addProblem(problem, test)
                             p_id++
                         }
                         t_id++
@@ -117,6 +139,8 @@ async function main() {
                 }
                 s_id++
             }
+            // console.log(problems_data)
+            fs.writeFile("scrape_data/problems.json", JSON.stringify(problems_data, null, 2))
             fs.writeFile("scrape_data/series.csv", JSONToCSV(series_data))
             fs.writeFile("scrape_data/tests.csv", JSONToCSV(tests_data))
             fs.writeFile("scrape_data/problems.csv", JSONToCSV(problems_data))
@@ -139,7 +163,10 @@ function JSONToCSV(data) {
                 text += `"${d.join(",")}"`
             } else {
                 if (d != null) {
-                    text += `"${d}"`
+                    text +=
+                        (typeof d === "string") ? 
+                            sanitizeStringCSV(d) :
+                            d
                 }
             }
             if (j < keys.length - 1) {
@@ -151,6 +178,19 @@ function JSONToCSV(data) {
         }
     }
     return text
+}
+
+function sanitizeStringCSV(content) {
+    content = content.replace(/\r\n/g, "\n")
+    if (/[",\n\r]/.test(content)) {
+        return `"${content.replace(/"/g, '""')}"`;
+    }
+    return content
+    /*let data = str
+    if (str.includes('"') || str.includes(',') || str.includes('\n')) {
+        data = `${str.replace(/"/g, '"')}`;
+    }
+    return `${data.replace(/\n/g, "\\n")}`*/
 }
 
 async function sleep(time) {await new Promise(resolve => setTimeout(resolve, time));}

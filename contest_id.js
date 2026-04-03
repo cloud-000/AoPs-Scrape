@@ -223,6 +223,11 @@ export const CONTEST_IDS = {
             "id": 4624886,
             "type": "forum"
         },
+        {
+            "type": "collection",
+            "name": "CNCM",
+            "id": 1282021
+        }
     ],
     "NotMath": [
         {
@@ -242,4 +247,7 @@ export const CONTEST_IDS = {
 const SOLUTION_USERS = [
     {"id": 672616, "name": "lpieleanu"},
     {"id": 86424, "name": "Mrdavid445"}
+]
+export const POST_USERS = [
+    {id: 167643, "name": "parmenides51"}
 ]

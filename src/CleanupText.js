@@ -1,5 +1,14 @@
 export class CleanupText {
-    static multiNregex = /^\s*(\d+\.\s+.+)(\n\s*\n|\n)(\d+\.\s+.+)(?:\n\s*\n|\n(\d+\.\s+.+))*$/s
+    static multiLineRegexes = [
+        {
+            regex:
+                /^\s*(\d+\.\s+.+)(\n\s*\n|\n)(\d+\.\s+.+)(?:\n\s*\n|\n(\d+\.\s+.+))*$/s,
+            line: (n) => {
+                return new RegExp(`^(?:p${n}|${n})\\.\\s*(.+)$`)
+            },
+            index: 1,
+        }
+    ]
     static imgAsyRegex = /<img\b[^>]*\bclass\s*=\s*["']asy-image["'][^>]*>/gi
     static formatLatex (string) {
         return string
@@ -60,23 +69,31 @@ export class CleanupText {
             return `[asy=${matches[count - 1]}]${content}[/asy]`;
         })
     }
-    static checkContainsMultiple(str, startN=1) {
-        if (CleanupText.multiNregex.test(str)) {
+    static checkContainsMultiple(str, startN=1, loose=false) {
+        if (loose) {
+            str = str.replace(/^\[i\].*?\[\/i\]/i, ''); // replace any [i] tag the beginning
+        }
+        let theRegex = null
+        for (let i = 0; i < this.multiLineRegexes.length; i++) {
+            if (this.multiLineRegexes[i].regex.test(str)) {
+                theRegex = this.multiLineRegexes[i]
+                break;
+            }
+        }
+        if (theRegex !== null) {
             let lines = str.split("\n").map(l => l.trim()).filter(l => l !== "")
             let statements = []
             let n = 0
             let text = ""
             for (let i = 0; i < lines.length; ++i) {
-                                                            //                 ^(?:p${num}|${num})\\.\\s*(.+)
-                let match = lines[i].match(new RegExp(`^(?:p${startN + n}|${startN + n})\\.\\s*(.+)$`))
-
+                let match = lines[i].match(theRegex.line(startN + n))
                 if (!match) {
                     text += "\n" + lines[i]
                 } else {
                     if (statements.length > 0) {
                         statements[statements.length - 1] += text
                     }
-                    statements.push(match[1])
+                    statements.push(match[theRegex.index])
                     text = ""
                     n++
                 }
@@ -182,5 +199,39 @@ export class CleanupText {
 
         }
         return tests
+    }
+    // AI generated (dynamic regex):
+    // Dynamic regex for any BBCode style [tag]N[/tag] numbered list
+    static makeBBCodeRegex(tag) {
+        // Escape special regex characters
+        const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // Pattern for a single item: [tag]Number[/tag] + text
+        const item = `\\[${escapedTag}\\](p?\\d+\\.?)\\[/${escapedTag}\\]\\s+.+`;
+
+        // Separator: newline or blank line
+        const sep = `(\\n\\s*\\n|\\n)`;
+
+        // Require at least two items, allow additional optional items
+        const pattern = `^\\s*(${item})${sep}(${item})(?:${sep}(${item}))*$`;
+
+        return new RegExp(pattern, 's'); // 's' = dotAll mode
+    }
+    static allBBCodeRegex(tag) {
+        return {
+            regex: this.makeBBCodeRegex(tag),
+            line: function (number) {
+                const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+                // Matches either N or pN, optional dot, then text
+                const pattern = `^\\[${escapedTag}\\](p?${number}\\.?)\\[/${escapedTag}\\]\\s*(.+)$`;
+
+                return new RegExp(pattern);
+            },
+            index: 2
+        }
+    }
+    static {
+        this.multiLineRegexes.push(this.allBBCodeRegex("b"))
     }
 }

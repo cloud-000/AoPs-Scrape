@@ -66,7 +66,6 @@
 <script src="../src/CleanupText.js" type="module"></script>
 <script src="../src/ForumSession.js" type="module"></script>
 
-
 <div class="container">
     <label>ID
 <!-- 1167202 1035157 1189415 3777656 -->
@@ -87,6 +86,18 @@
 
 <script src="https://unpkg.com/@alenaksu/json-viewer@2.1.0/dist/json-viewer.bundle.js"></script>
 <script src="script.js" type="module" defer></script>
+
+<script type="module">
+    import {CleanupText} from "../src/CleanupText.js";
+    window.CleanupText = CleanupText
+    console.log(
+        CleanupText.checkContainsMultiple(
+"[b]p1.[/b] If there are $7$ people sitting around a round table, how many distinct ways are there for them to sit?(If rotating the table will make two combinations the same, then it's not unique).\n\n\n[b]p2.[/b] What is the sum of the coe\u000ecients of the function $f(x) = (3x+1)^5$ when expanded out.\n\n\n[b]p3.[/b] If $x$ and $x^2 - 1$ are both prime and $x$ is a positive integer, find all such $x$.\n\n\n[b]p4.[/b] Given a regular tetrahedron with side lengths of $12$, the length of the altitude of the tetrahedron(the distance from the apex of the tetrahedron to the center of the base) can be expressed as $m\\sqrt{n}$ in simplest form. Find $m + n$.\n\n\n[b]p5.[/b] There are $5$ watermelons. The sum of the weights of all $10$ possible pairs of watermelons are $12$, $14$, $15$, $16$, $17$, $19$, $20$, $21$, $23$, $25$. If the weight of the third heaviest watermelon is $w$, find $2w$.\n\n\n[b]p6.[/b] Let $F_n = 2-4+8-16+32-64... (-1)^{n-1}2^n$. $F_{2021} -n F_{2019}$ can be expressed in the form $2^x$ where $x$ is a positive real number. Find $x$.\n\n\n[b]p7.[/b] If $x + \\frac{1}{x}=\\sqrt3 + \\frac15$ , then the value of $\\frac{x^2}{1+3x^2+x^4}$ can be expressed in the form $\\frac{a}{b+c\\sqrt{d}}$ in simplest form. Find $a + b + c + d$.\n\n\n[b]p8.[/b] In $\\vartriangle ABC$, point $E$ is on segment $AB$ such that $AE : EB = 5 : 2$, point $D$ is on segment $BC$ such that $BD : DC = 4 : 5$, and point $G$ is on segment $AC$ such that $AG : GC = 3 : 2$. Segments $ED$ and $BG$ intersect at point $F$. $BF/FG$ can be expressed as $m/n$ in its simplest form. What is $m + n$.\n\n\n[b]p9.[/b] There exists triangle $ABC$ and a point $P$ that lies on the extension of $BC$, closer to $C$. Point $Q$ is the midpoint of $AB$, and point $R$ is the intersection between $AC$ and $PQ$. If $AR = 5$, $RC = 3$, and $CP = 4$, the length of $BC$ can be written as $\\frac{m}{n}$ . Find $100m + n$.\n\n\n[b]p10.[/b] We construct a sequence recursively as follows: Set $a_0 = 0$. For $n \\ge 0$,\n$$a_{n+1} = \\begin{cases} \na_n + n, \\,\\,\\,\\, if \\,\\,\\,\\, a_n \\le  n \\\\\na_n - n, \\,\\,\\,\\, otherwise \\end{cases}$$\nLet $k$ be the number of integers such that $a_k < k \\le 3^{2020}$. Find $2k + 2$.\n\n\nPS. You should use hide for answers.  Collected [url=https://artofproblemsolving.com/community/c5h2760506p24143309]here[/url]."
+
+        )
+    // \n[b]p2.[/b] In triangles $\vartriangle ABC$ and $\vartriangle DEF$, $DE = 4AB$")
+    )
+</script>
 
 </body>
 </html>

@@ -1,5 +1,5 @@
 import {CleanupText} from "./CleanupText.js";
-import {CONTEST_IDS, TYPES} from "../contest_id.js";
+import {CONTEST_IDS, POST_USERS, TYPES} from "../contest_id.js";
 
 export const FETCH_ = {
     TOPIC: 0,
@@ -64,6 +64,7 @@ export class ForumSession {
         if (name.includes("RML")) {
             return TYPES.ARML
         }
+        // if (name.includes("CNCM"))
         if (/[A-Z]MC/.test(name)) {
             if (/\b8\b/.test(name)) {
                 TYPES.AMC.name = "AMC 8"
@@ -309,7 +310,15 @@ export class ForumSession {
                     // isOly = true, but since we already ...
                     type = TYPES.AMO
                 }
-                test.sections.push(item.post_data.post_canonical)
+                // Ignore mixer round of chmmc
+                if (item.post_data.post_canonical.trim() === "Mixer Round") {
+                    continue
+                }
+                // double post of individual round as separate (see c3012774)
+                if (test.sections.length > 0
+                    && item.post_data.post_canonical.trim() === test.sections[test.sections.length - 1]) {
+                }
+                test.sections.push(item.post_data.post_canonical.trim())
                 sectionCounter++
                 n = 0
                 isPrevMulti = false
@@ -317,11 +326,18 @@ export class ForumSession {
             } else if (
                 item.post_data.post_type === "forum"
                 && item.item_type !== "post_hidden"
+                && item.post_data.post_id !== 4956172 // MAA copyright post
+                && item.item_text !== "Mixer" // Chmmc mixer rounds are pain to parse
             ) {
                 let processed = CleanupText.toAsyLinks(item.post_data.post_canonical, item.post_data.post_rendered)
                 let isMulti;
                 if ((n === 0 || isPrevMulti) && (isMulti = CleanupText.checkContainsMultiple(processed, n + 1)).length > 1) {
                     isPrevMulti = true
+                    if (item.post_data.poster_id === POST_USERS[0].id) { // paramenides posted
+                        if (isMulti.length > 0) { // remove his PS statement
+                            isMulti[isMulti.length - 1] = isMulti[isMulti.length - 1].replace(/P\.?S\.?.*hide for answers.*$/i, "").trim();
+                        }
+                    }
                     for (let j = 0; j < isMulti.length; ++j) {
                         let problem = {
                             statement: CleanupText.cleanChoices(isMulti[j]),
@@ -332,6 +348,7 @@ export class ForumSession {
                             problem.choices = CleanupText.extractChoices(isMulti[j])
                         }
                         addProblem(problem, sectionCounter, test)
+                        problem = null
                         pCount++
                     }
                     n += isMulti.length
