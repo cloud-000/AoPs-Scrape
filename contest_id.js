@@ -1,19 +1,23 @@
 export const TYPES = {
-    OMMC: {id: -1, computational: true, name: "OMMC", choices: false},
     AMC: {id: 0, computational: true, name: "AMC", choices: true},
     AIME: {id: 1, computational: true, name: "AIME", choices: false},
-    AMO: {id: 2, computational: false, name: "US(J)AMO", choices: false},
-    HMMT: {id: 4, computational: true, name: "HMMT", choices: false},
-    COMPUTE: {id: 97, computational: true, name: "COMPUTE", choices: false},
+    AMO: {id: 2, computational: false, name: "OLY", choices: false},
+
+    COLLEGE: {id: 4, computational: true, name: "COLL", choices: false},
+
+    COMPUTE: {id: 97, computational: true, name: "COMP", choices: false},
+
     ARML: {id: 98, computational: true, name: "ARML", choices: false},
-    UNKNOWN: {id: 99, computational: null, name: null}
+    // OMMC: {id: -1, computational: true, name: "OMMC", choices: false},
+    UNKNOWN: {id: 99, computational: null, name: null, choices: false},
 }
 
 export const CONTEST_IDS = {
     "IGNORE": [
         4491998, // para made OMMC collection
         4479828,
-        3685109 // 2013 USAYNO (NIMO 2-13 Q11)
+        3685109, // 2013 USAYNO (NIMO 2-13 Q11)
+        2982588, // FMM duplicate
     ],
     "MAA": [
         {
@@ -214,9 +218,30 @@ export const CONTEST_IDS = {
             "link": "https://benny-w.github.io/ZeMC/",
         },
         {
-            "name": "Solstice Math Olympiads",
+            "name": "Solstice Math Olympiads (SSMO)",
             "id": 3072130,
-            "type": "forum"
+            "type": "forum",
+            "rules": {
+                names: [
+                    {
+                        regex:  /^(W|S)?SMO (\d{4}) Relay Round (\d+) (?:Problem|Question) (\d+)/,
+                        metadata: (matches) => {return {
+                            year: matches[2],
+                            name: `${matches[1]}SMO ${matches[2]} Relay ${matches[3]}`,
+                            n: matches[4],
+                        }}
+                    },
+                    {
+                        regex: /^(W|S)?SMO\s+(\d{4})\s*([^\s]+)\s*(?:Round)?\s+Problem\s*(\d+)/,
+                        metadata: (matches) => {return {
+                            year: matches[2],
+                            name: `${matches[1]}SMO ${matches[2]} ${matches[3]}`,
+                            n: matches[4],
+                        }}
+                    }
+                ],
+                posters: ["SMO_Team", "mudkip42"]
+            }
         },
         {
             "name": "2025 DISCUS AMC",
@@ -231,6 +256,7 @@ export const CONTEST_IDS = {
     ],
     "NotMath": [
         {
+            "ignore": true,
             "name": "F = MA",
             "id": 3421,
             "link": "https://aapt.org/physicsteam/PT-exams.cfm"

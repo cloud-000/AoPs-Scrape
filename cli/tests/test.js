@@ -1,3 +1,5 @@
+import {ForumSession} from "../../src/ForumSession.js";
+
 class CLIElement {
     constructor() {}
     done() {return true}
@@ -127,28 +129,50 @@ async function main() {
     }, 200);
 }
 
-/*import {CleanupText} from "../../src/CleanupText.js";
+import {CleanupText} from "../../src/CleanupText.js";
 import { promises as fs } from 'node:fs';
+import {ENV} from "../../env.js";
 
 try {
-    const data = await fs.readFile("raw.json")
-    const jsonData = JSON.parse(data)
-    console.log(CleanupText.parseForum(data, [
-        {
-            regex: /\(ZeMC \d+ P\d+\)$/,
-            matches: [1],
-            name: (matches, year) => {
-                return `${year} ZeMC 10`
-            }
-        },
-        {
-            regex: /^\(ZIME P(\d+)\)$/,
-            matches: [1],
-            name: (matches, year) => {
-                return `${year} ZIME`
-            }
-        }
-    ]))
+    // let text = "In square $ABCD$ with side length $2$, let $\\omega_1$ be a circle with its center at $A$ and radius $AB$. Let $\\omega_2$ be a circle with its center at $D$ and with radius $DC$. There exists a circle with radius $r$ that is externally tangent to both $\\omega_1$ and $\\omega_2$ and tangent to $BC$. What is $r$?\n\n[asy=https://latex.artofproblemsolving.com/2/0/1/201135c32840f1b1221c711b3a465376bed55d63.png]\nsize(4cm);\ndraw(scale(.5)*((-1,-1)--(1,-1)--(1,1)--(-1,1)--cycle));\npath p = arc((-.5,-.5),1,0,90);\npath q = arc((.5,-.5),-1,0,-90);\ndraw(p);\ndraw(q);\ndraw(circle((0,0.4375),0.0625));\n[/asy]\n\n$\\textbf {(A) } \\frac{1}{8} \\qquad \\textbf {(B) } \\frac{1}{7} \\qquad \\textbf {(C) } \\frac{1}{6} \\qquad \\textbf {(D) } \\frac{1}{5} \\qquad \\textbf {(E) } \\frac{1}{4}"
+    // console.log(CleanupText.extractChoices(text))
+    /*let text = `
+Given that $mx + k = 9$ and $(m+k)x = 15$ for positive integers $m$, $k$ and $x$, find $kx + m$.\n\n$\\textbf{(A) }8\\qquad\\textbf{(B) }9\\qquad\\textbf{(C) }10\\qquad\\textbf{(D) }11\\qquad\\textbf{(E) }12$    
+    `
+    console.log(CleanupText.cleanProblem(text))
+    console.log("#".repeat(10))
+    console.log(CleanupText.extractChoices(text))
+    console.log("#".repeat(10))
+    console.log(CleanupText.cleanChoices(text))*/
+    // const data = await fs.readFile("raw.json")
+    // const jsonData = JSON.parse(data)
+    // let user = ENV["AoPs-User"]["clod"]
+    // let f = new ForumSession(
+    //     user["logged-in"],
+    //     user["user-id"],
+    //     user["session-id"],
+    //     user["headers"] || null
+    // )
+
+    // f.debug = false
+    // console.log(await CleanupText.parseForum(jsonData, {}, f, null))
+
+    // console.log(CleanupText.parseForum(data, [
+    //     {
+    //         regex: /\(ZeMC \d+ P\d+\)$/,
+    //         matches: [1],
+    //         name: (matches, year) => {
+    //             return `${year} ZeMC 10`
+    //         }
+    //     },
+    //     {
+    //         regex: /^\(ZIME P(\d+)\)$/,
+    //         matches: [1],
+    //         name: (matches, year) => {
+    //             return `${year} ZIME`
+    //         }
+    //     }
+    // ]))
 } catch (e) {
     console.error(e)
-}*/
+}

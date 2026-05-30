@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import {input, confirm, select, number, search} from '@inquirer/prompts';
 import {ENV} from "../env.js"
-import {ForumSession} from "../src/ForumSession.js"
+import {FETCH_, ForumSession} from "../src/ForumSession.js"
 import { promises as fs } from 'node:fs';
 import {CONTEST_IDS} from "../contest_id.js";
 import {CLIBar, CLIBarManager, CLICount} from "./tests/test.js";
+import {CleanupText} from "../src/CleanupText.js";
 
 const command = process.argv[2];
 ForumSession.onProblemAdd = (data) => {
@@ -23,6 +24,14 @@ async function main() {
     ].filter(c => c.id && c.type !== "forum") // forum's not implemented yet
     let data;
     switch (command) {
+        case "scrape-all":
+            if (!await confirm({message: "Are you sure?", default: false})) {
+                process.exit(0)
+            }
+            for (let contest of ALL_CONTESTS) {
+                console.log(contest)
+            }
+            break;
         case "scrape":
             let user = await getUser()
             let f = new ForumSession(
@@ -67,6 +76,7 @@ async function main() {
             console.log("TO - CSV")
             data = await fs.readFile("raw.json")
             data = JSON.parse(data)
+            if (!Array.isArray(data)) { data = [data] }
             let series_data = []
             let tests_data = []
             let problems_data = []
@@ -80,13 +90,14 @@ async function main() {
                     // created_at
                     statement: problem.statement,
                     n: problem.n,
-                    answer_index: (problem.answer === null) ? -1 : problem.answer,
+                    answer_index:
+                        (problem?.choices[0] === null) ? -1 : ((problem.answer === null) ? -1 : problem.answer),
                     answers: problem.choices ? problem.choices : [],
                     difficulty: 0,
                     quality: 0,
                     verified: false,
                     aops_id: problem["topic_id"],
-                    topic: "O",
+                    topic: CleanupText.inferACGN(problem.statement),
                     is_computational: test.computational || false,
                 })
             }
@@ -102,8 +113,8 @@ async function main() {
                         tests_data.push({
                             id: t_id,
                             series: s_id,
-                            name: `${test.name} + ${test.sections[i]}`,
-                            year: test.year,
+                            name: `${test.name} ${test.sections[i]}`,
+                            year: test.year ?? CleanupText.extractYear(test.sections[i]),
                             links: [],
                             quality: 0,
                             difficulty: 0,
@@ -122,7 +133,7 @@ async function main() {
                             id: t_id,
                             series: s_id,
                             name: test.name,
-                            year: test.year,
+                            year: test.year ?? -1,
                             links: [],
                             quality: 0,
                             difficulty: 0,
@@ -146,6 +157,19 @@ async function main() {
             fs.writeFile("scrape_data/problems.csv", JSONToCSV(problems_data))
             console.log("Done!")
             break;
+        case "quick-fix":
+            data = await fs.readFile("scrape_data/problems.json")
+            data = JSON.parse(data)
+            for (let p of data) {
+                if (p.answers.length === 0) {
+                    p.answers = CleanupText.extractChoices(p.statement)
+                }
+                p.statement = CleanupText.cleanChoices(p.statement)
+            }
+            fs.writeFile("scrape_data/problems.json", JSON.stringify(data, null, 2))
+            fs.writeFile("scrape_data/problems.csv", JSONToCSV(data))
+            console.log("Saved!")
+            break;
         default:
             console.log("test")
             break;
@@ -160,7 +184,7 @@ function JSONToCSV(data) {
         for (let j = 0; j < keys.length; j++) {
             let d = data[i][keys[j]]
             if (Array.isArray(d)) {
-                text += `"${d.join(",")}"`
+                text += `"[${d.map(a => `""${a.replace(/\\/g, "\\\\")}""`).join(",")}]"`
             } else {
                 if (d != null) {
                     text +=
@@ -219,28 +243,32 @@ async function getMethod(message="Select method") {
             {
                 name: "All Tests",
                 value: (async (f, id) => {
-                    return await f.getAllTests(id, null, 0, [], false)
+                    return await f.getAllTests(id, null, 0, new Set(), false)
                 }),
                 description: "Get all tests from a collection",
             },
             {
                 name: "Forum",
                 value: (async (f, id) => {
-                    throw new Error("Forums scrape not completed...")
-                    // return await f.getForum(id)
+                    // throw new Error("Forums scrape not completed...")
+                    return await f.getForum(id)
                 }),
                 description: "Gets all posts from a forum",
             },
             {
-                name: "All",
+                name: "Topic",
                 value: (async (f, id) => {
-                    if (!await confirm({message: "Are you sure?", default: false})) {
-                        process.exit(0)
+                    let r =  (await f.sendRequest(
+                        ForumSession.payload(FETCH_.TOPIC, {"id": id})
+                    )).response
+                    console.log(r)
+                    for (let i = 0; i < r.topic.posts_data.length; ++i) {
+
                     }
-                    /*for (let contest of ALL_CONTESTS) {
-                    }*/
+                    // CleanupText.toAsyLinks(item.post_data.post_canonical, item.post_data.post_rendered)
+                    processs.exit(0)
                 }),
-                description: "Get ALL (Use with caution)",
+                description: "Just",
             }
         ],
     });

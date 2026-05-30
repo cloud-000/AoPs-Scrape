@@ -59,7 +59,13 @@ export class ForumSession {
             if (name.includes("final")) {
                 return TYPES.AMO
             }
-            return TYPES.OMMC
+            return TYPES.COMPUTE
+        }
+        if (name.includes("Solstice Math Olympiad")) {
+            return TYPES.COMPUTE
+        }
+        if (name.includes("CUBRMC")) {
+            return TYPES.COMPUTE
         }
         if (name.includes("RML")) {
             return TYPES.ARML
@@ -78,17 +84,19 @@ export class ForumSession {
             return TYPES.AMC
         }
         if (/\bHMMT\b/.test(name)) {
-            return TYPES.HMMT
+            return TYPES.COLLEGE
+        }
+        for (let collegeName of CONTEST_IDS.CollegeComp) {
+            if (name.toLowerCase().includes(collegeName.name.toLowerCase())) {
+                return TYPES.COLLEGE
+            }
         }
         if (name.includes("IME") && !(name.includes("(AIME level)"))) {
             // why c3676367 are you name liked that
             return TYPES.AIME
         }
-        if (name.includes("MO")) {
+        if (name.includes("MO") || name.includes("USAMTS")) {
             return TYPES.AMO
-        }
-        if (name.toLowerCase().includes("pumac")) {
-            return TYPES.COMPUTE
         }
         if (returnNull) {
             return null
@@ -152,15 +160,21 @@ export class ForumSession {
     /**
      *
      * @param {number} id
+     * @param {Function?} checkToStop
      */
-    async getForum(id) {
+    async getForum(id, checkToStop=null) {
         let r = await this.sendRequest(ForumSession.payload(FETCH_.FORUM, {id: id}))
         let posts = []
-        while (!r.no_more_topics) {
-            if (r.response.topics.length === 0) {
+        let checkStopTest =
+            (checkToStop === null) ? () => false : checkToStop;
+        while (!r["no_more_topics"]) {
+            if (r.response["topics"].length === 0) {
                 break;
             }
-            posts.push(...r.response.topics)
+            posts.push(...r.response["topics"])
+            if (checkStopTest(posts)) {
+                return posts;
+            }
             r = await this.sendRequest({
                 ...ForumSession.payload(FETCH_.FORUM, {id: id}),
                 ...{
@@ -171,7 +185,8 @@ export class ForumSession {
         return posts
     }
 
-    async getAllTests(id, type=null, shownDepth=1, done=[], returnDone=false) {
+    async getAllTests(id, type=null, shownDepth=1, done=new Set(), returnDone=false, removeDuplicates=true) {
+        let doneProblems = []
         let response = (await this.sendRequest(
             ForumSession.payload(FETCH_.CATEGORY_DATA, {"id": id})
         )).response;
@@ -206,7 +221,7 @@ export class ForumSession {
                 items[i] = null
                 continue;
             }
-            if (CONTEST_IDS.IGNORE.includes(items[i].item_id) || done.includes(items[i].item_id)) {
+            if (CONTEST_IDS.IGNORE.includes(items[i].item_id) || done.has(items[i].item_id)) {
                 // ignore already done things
                 this.log(`Ignoring: ${items[i].item_id}`)
                 items[i] = null
@@ -219,20 +234,26 @@ export class ForumSession {
             switch (items[i].item_type) {
                 case "folder":
                     this.log("========")
+                    done.add(items[i].item_id)
                     let subTests = await this.getAllTests(items[i].item_id, type, shownDepth - 1, done)
                     pCount += subTests.count
+                    if (subTests.count === 0) {
+                        break;
+                    }
                     if (shownDepth > 0) {
                         tests.push(subTests)
                     } else {
                         tests.push(...(subTests["tests"]))
                     }
-                    done.push(items[i].item_id)
+                    subTests = null
                     break;
                 case "view_posts": // Test
-                    done.push(items[i].item_id)
-                    let t = (await this.getTest(items[i].item_id, type))
+                    done.add(items[i].item_id)
+                    let t = (await this.getTest(items[i].item_id, type, doneProblems))
                     pCount += t.count
-                    tests.push(t)
+                    if (t.count > 0) {
+                        tests.push(t)
+                    }
                     break;
                 default:
                     this.log("What da " + items[i].item_type)
@@ -261,8 +282,9 @@ export class ForumSession {
      * Spaghetti, refactor later
      * @param {number} id
      * @param {number | null} testType Type of Test (AMC, etc) or infer type
+     * @param {number[]} done
      */
-    async getTest(id, testType=null) {
+    async getTest(id, testType=null, done=[]) {
         let test = {
             sections: [],
             problems: [],
@@ -328,66 +350,49 @@ export class ForumSession {
                 && item.item_type !== "post_hidden"
                 && item.post_data.post_id !== 4956172 // MAA copyright post
                 && item.item_text !== "Mixer" // Chmmc mixer rounds are pain to parse
+                && !done.includes(item.post_data.topic_id)
             ) {
                 let processed = CleanupText.toAsyLinks(item.post_data.post_canonical, item.post_data.post_rendered)
                 let isMulti;
                 if ((n === 0 || isPrevMulti) && (isMulti = CleanupText.checkContainsMultiple(processed, n + 1)).length > 1) {
                     isPrevMulti = true
-                    if (item.post_data.poster_id === POST_USERS[0].id) { // paramenides posted
-                        if (isMulti.length > 0) { // remove his PS statement
-                            isMulti[isMulti.length - 1] = isMulti[isMulti.length - 1].replace(/P\.?S\.?.*hide for answers.*$/i, "").trim();
-                        }
+                    let answers
+                    if (type.computational) {
+                        answers = await this.searchTopicForAnswer(item.post_data.topic_id, true)
                     }
                     for (let j = 0; j < isMulti.length; ++j) {
                         let problem = {
                             statement: CleanupText.cleanChoices(isMulti[j]),
                             post_id: item.post_data.post_id,
-                            topic_id: item.post_data.topic_id
+                            topic_id: item.post_data.topic_id,
+                            n: j + n
                         }
-                        if (type.choices) {
-                            problem.choices = CleanupText.extractChoices(isMulti[j])
+                        if (type.computational) {
+                            let answer = answers[(j + 1).toString()] || null
+                            if (type.choices) {
+                                problem.choices = CleanupText.extractChoices(isMulti[j])
+                                problem.answer = problem.choices.indexOf(answer)
+                            } else {
+                                problem.choices = [answer]
+                                problem.answer = 1
+                            }
                         }
+
                         addProblem(problem, sectionCounter, test)
+                        done.push(item["post_data"]["topic_id"])
                         problem = null
                         pCount++
                     }
+
+                    // done.push()
                     n += isMulti.length
                 } else {
-                    let problem = {
-                        statement: CleanupText.cleanProblem(processed),
-                        post_id: item.post_data.post_id,
-                        topic_id: item.post_data.topic_id,
-                    }
+                    let problem = await this.getProblem(processed, type, item.post_data.topic_id)
+                    problem["post_id"] = item.post_data.post_id
+                    problem["topic_id"] = item.post_data.topic_id
                     problem.n = n
-                    problem.answer = null
-                    if (type.computational) {
-                        // Look for answer
-                        problem.answer =
-                            (ForumSession.MORE_INFO === "NO_PERMISSION") ? null : (await this.searchTopicForAnswer(problem.topic_id))
-                        if (type.choices) {
-                            problem.choices = CleanupText.extractChoices(problem.statement)
-                            problem.statement = CleanupText.cleanChoices(problem.statement).trim()
-                            if (problem.answer != null) {
-                                let bruh = CleanupText.parseMCQAns(problem.answer)
-                                if (bruh == null) {
-                                    problem.answer = -1
-                                } else {
-                                    if (bruh.type === "letter") {
-                                        problem.answer = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"].indexOf(bruh.value)
-                                    } else {
-                                        problem.answer = problem.choices.indexOf(bruh.value)
-                                    }
-                                }
-                                // problem.answer = problem.choices.indexOf(problem.answer)
-                            } else {
-                                problem.answer = -1
-                            }
-                        } else {
-                            problem.choices = [problem.answer]
-                            problem.answer = 0
-                        }
-                    }
                     addProblem(problem, sectionCounter, test)
+                    done.push(problem["topic_id"])
                     pCount++
                     n++
                 }
@@ -428,13 +433,62 @@ export class ForumSession {
         return test
     }
 
-    async searchTopicForAnswer(id) {
+    async getProblem(processed, type, topic_id) {
+        let problem = {
+            statement: CleanupText.cleanProblem(processed),
+        }
+        problem.answer = null
+        if (type.computational) {
+            // Look for answer
+            problem.answer =
+                (ForumSession.MORE_INFO === "NO_PERMISSION") ? null : (await this.searchTopicForAnswer(topic_id))
+            if (type.choices) {
+                problem.choices = CleanupText.extractChoices(problem.statement)
+                problem.statement = CleanupText.cleanChoices(problem.statement).trim()
+                if (problem.answer != null) {
+                    let bruh = CleanupText.parseMCQAns(problem.answer)
+                    if (bruh == null) {
+                        problem.answer = -1
+                    } else {
+                        if (bruh.type === "letter") {
+                            problem.answer = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"].indexOf(bruh.value)
+                        } else {
+                            problem.answer = problem.choices.indexOf(bruh.value)
+                        }
+                    }
+                    // problem.answer = problem.choices.indexOf(problem.answer)
+                } else {
+                    problem.answer = -1
+                }
+            } else {
+                problem.choices = [problem.answer]
+                problem.answer = 0
+            }
+        }
+        return problem
+    }
+
+    async searchTopicForAnswer(id, searchManyProblems=false) {
         let response = await this.sendRequest(
             ForumSession.payload(FETCH_.TOPIC, {"id": id})
         )
         if (response.error_code === "E_NO_PERMISSION") {
             ForumSession.MORE_INFO = "NO_PERMISSION"
             return null;
+        }
+        if (searchManyProblems) {
+            let answers = {}
+            let hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g
+            for (let post of response.response.topic.posts_data) {
+                for (let matches of post["post_canonical"].matchAll(hideTag)) {
+                    let answer = CleanupText.getBoxed(matches[2])
+                    if (answer) {
+                        answers[matches[1]] = answer
+                    }
+                }
+
+            }
+            return answers
         }
         for (let post of (response.response.topic.posts_data) ) {
             let a = CleanupText.getBoxed(post.post_canonical)
