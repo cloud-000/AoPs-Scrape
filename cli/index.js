@@ -1,86 +1,95 @@
-#!/usr/bin/env node
-import {input, confirm, select, number, search} from '@inquirer/prompts';
-import {ENV} from "../env.js"
-import {FETCH_, ForumSession} from "../src/ForumSession.js"
-import { promises as fs } from 'node:fs';
-import {CONTEST_IDS} from "../contest_id.js";
-import {CLIBar, CLIBarManager, CLICount} from "./tests/test.js";
-import {CleanupText} from "../src/CleanupText.js";
+#!/usr/bin/env bun
+import { input, confirm, select, number, search } from "@inquirer/prompts";
+import { ENV } from "../.env.js";
+import { FETCH_, ForumSession } from "../src/ForumSession.js";
+import { CONTEST_IDS } from "../contest_id.js";
+import { CLIBar, CLIBarManager, CLICount } from "./tests/test.js";
+import { CleanupText } from "../src/CleanupText.js";
 
 const command = process.argv[2];
 ForumSession.onProblemAdd = (data) => {
-    loader.bars[0].count ++
-}
+    loader.bars[0].count++;
+};
 
-let loader = new CLIBarManager()
-let ALL_CONTESTS
+let loader = new CLIBarManager();
+let ALL_CONTESTS;
 async function main() {
     ALL_CONTESTS = [
         ...CONTEST_IDS["MAA"],
         ...CONTEST_IDS["CollegeComp"],
         ...CONTEST_IDS["Other"],
         ...CONTEST_IDS["UserContestSeries"],
-        ...CONTEST_IDS["UserMocks"]
-    ].filter(c => c.id && c.type !== "forum") // forum's not implemented yet
+        ...CONTEST_IDS["UserMocks"],
+    ].filter((c) => c.id && c.type !== "forum"); // forum's not implemented yet
     let data;
     switch (command) {
         case "scrape-all":
-            if (!await confirm({message: "Are you sure?", default: false})) {
-                process.exit(0)
+            if (
+                !(await confirm({ message: "Are you sure?", default: false }))
+            ) {
+                process.exit(0);
             }
             for (let contest of ALL_CONTESTS) {
-                console.log(contest)
+                console.log(contest);
             }
             break;
         case "scrape":
-            let user = await getUser()
+            let user = await getUser();
             let f = new ForumSession(
                 user["logged-in"],
                 user["user-id"],
                 user["session-id"],
-                user["headers"] || null
-            )
-            f.debug = false
-            let id = await autoSearch("Enter id: ", ALL_CONTESTS)
-            let method = await getMethod()
-            if (!(await confirm({message: `Confirm ${id}?`}))) {
-                console.log("Exiting")
+                user["headers"] || null,
+            );
+            // f.debug = false;
+            let id = await autoSearch("Enter id: ", ALL_CONTESTS);
+            let method = await getMethod();
+            if (!(await confirm({ message: `Confirm ${id}?` }))) {
+                console.log("Exiting");
                 break;
             }
-            loader.add(new CLICount("Problem's Collected:"))
-            loader.start()
+            loader.add(new CLICount("Problem's Collected:"));
+            loader.start();
             let loaderInterval = setInterval(() => {
-                loader.calculate()
-                loader.render()
-            }, 300)
-            let startTime = Date.now()
+                loader.calculate();
+                loader.render();
+            }, 300);
+            let startTime = Date.now();
             data = await method.apply(null, [f, id]);
             let elapsedTime = Date.now() - startTime;
-            clearInterval(loaderInterval)
-            await sleep(100)
-            loader.clear()
-            console.log(`Collected ${data.count} problems in ${elapsedTime}ms from ${id}`)
-            if (await confirm({message: "Log Data?"})) {
-                console.log(data)
+            clearInterval(loaderInterval);
+            await sleep(100);
+            loader.clear();
+            console.log(
+                `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
+            );
+            if (await confirm({ message: "Log Data?" })) {
+                console.log(data);
             }
-            let saveFile = await input({message: "Save to: ", default: "raw.json"})
+            let saveFile = await input({
+                message: "Save to: ",
+                default: "raw.json",
+            });
             if (saveFile) {
-                await fs.writeFile(saveFile, JSON.stringify(data, null, 2))
-                console.log("Saved to file: ", saveFile)
+                await Bun.write(saveFile, JSON.stringify(data, null, 2));
+                console.log("Saved to file: ", saveFile);
             } else {
-                console.log("Data not saved")
+                console.log("Data not saved");
                 break;
             }
             break;
         case "to-csv": // normalize data
-            console.log("TO - CSV")
-            data = await fs.readFile("raw.json")
-            data = JSON.parse(data)
-            if (!Array.isArray(data)) { data = [data] }
-            let series_data = []
-            let tests_data = []
-            let problems_data = []
-            let s_id = 0, t_id = 0, p_id = 0
+            console.log("TO - CSV");
+            data = await Bun.file("raw.json").json();
+            if (!Array.isArray(data)) {
+                data = [data];
+            }
+            let series_data = [];
+            let tests_data = [];
+            let problems_data = [];
+            let s_id = 0,
+                t_id = 0,
+                p_id = 0;
             let addProblem = (problem, test) => {
                 problems_data.push({
                     id: p_id,
@@ -91,7 +100,11 @@ async function main() {
                     statement: problem.statement,
                     n: problem.n,
                     answer_index:
-                        (problem?.choices[0] === null) ? -1 : ((problem.answer === null) ? -1 : problem.answer),
+                        problem?.choices[0] === null
+                            ? -1
+                            : problem.answer === null
+                              ? -1
+                              : problem.answer,
                     answers: problem.choices ? problem.choices : [],
                     difficulty: 0,
                     quality: 0,
@@ -99,34 +112,37 @@ async function main() {
                     aops_id: problem["topic_id"],
                     topic: CleanupText.inferACGN(problem.statement),
                     is_computational: test.computational || false,
-                })
-            }
+                });
+            };
             for (let series of data) {
                 series_data.push({
                     id: s_id,
                     name: series.name,
                     // is_computational: series.is_computational,
                     is_official: false,
-                })
-                for (let test of series.tests) {// remember single no section
+                });
+                for (let test of series.tests) {
+                    // remember single no section
                     for (let i = 0; i < test.sections.length; i++) {
                         tests_data.push({
                             id: t_id,
                             series: s_id,
                             name: `${test.name} ${test.sections[i]}`,
-                            year: test.year ?? CleanupText.extractYear(test.sections[i]),
+                            year:
+                                test.year ??
+                                CleanupText.extractYear(test.sections[i]),
                             links: [],
                             quality: 0,
                             difficulty: 0,
                             // user_id: null
                             aops_id: test.id,
                             is_computational: test.computational,
-                        })
+                        });
                         for (let problem of test.problems[i]) {
-                            addProblem(problem, test)
-                            p_id++
+                            addProblem(problem, test);
+                            p_id++;
                         }
-                        t_id++
+                        t_id++;
                     }
                     if (test.sections.length === 0) {
                         tests_data.push({
@@ -140,76 +156,80 @@ async function main() {
                             // user_id: null
                             aops_id: test.id,
                             is_computational: test.computational,
-                        })
+                        });
                         for (let problem of test.problems) {
-                            addProblem(problem, test)
-                            p_id++
+                            addProblem(problem, test);
+                            p_id++;
                         }
-                        t_id++
+                        t_id++;
                     }
                 }
-                s_id++
+                s_id++;
             }
             // console.log(problems_data)
-            fs.writeFile("scrape_data/problems.json", JSON.stringify(problems_data, null, 2))
-            fs.writeFile("scrape_data/series.csv", JSONToCSV(series_data))
-            fs.writeFile("scrape_data/tests.csv", JSONToCSV(tests_data))
-            fs.writeFile("scrape_data/problems.csv", JSONToCSV(problems_data))
-            console.log("Done!")
+            await Bun.write(
+                "scrape_data/problems.json",
+                JSON.stringify(problems_data, null, 2),
+            );
+            await Bun.write("scrape_data/series.csv", JSONToCSV(series_data));
+            await Bun.write("scrape_data/tests.csv", JSONToCSV(tests_data));
+            await Bun.write(
+                "scrape_data/problems.csv",
+                JSONToCSV(problems_data),
+            );
+            console.log("Done!");
             break;
         case "quick-fix":
-            data = await fs.readFile("scrape_data/problems.json")
-            data = JSON.parse(data)
+            data = await Bun.file("scrape_data/problems.json").json();
             for (let p of data) {
                 if (p.answers.length === 0) {
-                    p.answers = CleanupText.extractChoices(p.statement)
+                    p.answers = CleanupText.extractChoices(p.statement);
                 }
-                p.statement = CleanupText.cleanChoices(p.statement)
+                p.statement = CleanupText.cleanChoices(p.statement);
             }
-            fs.writeFile("scrape_data/problems.json", JSON.stringify(data, null, 2))
-            fs.writeFile("scrape_data/problems.csv", JSONToCSV(data))
-            console.log("Saved!")
+            await Bun.write(
+                "scrape_data/problems.json",
+                JSON.stringify(data, null, 2),
+            );
+            await Bun.write("scrape_data/problems.csv", JSONToCSV(data));
+            console.log("Saved!");
             break;
         default:
-            console.log("test")
+            console.log("test");
             break;
     }
-
 }
 
 function JSONToCSV(data) {
-    let keys = Object.keys(data[0])
-    let text = keys.join(",") + "\n"
+    let keys = Object.keys(data[0]);
+    let text = keys.join(",") + "\n";
     for (let i = 0; i < data.length; i++) {
         for (let j = 0; j < keys.length; j++) {
-            let d = data[i][keys[j]]
+            let d = data[i][keys[j]];
             if (Array.isArray(d)) {
-                text += `"[${d.map(a => `""${a.replace(/\\/g, "\\\\")}""`).join(",")}]"`
+                text += `"[${d.map((a) => `""${a.replace(/\\/g, "\\\\")}""`).join(",")}]"`;
             } else {
                 if (d != null) {
-                    text +=
-                        (typeof d === "string") ? 
-                            sanitizeStringCSV(d) :
-                            d
+                    text += typeof d === "string" ? sanitizeStringCSV(d) : d;
                 }
             }
             if (j < keys.length - 1) {
-                text += ","
+                text += ",";
             }
         }
         if (i < data.length - 1) {
-            text += "\n"
+            text += "\n";
         }
     }
-    return text
+    return text;
 }
 
 function sanitizeStringCSV(content) {
-    content = content.replace(/\r\n/g, "\n")
+    content = content.replace(/\r\n/g, "\n");
     if (/[",\n\r]/.test(content)) {
         return `"${content.replace(/"/g, '""')}"`;
     }
-    return content
+    return content;
     /*let data = str
     if (str.includes('"') || str.includes(',') || str.includes('\n')) {
         data = `${str.replace(/"/g, '"')}`;
@@ -217,96 +237,99 @@ function sanitizeStringCSV(content) {
     return `${data.replace(/\n/g, "\\n")}`*/
 }
 
-async function sleep(time) {await new Promise(resolve => setTimeout(resolve, time));}
-
-async function getUser(message="Select user") {
-    return await select({
-        message: message,
-        choices: Object.keys(ENV["AoPs-User"]).map(name => ({
-            name: name,
-            value: ENV["AoPs-User"][name],
-        }))
-    })
+async function sleep(time) {
+    await new Promise((resolve) => setTimeout(resolve, time));
 }
 
-async function getMethod(message="Select method") {
+async function getUser(message = "Select user") {
+    return await select({
+        message: message,
+        choices: Object.keys(ENV["AoPs-User"]).map((name) => ({
+            name: name,
+            value: ENV["AoPs-User"][name],
+        })),
+    });
+}
+
+async function getMethod(message = "Select method") {
     return await select({
         message: message,
         choices: [
             {
                 name: "Test",
-                value: (async (f, id) => {
-                    return await f.getTest(id)
-                }),
+                value: async (f, id) => {
+                    return await f.getTest(id);
+                },
                 description: "Get single test",
             },
             {
                 name: "All Tests",
-                value: (async (f, id) => {
-                    return await f.getAllTests(id, null, 0, new Set(), false)
-                }),
+                value: async (f, id) => {
+                    return await f.getAllTests(id, null, 0, new Set(), false);
+                },
                 description: "Get all tests from a collection",
             },
             {
                 name: "Forum",
-                value: (async (f, id) => {
+                value: async (f, id) => {
                     // throw new Error("Forums scrape not completed...")
-                    return await f.getForum(id)
-                }),
+                    return await f.getForum(id);
+                },
                 description: "Gets all posts from a forum",
             },
             {
                 name: "Topic",
-                value: (async (f, id) => {
-                    let r =  (await f.sendRequest(
-                        ForumSession.payload(FETCH_.TOPIC, {"id": id})
-                    )).response
-                    console.log(r)
-                    for (let i = 0; i < r.topic.posts_data.length; ++i) {
-
-                    }
+                value: async (f, id) => {
+                    let r = (
+                        await f.sendRequest(
+                            ForumSession.payload(FETCH_.TOPIC, { id: id }),
+                        )
+                    ).response;
+                    console.log(r);
+                    for (let i = 0; i < r.topic.posts_data.length; ++i) {}
                     // CleanupText.toAsyLinks(item.post_data.post_canonical, item.post_data.post_rendered)
-                    processs.exit(0)
-                }),
+                    processs.exit(0);
+                },
                 description: "Just",
-            }
+            },
         ],
     });
 }
 
-async function autoSearch(message="Search", choices=[]) {
+async function autoSearch(message = "Search", choices = []) {
     return await search({
         message: message,
         source: async (input = "") => {
             input = input.trim();
 
             let matches = choices
-                .filter(item =>
-                    item.id.toString().includes(input) ||
-                    item.name.toLowerCase().includes(input.toLowerCase())
+                .filter(
+                    (item) =>
+                        item.id.toString().includes(input) ||
+                        item.name.toLowerCase().includes(input.toLowerCase()),
                 )
-                .map(item => ({
+                .map((item) => ({
                     name: `[${item.name}] ${item.id}`,
-                    value: item.id
+                    value: item.id,
                 }));
 
             // Add custom option if user typed something
             if (input.length > 0) {
                 matches.push({
                     name: `Use custom: ${input}`,
-                    value: input
+                    value: input,
                 });
             }
             return matches;
-        }
+        },
     });
 }
 
 try {
-    await main()
+    await main();
 } catch (error) {
     if (error.name === "ExitPromptError") {
-        console.log("Exiting ...")
+        console.log("Exiting ...");
     } else {
         throw error;
     }

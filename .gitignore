@@ -7,5 +7,6 @@ node_modules/
 
 # other
 scrape_data/
-env.js
+**/.env.*
+**/.env
 raw*.json
