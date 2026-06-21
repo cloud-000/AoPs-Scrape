@@ -14,24 +14,32 @@ export class CleanupText {
             name: "A",
             keywords: [
                 "real number", "complex number", "coefficient", "expansion",
-                "y =", "y=", "x^2", "polynomial",
+                "y =", "y=", "x^2", "polynomial", "function", "sequence",
+                "series", "arithmetic", "geometric", "logarithm", "inequality",
+                "root", "equation", "sum of", "minimum", "maximum", "optimize",
             ],
         },
         {
             name: "C",
             keywords: [
                 "probability", "number of ways", "how many", "rearranged",
-                "expected value", "expected sum", "identical", "permutation", "palindrome",
+                "expected value", "expected sum", "identical", "permutation",
+                "palindrome", "graph", "counting", "bijection", "pigeonhole",
+                "combination", "path", "tree", "cycle", "arrangement",
+                "choose", "select", "committee", "subset",
             ],
         },
         {
             name: "G",
             keywords: [
                 "circle", "radius", "ellipse", "triangle", "rectangle", "polygon",
-                "intersects", "plane", "points", "area", "equilateral", "isosceles",
-                "scalene", "vertex", "vertice", "diagonal", "congruent", "vertical",
-                "horizontal", "parallel", "concurrent", "co-centric", "collinear",
+                "intersects", "plane", "area", "equilateral", "isosceles",
+                "scalene", "vertex", "vertice", "diagonal", "congruent",
+                "parallel", "concurrent", "co-centric", "collinear",
                 "\\circ", "midpoint", "\\angle", "convex", "concave",
+                "angle", "perpendicular", "circumradius", "inscribed", "tangent",
+                "chord", "altitude", "median", "centroid", "circumcircle",
+                "incircle", "hexagon", "quadrilateral", "perimeter", "hypotenuse",
             ],
         },
         {
@@ -39,6 +47,9 @@ export class CleanupText {
             keywords: [
                 "integer", "divisor", "whole number", "lcm", "gcd",
                 "digits", "integers", "factor", "perfect square",
+                "prime", "divisible", "remainder", "modulo", "floor",
+                "ceiling", "digit sum", "congruent", "modular", "base",
+                "number theory", "\\lfloor", "\\lceil",
             ],
         },
     ]
@@ -156,15 +167,25 @@ export class CleanupText {
     }
 
     static inferACGN(text) {
-        let lowerCase = text.replace(/\[asy=.*?].*?\[\/asy]/gs, "").toLowerCase().trim();
-        for (let mathType of this.INFER_WORDS) {
-            for (let word of mathType.keywords) {
-                if (lowerCase.includes(word)) {
-                    return mathType.name
-                }
+        const lowerCase = text.replace(/\[asy=.*?]\s*.*?\[\/asy]/gs, "").toLowerCase().trim();
+        const scores = {};
+        for (const mathType of this.INFER_WORDS) {
+            let score = 0;
+            for (const word of mathType.keywords) {
+                if (lowerCase.includes(word)) score++;
+            }
+            scores[mathType.name] = score;
+        }
+        // Find highest scoring; ties go to first (A→C→G→N)
+        let best = null;
+        let bestScore = 0;
+        for (const mathType of this.INFER_WORDS) {
+            if (scores[mathType.name] > bestScore) {
+                bestScore = scores[mathType.name];
+                best = mathType.name;
             }
         }
-        return "O"
+        return best ?? "O";
     }
 
     static removePSHideAns(text) {

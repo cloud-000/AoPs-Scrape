@@ -16,13 +16,14 @@ export const CONTEST_IDS = {
         2982588, // FMM duplicate
     ],
     MAA: [
-        { name: "AMC 8", id: 3413 },
-        { name: "AMC 10", id: 3414 },
-        { name: "AMC 12", id: 3415 },
-        { name: "AIME", id: 3416 },
+        { name: "AMC 8", id: 3413, is_official: true },
+        { name: "AMC 10", id: 3414, is_official: true },
+        { name: "AMC 12", id: 3415, is_official: true },
+        { name: "AIME", id: 3416, is_official: true },
         {
             name: "USAMTS",
             id: 3412,
+            is_official: true,
             link: "https://www.usamts.org/contest/past-problems/",
         },
     ],
@@ -30,42 +31,50 @@ export const CONTEST_IDS = {
         {
             name: "CMIMC",
             id: 253928,
+            is_official: true,
             link: "https://cmimc.math.cmu.edu/math/past-problems",
         },
         {
             name: "CHMMC",
             id: 2746308,
+            is_official: true,
             link: "https://www.caltechmathmeet.org/problems",
         },
         {
             name: "HMMT",
             id: 3417,
+            is_official: true,
             link: "https://www.hmmt.org/www/archive/problems",
         },
         {
             name: "HMMT November",
             id: 2881068,
+            is_official: true,
             link: "https://www.hmmt.org/www/archive/problems",
         },
         {
             name: "SMT",
             id: 3418,
+            is_official: true,
             link: "https://www.stanfordmathtournament.org/past-tests/problems",
         },
-        { name: "BMT", id: 2503467, link: "https://berkeley.mt/resources/" },
+        { name: "BMT", id: 2503467, is_official: true, link: "https://berkeley.mt/resources/" },
         {
             name: "PUMAC",
             id: 3426,
+            is_official: true,
             link: "https://pumac.princeton.edu/archives",
         },
         {
             name: "BAMO",
             id: 233906,
+            is_official: true,
             link: "https://www.bamo.org/archives/problems_and_solutions/",
         },
         {
             name: "JHMT",
             id: 3347995,
+            is_official: true,
             link: "https://www.johnshopkinsmathtournament.com/past-papers",
         },
     ],
@@ -73,33 +82,39 @@ export const CONTEST_IDS = {
         {
             name: "MPFG",
             id: 3427,
+            is_official: true,
             link: "https://mathprize.atfoundation.org/resources",
         },
-        { name: "MPFG Olympiad", id: 953466 },
+        { name: "MPFG Olympiad", id: 953466, is_official: true },
         {
             name: "Purple Comet",
             id: 3419,
+            is_official: true,
             link: "https://purplecomet.org/answers",
         },
-        { name: "OMMC", id: 2824982, link: "https://www.ommcofficial.org/" },
+        { name: "OMMC", id: 2824982, is_official: true, link: "https://www.ommcofficial.org/" },
         {
             name: "NIMO",
             id: 3423,
+            is_official: true,
             link: "https://drive.google.com/drive/folders/1jVXuZMdk-GkucFtqPWAIg5xMiQN-E3gf?usp=drive_link",
         },
         {
             name: "OMO",
             id: 3431,
+            is_official: true,
             link: "https://drive.google.com/drive/folders/1jVXuZMdk-GkucFtqPWAIg5xMiQN-E3gf?usp=drive_link",
         },
         {
             name: "EMCC",
             id: 4718194,
+            is_official: true,
             link: "https://exetermathclub.com/archives",
         },
         {
             name: "Putnam",
             id: 3249,
+            is_official: true,
             link: "https://kskedlaya.org/putnam-archive/",
         },
         { name: "mathleague.org", id: 134, type: "forum", rules: {} },
@@ -158,7 +173,8 @@ export const CONTEST_IDS = {
     ],
 };
 
-export const SOLUTION_USERS = [
+// Users known to post high-quality solutions; used to classify solution posts during scraping.
+export const SOLUTIONS_USERS = [
     { id: 672616, name: "lpieleanu" },
     { id: 86424, name: "Mrdavid445" },
     { id: 560465, name: "HamstPan38825" },
@@ -169,3 +185,6 @@ export const SOLUTION_USERS = [
     { id: 448942, name: "IAmTheHazard" },
     { id: 529392, name: "peace09" },
 ];
+
+/** @deprecated use SOLUTIONS_USERS */
+export const SOLUTION_USERS = SOLUTIONS_USERS;

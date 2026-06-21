@@ -328,6 +328,7 @@ Recursively scrapes a folder hierarchy, returning a tree of test results.
 
 ```js
 {
+  id: number,
   name: string,
   tests: (TestResult | FolderResult)[],  // mix of getTest results and nested getAllTests results
   count: number,

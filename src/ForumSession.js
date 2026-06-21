@@ -1,5 +1,5 @@
 import { CleanupText } from "./CleanupText.js";
-import { CONTEST_IDS, TYPES } from "../contest_id.js";
+import { CONTEST_IDS, TYPES, SOLUTIONS_USERS } from "../contest_id.js";
 
 export const ApiMethod = {
     TOPIC: 0,
@@ -76,7 +76,9 @@ export class ForumSession {
         }
     }
 
-    static inferType(name, returnNull = false) {
+    static inferType(name, returnNull = false, explicitType = null) {
+        if (explicitType && TYPES[explicitType]) return TYPES[explicitType];
+
         if (name.includes("OMMC")) {
             return name.includes("final") ? TYPES.AMO : TYPES.COMPUTE;
         }
@@ -326,9 +328,32 @@ export class ForumSession {
             }
         }
 
-        const result = { name, tests, count: pCount };
+        const result = { id: Number(id), name, tests, count: pCount };
         if (returnDone) result["done"] = done;
         return result;
+    }
+
+    async getAllTestsMulti(ids, name, type = null) {
+        const allTests = [];
+        let totalCount = 0;
+        const done = new Set();
+
+        for (const id of ids) {
+            const { items } = await this._fetchCategory(id);
+            // Check if this category is forum-type
+            const hasForum = items.some(item => item.item_type === "forum");
+            if (hasForum) {
+                // Route to getForum behavior — skip for now, forum handling is separate
+                this.log(`Category ${id} appears to be forum-type, skipping in getAllTestsMulti`);
+                continue;
+            }
+            // Otherwise, treat as a regular test collection
+            const subResult = await this.getAllTests(id, type, 0, done, false);
+            allTests.push(...subResult.tests);
+            totalCount += subResult.count;
+        }
+
+        return { ids: ids.map(Number), name, tests: allTests, count: totalCount };
     }
 
     async getTest(id, testType = null, done = []) {
@@ -443,12 +468,12 @@ export class ForumSession {
 
     async _handleMultiProblem(isMulti, item, type, ctx, test, done) {
         ctx.isPrevMulti = true;
-        let answers;
+        let answers = null;
+        let topicSolutions = [];
         if (type.computational) {
-            answers = await this.searchTopicForAnswer(
-                item.post_data.topic_id,
-                true,
-            );
+            const topicData = await this.searchTopicForSolutions(item.post_data.topic_id, true, false);
+            answers = topicData.answers; // for multi-problem, returns a map
+            topicSolutions = topicData.solutions;
         }
         for (let j = 0; j < isMulti.length; j++) {
             const problem = {
@@ -456,15 +481,18 @@ export class ForumSession {
                 post_id: item.post_data.post_id,
                 topic_id: item.post_data.topic_id,
                 n: j + ctx.problemIndex,
+                choices: null,
+                raw_answer: null,
+                answer: -1,
+                solutions: j === 0 ? topicSolutions : [],
+                all_posts: [],
             };
             if (type.computational) {
                 const answer = answers?.[(j + 1).toString()] ?? null;
+                problem.raw_answer = answer;
                 if (type.choices) {
                     problem.choices = CleanupText.extractChoices(isMulti[j]);
                     problem.answer = problem.choices.indexOf(answer);
-                } else {
-                    problem.choices = [answer];
-                    problem.answer = 0;
                 }
             }
             addProblemToTest(problem, ctx, test, this.onProblemAdd);
@@ -515,40 +543,68 @@ export class ForumSession {
     async _buildProblem(processed, type, topic_id) {
         const problem = {
             statement: CleanupText.cleanProblem(processed),
-            answer: null,
+            answer: -1,
+            choices: null,
+            raw_answer: null,
+            solutions: [],
+            all_posts: [],
         };
 
-        if (!type.computational) return problem;
+        if (!type.computational) {
+            // OLY — fetch all posts for potential solutions
+            const topicData = await this.searchTopicForSolutions(topic_id, false, true);
+            problem.solutions = topicData.solutions;
+            problem.all_posts = topicData.all_posts;
+            return problem;
+        }
 
-        problem.answer = await this.searchTopicForAnswer(topic_id);
+        const topicData = await this.searchTopicForSolutions(topic_id, false, false);
+        const rawAnswer = topicData.answer;
+        problem.solutions = topicData.solutions;
+        problem.raw_answer = rawAnswer;
 
         if (type.choices) {
+            // MCQ (e.g. AMC)
             problem.choices = CleanupText.extractChoices(problem.statement);
-            problem.statement = CleanupText.cleanChoices(
-                problem.statement,
-            ).trim();
-            if (problem.answer != null) {
-                const parsed = CleanupText.parseMCQAns(problem.answer);
+            problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+            if (rawAnswer != null) {
+                const parsed = CleanupText.parseMCQAns(rawAnswer);
                 if (parsed == null) {
                     problem.answer = -1;
                 } else if (parsed.type === "letter") {
+                    problem.raw_answer = parsed.value; // normalize to just the letter
                     problem.answer = MCQ_LETTERS.indexOf(parsed.value);
                 } else {
                     problem.answer = problem.choices.indexOf(parsed.value);
                 }
-            } else {
-                problem.answer = -1;
             }
         } else {
-            problem.choices = [problem.answer];
-            problem.answer = 0;
+            // Numeric (AIME, COMP, COLLEGE, etc.)
+            problem.choices = null;
+            problem.answer = -1; // no index concept for numeric answers
         }
 
         return problem;
     }
 
-    async searchTopicForAnswer(id, searchManyProblems = false) {
-        if (this._permissionDenied) return null;
+    _isSolutionPost(post, content) {
+        // Rule 1: [hide=...solution...]
+        if (/\[hide\s*=[^\]]*solution[^\]]*\]/i.test(content)) return true;
+        // Rule 2: QED markers
+        if (/Q\.?E\.?D\.?|\\blacksquare|\\square/.test(content)) return true;
+        // Rule 3: known solution poster
+        if (post.poster_id && (SOLUTIONS_USERS ?? []).some(u => u.id === post.poster_id)) return true;
+        // Rule 4: contains \boxed{} (computational answer marker)
+        if (/\\boxed\s*\{/.test(content)) return true;
+        // Rule 5: starts with "Proof", "Solution", "Sol."
+        if (/^\s*(?:proof|solution|sol\.)/i.test(content.slice(0, 50))) return true;
+        return false;
+    }
+
+    async searchTopicForSolutions(id, searchManyProblems = false, isOly = false) {
+        if (this._permissionDenied) {
+            return { answer: null, answers: {}, solutions: [], all_posts: [] };
+        }
 
         const response = await this.sendRequest(
             ForumSession.payload(ApiMethod.TOPIC, { id }),
@@ -556,27 +612,60 @@ export class ForumSession {
 
         if (response.error_code === "E_NO_PERMISSION") {
             this._permissionDenied = true;
-            return null;
+            return { answer: null, answers: {}, solutions: [], all_posts: [] };
         }
 
-        if (searchManyProblems) {
-            const answers = {};
-            const hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
-            for (const post of response.response.topic.posts_data) {
-                for (const matches of post["post_canonical"].matchAll(
-                    hideTag,
-                )) {
-                    const answer = CleanupText.getBoxed(matches[2]);
-                    if (answer) answers[matches[1]] = answer;
+        const posts = response.response.topic.posts_data ?? [];
+        const solutions = [];
+        const all_posts = [];
+        let answer = null;
+        const answers = {};
+
+        for (const post of posts) {
+            const content = post.post_canonical;
+
+            // Extract answers
+            if (searchManyProblems) {
+                const hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
+                for (const match of content.matchAll(hideTag)) {
+                    const boxed = CleanupText.getBoxed(match[2]);
+                    if (boxed) answers[match[1]] = boxed;
                 }
+            } else if (answer == null) {
+                answer = CleanupText.getBoxed(content);
             }
-            return answers;
+
+            // Collect all posts for OLY
+            if (isOly) {
+                all_posts.push({
+                    post_id: post.post_id,
+                    user_id: post.poster_id ?? null,
+                    username: post.username ?? null,
+                    content,
+                    posted_at: post.post_time ? new Date(post.post_time * 1000).toISOString() : null,
+                });
+            }
+
+            // Classify solution posts (skip post_type === 'view_posts_text' which is the problem statement)
+            if (post.post_type === 'view_posts_text') continue;
+            if (this._isSolutionPost(post, content)) {
+                solutions.push({
+                    post_id: post.post_id,
+                    topic_id: id,
+                    user_id: post.poster_id ?? null,
+                    username: post.username ?? null,
+                    content,
+                    posted_at: post.post_time ? new Date(post.post_time * 1000).toISOString() : null,
+                });
+            }
         }
 
-        for (const post of response.response.topic.posts_data) {
-            const a = CleanupText.getBoxed(post.post_canonical);
-            if (a != null) return a;
-        }
-        return null;
+        return { answer, answers, solutions, all_posts };
+    }
+
+    async searchTopicForAnswer(id, searchManyProblems = false) {
+        const result = await this.searchTopicForSolutions(id, searchManyProblems, false);
+        if (searchManyProblems) return result.answers;
+        return result.answer;
     }
 }

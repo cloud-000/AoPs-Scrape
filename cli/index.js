@@ -20,7 +20,7 @@ async function main() {
         ...CONTEST_IDS["Other"],
         ...CONTEST_IDS["UserContestSeries"],
         ...CONTEST_IDS["UserMocks"],
-    ].filter((c) => c.id && c.type !== "forum");
+    ].filter((c) => c.id); // only filter out entries without a plain .id (like ZeMC with ids[])
 
     let data;
     switch (command) {
@@ -97,12 +97,29 @@ async function main() {
             break;
         }
 
-        case "to-csv": {
-            console.log("TO-CSV");
+        case "json-to-csv": {
+            console.log("JSON-TO-CSV");
             data = await Bun.file("raw.json").json();
             if (!Array.isArray(data)) data = [data];
             await exportToCSV(data);
             console.log("Done!");
+            break;
+        }
+
+        case "to-csv": {
+            console.log("TO-CSV (from DB)");
+            const db = initDB(DB_PATH);
+            await exportToCSVFromDB(db);
+            db.close();
+            console.log("Done!");
+            break;
+        }
+
+        case "preprocess": {
+            const db = initDB(DB_PATH);
+            const { runPreprocess } = await import("../src/preprocess.js");
+            await runPreprocess(db);
+            db.close();
             break;
         }
 
@@ -132,7 +149,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape, save-to-db, to-csv, quick-fix, init-db",
+                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, preprocess",
             );
             break;
     }
@@ -150,15 +167,19 @@ async function exportToCSV(seriesList) {
         problemRows.push({
             id: problemId,
             test_id: testId,
+            section: problem.section ?? -1,
             statement: problem.statement,
             n: problem.n,
             answer_index:
-                problem?.choices[0] === null
-                    ? -1
+                (problem?.choices[0] === null
+                    ? null
                     : problem.answer === null
-                      ? -1
-                      : problem.answer,
-            answers: problem.choices ?? [],
+                      ? null
+                      : problem.answer) ??
+                (problem.raw_answer != null ? 0 : -1),
+            answers:
+                (problem.choices.length > 0 ? problem.choices : null) ??
+                (problem.raw_answer != null ? [problem.raw_answer] : []),
             difficulty: 0,
             quality: 0,
             verified: false,
@@ -176,45 +197,32 @@ async function exportToCSV(seriesList) {
         });
 
         for (let test of series.tests) {
+            testRows.push({
+                id: testId,
+                series: seriesId,
+                name: test.name,
+                year: test.year ?? -1,
+                links: [],
+                quality: 0,
+                difficulty: 0,
+                aops_id: test.id,
+                is_computational: test.computational,
+            });
+
             if (test.sections.length > 0) {
                 for (let i = 0; i < test.sections.length; i++) {
-                    testRows.push({
-                        id: testId,
-                        series: seriesId,
-                        name: `${test.name} ${test.sections[i]}`,
-                        year:
-                            test.year ??
-                            CleanupText.extractYear(test.sections[i]),
-                        links: [],
-                        quality: 0,
-                        difficulty: 0,
-                        aops_id: test.id,
-                        is_computational: test.computational,
-                    });
                     for (let problem of test.problems[i]) {
-                        addProblem(problem, test);
+                        addProblem({ ...problem, section: i }, test);
                         problemId++;
                     }
-                    testId++;
                 }
             } else {
-                testRows.push({
-                    id: testId,
-                    series: seriesId,
-                    name: test.name,
-                    year: test.year ?? -1,
-                    links: [],
-                    quality: 0,
-                    difficulty: 0,
-                    aops_id: test.id,
-                    is_computational: test.computational,
-                });
                 for (let problem of test.problems) {
-                    addProblem(problem, test);
+                    addProblem({ ...problem, section: -1 }, test);
                     problemId++;
                 }
-                testId++;
             }
+            testId++;
         }
         seriesId++;
     }
@@ -226,6 +234,63 @@ async function exportToCSV(seriesList) {
     await Bun.write("scrape_data/series.csv", JSONToCSV(seriesRows));
     await Bun.write("scrape_data/tests.csv", JSONToCSV(testRows));
     await Bun.write("scrape_data/problems.csv", JSONToCSV(problemRows));
+}
+
+async function exportToCSVFromDB(db) {
+    const problems = db
+        .query(
+            `
+        SELECT
+            p.id,
+            p.test_id,
+            p.n,
+            p.section,
+            p.statement,
+            p.answer_index,
+            p.answers,
+            p.topic,
+            p.tags,
+            p.is_computational,
+            p.difficulty,
+            p.quality,
+            p.verified,
+            p.aops_topic_id,
+            p.aops_choices,
+            p.aops_answer,
+            p.aops_answer_index,
+            t.name AS test_name,
+            t.year AS test_year,
+            t.type AS test_type,
+            t.aops_category_id,
+            s.name AS series_name,
+            s.is_official
+        FROM problems p
+        JOIN tests t ON p.test_id = t.id
+        JOIN series s ON t.series_id = s.id
+        ORDER BY s.name, t.year, t.name, p.section, p.n
+    `,
+        )
+        .all();
+
+    const tests = db
+        .query(
+            `
+        SELECT t.*, s.name AS series_name, s.is_official
+        FROM tests t JOIN series s ON t.series_id = s.id
+        ORDER BY s.name, t.year, t.name
+    `,
+        )
+        .all();
+
+    const seriesList = db.query(`SELECT * FROM series ORDER BY name`).all();
+
+    await Bun.write("scrape_data/series.csv", JSONToCSV(seriesList));
+    await Bun.write("scrape_data/tests.csv", JSONToCSV(tests));
+    await Bun.write(
+        "scrape_data/problems.json",
+        JSON.stringify(problems, null, 2),
+    );
+    await Bun.write("scrape_data/problems.csv", JSONToCSV(problems));
 }
 
 function JSONToCSV(data) {
@@ -317,7 +382,10 @@ async function autoSearch(message = "Search", choices = []) {
                         item.name.toLowerCase().includes(input.toLowerCase()),
                 )
                 .map((item) => ({
-                    name: `[${item.name}] ${item.id}`,
+                    name:
+                        item.type === "forum"
+                            ? `[forum] [${item.name}] ${item.id}`
+                            : `[${item.name}] ${item.id}`,
                     value: item.id,
                 }));
             if (input.length > 0) {
