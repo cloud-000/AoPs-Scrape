@@ -79,6 +79,17 @@ async function main() {
             break;
         }
 
+        case "save-to-db": {
+            const srcFile = process.argv[3] ?? "raw.json";
+            data = await Bun.file(srcFile).json();
+            const db = initDB(DB_PATH);
+            upsertScrapeResults(db, data);
+            const { c } = db.query("SELECT count(*) as c FROM problems").get();
+            db.close();
+            console.log(`Merged ${srcFile} into ${DB_PATH} (${c} total problems in DB).`);
+            break;
+        }
+
         case "to-csv": {
             console.log("TO-CSV");
             data = await Bun.file("raw.json").json();
@@ -113,7 +124,7 @@ async function main() {
         }
 
         default:
-            console.log("Available commands: scrape, to-csv, quick-fix, init-db");
+            console.log("Available commands: scrape, save-to-db, to-csv, quick-fix, init-db");
             break;
     }
 }
