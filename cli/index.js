@@ -35,7 +35,7 @@ async function main() {
                     loader.bars[0].count++;
                 },
             );
-            session.debug = true;
+            session.debug = false;
             let id = await autoSearch("Enter id: ", ALL_CONTESTS);
             let method = await getMethod();
             if (!(await confirm({ message: `Confirm ${id}?` }))) {
@@ -43,17 +43,17 @@ async function main() {
                 break;
             }
             loader.add(new CLICount("Problems Collected:"));
-            // loader.start();
+            loader.start();
             let loaderInterval = setInterval(() => {
                 loader.calculate();
-                // loader.render();
+                loader.render();
             }, 300);
             let startTime = Date.now();
             data = await method(session, id);
             let elapsedTime = Date.now() - startTime;
             clearInterval(loaderInterval);
             await sleep(100);
-            // loader.clear();
+            loader.clear();
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );

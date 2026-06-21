@@ -86,8 +86,9 @@ export class ForumSession {
 
         if (/[A-Z]MC/.test(name)) {
             let amcName = "AMC";
-            if (/\b8\b/.test(name))       amcName = "AMC 8";
-            else if (/\b10\b/.test(name) || /\b11\b/.test(name)) amcName = "AMC 10";
+            if (/\b8\b/.test(name)) amcName = "AMC 8";
+            else if (/\b10\b/.test(name) || /\b11\b/.test(name))
+                amcName = "AMC 10";
             else if (/\b12\b/.test(name)) amcName = "AMC 12";
             return { ...TYPES.AMC, name: amcName };
         }
@@ -100,14 +101,21 @@ export class ForumSession {
             }
         }
 
-        if (name.includes("IME") && !name.includes("(AIME level)")) return TYPES.AIME;
+        if (name.includes("IME") && !name.includes("(AIME level)"))
+            return TYPES.AIME;
         if (name.includes("MO") || name.includes("USAMTS")) return TYPES.AMO;
 
         if (returnNull) return null;
         return TYPES.UNKNOWN;
     }
 
-    constructor(loggedIn, userId, sessionId, headers = null, onProblemAdd = null) {
+    constructor(
+        loggedIn,
+        userId,
+        sessionId,
+        headers = null,
+        onProblemAdd = null,
+    ) {
         this.loggedIn = loggedIn;
         this.userId = userId;
         this.sessionId = sessionId;
@@ -115,6 +123,7 @@ export class ForumSession {
         this.debug = true;
         this.onProblemAdd = onProblemAdd ?? (() => {});
         this._permissionDenied = false;
+        this.requestDelay = [100, 250];
     }
 
     log(message) {
@@ -123,7 +132,7 @@ export class ForumSession {
         }
     }
 
-    sendRequest(bodyInput) {
+    async sendRequest(bodyInput) {
         const formData = {
             aops_logged_in: this.loggedIn ? "1" : "0",
             aops_user_id: this.userId.toString(),
@@ -132,26 +141,80 @@ export class ForumSession {
         };
         const init = {
             method: "POST",
-            body: toSearchParams(formData),
             credentials: "include",
         };
         if (this.headers) {
             Object.assign(init, { headers: this.headers });
         }
-        return fetch("https://artofproblemsolving.com/m/community/ajax.php", init)
-            .then((response) => response.json());
+
+        if (this.requestDelay[0] > 0) {
+            await new Promise((r) =>
+                setTimeout(
+                    r,
+                    this.requestDelay[0] +
+                        (this.requestDelay[1] - this.requestDelay[0]) *
+                            Math.random(),
+                ),
+            );
+        }
+
+        const MAX_RETRIES = 3;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            const response = await fetch(
+                "https://artofproblemsolving.com/m/community/ajax.php",
+                {
+                    ...init,
+                    body: toSearchParams(formData),
+                },
+            );
+            const text = await response.text();
+            if (text.includes("challenges.cloudflare.com")) {
+                if (attempt === MAX_RETRIES) {
+                    throw new Error(
+                        "Cloudflare challenge page returned after all retries. If this keeps happening, copy fresh headers from your browser's DevTools and update .env.js.",
+                    );
+                }
+                const delay = 5000 * (attempt + 1);
+                console.log(
+                    `\nCloudflare challenge (attempt ${attempt + 1}/${MAX_RETRIES + 1}), waiting ${delay / 1000}s...`,
+                );
+                await new Promise((r) => setTimeout(r, delay));
+                continue;
+            }
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                if (attempt === MAX_RETRIES) {
+                    console.error(
+                        `\nFailed to parse JSON after ${MAX_RETRIES + 1} attempts. Response: ${text.slice(0, 500)}`,
+                    );
+                    throw e;
+                }
+                const delay = 1000 * 2 ** attempt;
+                console.log(
+                    `\nJSON parse failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${delay}ms...`,
+                );
+                await new Promise((r) => setTimeout(r, delay));
+            }
+        }
     }
 
     async _fetchCategory(id) {
-        const fullResponse = await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }));
+        const fullResponse = await this.sendRequest(
+            ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }),
+        );
         if (fullResponse.error_code) {
-            throw new Error(`API error for category ${id}: ${fullResponse.error_code}`);
+            throw new Error(
+                `API error for category ${id}: ${fullResponse.error_code}`,
+            );
         }
         let response = fullResponse.response;
         this.log(response);
 
         if (!response.category) {
-            throw new Error(`No category data for id ${id}. Full response: ${JSON.stringify(fullResponse)}`);
+            throw new Error(
+                `No category data for id ${id}. Full response: ${JSON.stringify(fullResponse)}`,
+            );
         }
 
         const name = response.category.category_name;
@@ -174,7 +237,9 @@ export class ForumSession {
     }
 
     async getForum(id, checkToStop = null) {
-        let r = await this.sendRequest(ForumSession.payload(ApiMethod.FORUM, { id }));
+        let r = await this.sendRequest(
+            ForumSession.payload(ApiMethod.FORUM, { id }),
+        );
         const posts = [];
         const shouldStop = checkToStop ?? (() => false);
         while (!r["no_more_topics"]) {
@@ -184,14 +249,22 @@ export class ForumSession {
             r = await this.sendRequest({
                 ...ForumSession.payload(ApiMethod.FORUM, { id }),
                 fetch_before: [
-                    r.response.topics[r.response.topics.length - 1].last_post_time.toString(),
+                    r.response.topics[
+                        r.response.topics.length - 1
+                    ].last_post_time.toString(),
                 ],
             });
         }
         return posts;
     }
 
-    async getAllTests(id, type = null, shownDepth = 1, done = new Set(), returnDone = false) {
+    async getAllTests(
+        id,
+        type = null,
+        shownDepth = 1,
+        done = new Set(),
+        returnDone = false,
+    ) {
         const doneProblems = [];
         const { name, items: allItems } = await this._fetchCategory(id);
 
@@ -203,8 +276,12 @@ export class ForumSession {
         const tests = [];
 
         const items = allItems.filter((item) => {
-            if (item.item_type === "forum" || item.item_type === "post") return false;
-            if (CONTEST_IDS.IGNORE.includes(item.item_id) || done.has(item.item_id)) {
+            if (item.item_type === "forum" || item.item_type === "post")
+                return false;
+            if (
+                CONTEST_IDS.IGNORE.includes(item.item_id) ||
+                done.has(item.item_id)
+            ) {
                 this.log(`Ignoring: ${item.item_id}`);
                 return false;
             }
@@ -217,7 +294,12 @@ export class ForumSession {
                 case "folder": {
                     this.log("========");
                     done.add(item.item_id);
-                    const subTests = await this.getAllTests(item.item_id, type, shownDepth - 1, done);
+                    const subTests = await this.getAllTests(
+                        item.item_id,
+                        type,
+                        shownDepth - 1,
+                        done,
+                    );
                     pCount += subTests.count;
                     if (subTests.count === 0) break;
                     if (shownDepth > 0) {
@@ -229,7 +311,11 @@ export class ForumSession {
                 }
                 case "view_posts": {
                     done.add(item.item_id);
-                    const t = await this.getTest(item.item_id, type, doneProblems);
+                    const t = await this.getTest(
+                        item.item_id,
+                        type,
+                        doneProblems,
+                    );
                     pCount += t.count;
                     if (t.count > 0) tests.push(t);
                     break;
@@ -250,11 +336,17 @@ export class ForumSession {
         const test = { sections: [], problems: [], id, name };
         test.year = CleanupText.extractYear(name);
 
-        let type = ForumSession.inferType(name, true) ?? testType ?? TYPES.UNKNOWN;
+        let type =
+            ForumSession.inferType(name, true) ?? testType ?? TYPES.UNKNOWN;
         this.log(`Test ${id} | Type: ${type.name}`);
 
         const isOly = type.computational === false;
-        const ctx = { sectionCounter: -1, problemIndex: 0, isPrevMulti: false, pCount: 0 };
+        const ctx = {
+            sectionCounter: -1,
+            problemIndex: 0,
+            isPrevMulti: false,
+            pCount: 0,
+        };
         let lastItem = null;
 
         for (let i = 0; i < items.length; i++) {
@@ -262,7 +354,13 @@ export class ForumSession {
             lastItem = item;
 
             if (!isOly && isPostDesc(item)) {
-                type = this._handleSectionMarker(item, items[i + 1], ctx, test, type);
+                type = this._handleSectionMarker(
+                    item,
+                    items[i + 1],
+                    ctx,
+                    test,
+                    type,
+                );
             } else if (this._isProblemItem(item, done)) {
                 await this._handleProblemItem(item, type, ctx, test, done);
             }
@@ -288,7 +386,9 @@ export class ForumSession {
     }
 
     _handleSectionMarker(item, nextItem, ctx, test, type) {
-        const isSameAs = /^same as ([a-zA-Z]+ ){1,3}(\d+)$/.test(item.post_data.post_canonical);
+        const isSameAs = /^same as ([a-zA-Z]+ ){1,3}(\d+)$/.test(
+            item.post_data.post_canonical,
+        );
         if ((nextItem && isPostDesc(nextItem)) || isSameAs) {
             if (isSameAs) ctx.problemIndex++;
             return type;
@@ -316,11 +416,28 @@ export class ForumSession {
         let isMulti;
         if (
             (ctx.problemIndex === 0 || ctx.isPrevMulti) &&
-            (isMulti = CleanupText.checkContainsMultiple(processed, ctx.problemIndex + 1)).length > 1
+            (isMulti = CleanupText.checkContainsMultiple(
+                processed,
+                ctx.problemIndex + 1,
+            )).length > 1
         ) {
-            await this._handleMultiProblem(isMulti, item, type, ctx, test, done);
+            await this._handleMultiProblem(
+                isMulti,
+                item,
+                type,
+                ctx,
+                test,
+                done,
+            );
         } else {
-            await this._handleSingleProblem(processed, item, type, ctx, test, done);
+            await this._handleSingleProblem(
+                processed,
+                item,
+                type,
+                ctx,
+                test,
+                done,
+            );
         }
     }
 
@@ -328,7 +445,10 @@ export class ForumSession {
         ctx.isPrevMulti = true;
         let answers;
         if (type.computational) {
-            answers = await this.searchTopicForAnswer(item.post_data.topic_id, true);
+            answers = await this.searchTopicForAnswer(
+                item.post_data.topic_id,
+                true,
+            );
         }
         for (let j = 0; j < isMulti.length; j++) {
             const problem = {
@@ -355,7 +475,11 @@ export class ForumSession {
     }
 
     async _handleSingleProblem(processed, item, type, ctx, test, done) {
-        const problem = await this._buildProblem(processed, type, item.post_data.topic_id);
+        const problem = await this._buildProblem(
+            processed,
+            type,
+            item.post_data.topic_id,
+        );
         problem.post_id = item.post_data.post_id;
         problem.topic_id = item.post_data.topic_id;
         problem.n = ctx.problemIndex;
@@ -380,14 +504,19 @@ export class ForumSession {
         if (lastItem?.item_text?.toLowerCase() !== "answer key") return;
         const answerPattern = /(?:1[0-5]|[1-9])\.\s(\d{3})/g;
         if (!answerPattern.test(lastItem.post_data.post_canonical)) return;
-        const answers = [...lastItem.post_data.post_canonical.matchAll(answerPattern)].map(m => m[1]);
+        const answers = [
+            ...lastItem.post_data.post_canonical.matchAll(answerPattern),
+        ].map((m) => m[1]);
         for (let i = 0; i < AIME_PROBLEM_COUNT; i++) {
             test.problems[i].choices = [answers[i]];
         }
     }
 
     async _buildProblem(processed, type, topic_id) {
-        const problem = { statement: CleanupText.cleanProblem(processed), answer: null };
+        const problem = {
+            statement: CleanupText.cleanProblem(processed),
+            answer: null,
+        };
 
         if (!type.computational) return problem;
 
@@ -395,7 +524,9 @@ export class ForumSession {
 
         if (type.choices) {
             problem.choices = CleanupText.extractChoices(problem.statement);
-            problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+            problem.statement = CleanupText.cleanChoices(
+                problem.statement,
+            ).trim();
             if (problem.answer != null) {
                 const parsed = CleanupText.parseMCQAns(problem.answer);
                 if (parsed == null) {
@@ -419,7 +550,9 @@ export class ForumSession {
     async searchTopicForAnswer(id, searchManyProblems = false) {
         if (this._permissionDenied) return null;
 
-        const response = await this.sendRequest(ForumSession.payload(ApiMethod.TOPIC, { id }));
+        const response = await this.sendRequest(
+            ForumSession.payload(ApiMethod.TOPIC, { id }),
+        );
 
         if (response.error_code === "E_NO_PERMISSION") {
             this._permissionDenied = true;
@@ -430,7 +563,9 @@ export class ForumSession {
             const answers = {};
             const hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
             for (const post of response.response.topic.posts_data) {
-                for (const matches of post["post_canonical"].matchAll(hideTag)) {
+                for (const matches of post["post_canonical"].matchAll(
+                    hideTag,
+                )) {
                     const answer = CleanupText.getBoxed(matches[2]);
                     if (answer) answers[matches[1]] = answer;
                 }
