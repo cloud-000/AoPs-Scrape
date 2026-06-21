@@ -5,6 +5,9 @@ import { ApiMethod, ForumSession } from "../src/ForumSession.js";
 import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
 import { CleanupText } from "../src/CleanupText.js";
+import { initDB, upsertScrapeResults } from "../src/db.js";
+
+const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
 
 const command = process.argv[2];
 
@@ -67,6 +70,12 @@ async function main() {
             } else {
                 console.log("Data not saved");
             }
+            if (await confirm({ message: `Save to database (${DB_PATH})?`, default: true })) {
+                const db = initDB(DB_PATH);
+                upsertScrapeResults(db, data);
+                db.close();
+                console.log("Saved to database.");
+            }
             break;
         }
 
@@ -96,8 +105,15 @@ async function main() {
             break;
         }
 
+        case "init-db": {
+            const db = initDB(DB_PATH);
+            db.close();
+            console.log(`Database initialized at ${DB_PATH}`);
+            break;
+        }
+
         default:
-            console.log("Available commands: scrape, to-csv, quick-fix");
+            console.log("Available commands: scrape, to-csv, quick-fix, init-db");
             break;
     }
 }

@@ -12,3 +12,7 @@ scrape_data/
 raw*.json
 cleaning_steps
 CLAUDE.md
+
+# DB
+*.sqlite-shm
+*.sqlite-wal
