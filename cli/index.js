@@ -35,7 +35,7 @@ async function main() {
                     loader.bars[0].count++;
                 },
             );
-            session.debug = false;
+            session.debug = true;
             let id = await autoSearch("Enter id: ", ALL_CONTESTS);
             let method = await getMethod();
             if (!(await confirm({ message: `Confirm ${id}?` }))) {
@@ -43,17 +43,17 @@ async function main() {
                 break;
             }
             loader.add(new CLICount("Problems Collected:"));
-            loader.start();
+            // loader.start();
             let loaderInterval = setInterval(() => {
                 loader.calculate();
-                loader.render();
+                // loader.render();
             }, 300);
             let startTime = Date.now();
             data = await method(session, id);
             let elapsedTime = Date.now() - startTime;
             clearInterval(loaderInterval);
             await sleep(100);
-            loader.clear();
+            // loader.clear();
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );
@@ -70,7 +70,12 @@ async function main() {
             } else {
                 console.log("Data not saved");
             }
-            if (await confirm({ message: `Save to database (${DB_PATH})?`, default: true })) {
+            if (
+                await confirm({
+                    message: `Save to database (${DB_PATH})?`,
+                    default: true,
+                })
+            ) {
                 const db = initDB(DB_PATH);
                 upsertScrapeResults(db, data);
                 db.close();
@@ -86,7 +91,9 @@ async function main() {
             upsertScrapeResults(db, data);
             const { c } = db.query("SELECT count(*) as c FROM problems").get();
             db.close();
-            console.log(`Merged ${srcFile} into ${DB_PATH} (${c} total problems in DB).`);
+            console.log(
+                `Merged ${srcFile} into ${DB_PATH} (${c} total problems in DB).`,
+            );
             break;
         }
 
@@ -124,7 +131,9 @@ async function main() {
         }
 
         default:
-            console.log("Available commands: scrape, save-to-db, to-csv, quick-fix, init-db");
+            console.log(
+                "Available commands: scrape, save-to-db, to-csv, quick-fix, init-db",
+            );
             break;
     }
 }
