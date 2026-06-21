@@ -17,3 +17,4 @@ CLAUDE.md
 # DB
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite
