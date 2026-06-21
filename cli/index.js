@@ -32,6 +32,7 @@ async function main() {
                     loader.bars[0].count++;
                 },
             );
+            session.debug = false;
             let id = await autoSearch("Enter id: ", ALL_CONTESTS);
             let method = await getMethod();
             if (!(await confirm({ message: `Confirm ${id}?` }))) {

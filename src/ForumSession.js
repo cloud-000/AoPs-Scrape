@@ -163,10 +163,16 @@ export class ForumSession {
 
     async getAllTests(id, type = null, shownDepth = 1, done = new Set(), returnDone = false) {
         let doneProblems = [];
-        let response = (
-            await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }))
-        ).response;
+        let fullResponse = await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }));
+        if (fullResponse.error_code) {
+            throw new Error(`API error for category ${id}: ${fullResponse.error_code}`);
+        }
+        let response = fullResponse.response;
         this.log(response);
+
+        if (!response.category) {
+            throw new Error(`No category data for id ${id}. Full response: ${JSON.stringify(fullResponse)}`);
+        }
 
         let pCount = 0;
         let tests = [];
@@ -235,10 +241,16 @@ export class ForumSession {
 
     async getTest(id, testType = null, done = []) {
         let test = { sections: [], problems: [], id };
-        let response = (
-            await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }))
-        ).response;
+        let fullResponse = await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }));
+        if (fullResponse.error_code) {
+            throw new Error(`API error for category ${id}: ${fullResponse.error_code}`);
+        }
+        let response = fullResponse.response;
         this.log(response);
+
+        if (!response.category) {
+            throw new Error(`No category data for id ${id}. Full response: ${JSON.stringify(fullResponse)}`);
+        }
 
         test.name = response.category.category_name;
         test.year = CleanupText.extractYear(test.name);
