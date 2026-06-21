@@ -10,3 +10,5 @@ scrape_data/
 **/.env.*
 **/.env
 raw*.json
+cleaning_steps
+CLAUDE.md

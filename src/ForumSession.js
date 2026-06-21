@@ -1,39 +1,43 @@
 import { CleanupText } from "./CleanupText.js";
-import { CONTEST_IDS, POST_USERS, TYPES } from "../contest_id.js";
+import { CONTEST_IDS, TYPES } from "../contest_id.js";
 
-export const FETCH_ = {
+export const ApiMethod = {
     TOPIC: 0,
     CATEGORY_DATA: 1,
     FORUM: 2,
     ITEMS_CATEGORIES: 3,
 };
-// Spaghetti
-let addProblem = (p, sectionCounter, test) => {
+
+const MAA_COPYRIGHT_POST_ID = 4956172;
+const CHMMC_MIXER_ITEM_TEXT = "Mixer";
+const AIME_PROBLEM_COUNT = 15;
+
+const MCQ_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+
+function addProblemToTest(problem, sectionCounter, test, onProblemAdd) {
     if (sectionCounter >= 0) {
-        p.section = sectionCounter;
-        test.problems[test.problems.length - 1].push(p);
+        problem.section = sectionCounter;
+        test.problems[test.problems.length - 1].push(problem);
     } else {
-        test.problems.push(p);
+        test.problems.push(problem);
     }
-    ForumSession.onProblemAdd(p);
-};
+    onProblemAdd(problem);
+}
 
 export class ForumSession {
-    static MORE_INFO = null;
-    static onProblemAdd(data) {}
-    static payload(f_type, params) {
-        switch (f_type) {
-            case FETCH_.TOPIC:
+    static payload(methodType, params) {
+        switch (methodType) {
+            case ApiMethod.TOPIC:
                 return {
                     a: ["fetch_topic"],
                     topic_id: [params["id"].toString()],
                 };
-            case FETCH_.CATEGORY_DATA:
+            case ApiMethod.CATEGORY_DATA:
                 return {
                     a: ["fetch_category_data"],
                     category_id: [params["id"].toString()],
                 };
-            case FETCH_.ITEMS_CATEGORIES:
+            case ApiMethod.ITEMS_CATEGORIES:
                 return {
                     sought_category_ids: "[]",
                     parent_category_id: [params["id"].toString()],
@@ -42,74 +46,53 @@ export class ForumSession {
                     log_visit: ["0"],
                     a: ["fetch_items_categories"],
                 };
-            case FETCH_.FORUM:
+            case ApiMethod.FORUM:
                 return {
                     a: ["fetch_topics"],
                     category_type: ["forum"],
                     category_id: [params["id"].toString()],
                 };
             default:
-                console.error(":( !!! :(");
+                console.error("Unknown ApiMethod:", methodType);
                 break;
         }
     }
 
     static inferType(name, returnNull = false) {
         if (name.includes("OMMC")) {
-            if (name.includes("final")) {
-                return TYPES.AMO;
-            }
-            return TYPES.COMPUTE;
+            return name.includes("final") ? TYPES.AMO : TYPES.COMPUTE;
         }
-        if (name.includes("Solstice Math Olympiad")) {
-            return TYPES.COMPUTE;
-        }
-        if (name.includes("CUBRMC")) {
-            return TYPES.COMPUTE;
-        }
-        if (name.includes("RML")) {
-            return TYPES.ARML;
-        }
-        // if (name.includes("CNCM"))
+        if (name.includes("Solstice Math Olympiad")) return TYPES.COMPUTE;
+        if (name.includes("CUBRMC")) return TYPES.COMPUTE;
+        if (name.includes("RML")) return TYPES.ARML;
+
         if (/[A-Z]MC/.test(name)) {
-            if (/\b8\b/.test(name)) {
-                TYPES.AMC.name = "AMC 8";
-            } else if (/\b10\b/.test(name) || /\b11\b/.test("name")) {
-                TYPES.AMC.name = "AMC 10";
-            } else if (/\b12\b/.test(name)) {
-                TYPES.AMC.name = "AMC 12";
-            } else {
-                TYPES.AMC.name = "AMC";
-            }
-            return TYPES.AMC;
+            let amcName = "AMC";
+            if (/\b8\b/.test(name))       amcName = "AMC 8";
+            else if (/\b10\b/.test(name) || /\b11\b/.test(name)) amcName = "AMC 10";
+            else if (/\b12\b/.test(name)) amcName = "AMC 12";
+            return { ...TYPES.AMC, name: amcName };
         }
-        if (/\bHMMT\b/.test(name)) {
-            return TYPES.COLLEGE;
-        }
+
+        if (/\bHMMT\b/.test(name)) return TYPES.COLLEGE;
+
         for (let collegeName of CONTEST_IDS.CollegeComp) {
             if (name.toLowerCase().includes(collegeName.name.toLowerCase())) {
                 return TYPES.COLLEGE;
             }
         }
-        if (name.includes("IME") && !name.includes("(AIME level)")) {
-            // why c3676367 are you name liked that
-            return TYPES.AIME;
-        }
-        if (name.includes("MO") || name.includes("USAMTS")) {
-            return TYPES.AMO;
-        }
-        if (returnNull) {
-            return null;
-        }
+
+        if (name.includes("IME") && !name.includes("(AIME level)")) return TYPES.AIME;
+        if (name.includes("MO") || name.includes("USAMTS")) return TYPES.AMO;
+
+        if (returnNull) return null;
         return TYPES.UNKNOWN;
     }
 
     static toSearchParams(formData) {
         const searchParams = new URLSearchParams();
-
         for (const key in formData) {
             if (Array.isArray(formData[key])) {
-                // Append each array element with the same key name (no brackets)
                 formData[key].forEach((val) => searchParams.append(key, val));
             } else {
                 searchParams.append(key, formData[key]);
@@ -118,12 +101,21 @@ export class ForumSession {
         return searchParams;
     }
 
-    constructor(loggedIn, userId, sessionId, headers = null) {
+    static isPostDesc(item) {
+        return (
+            item.post_data.post_type === "view_posts_text" ||
+            item.post_data.topic_id === 0
+        );
+    }
+
+    constructor(loggedIn, userId, sessionId, headers = null, onProblemAdd = null) {
         this.loggedIn = loggedIn;
         this.userId = userId;
         this.sessionId = sessionId;
         this.headers = headers;
         this.debug = true;
+        this.onProblemAdd = onProblemAdd ?? (() => {});
+        this._permissionDenied = false;
     }
 
     log(message) {
@@ -132,12 +124,7 @@ export class ForumSession {
         }
     }
 
-    /**
-     * @param {Object} bodyInput - A map of keys to arrays of strings
-     */
     sendRequest(bodyInput) {
-        // 1. Prepare base data
-        // Note: AoPS usually expects 1/0 for booleans in ajax.php
         const formData = {
             aops_logged_in: this.loggedIn ? "1" : "0",
             aops_user_id: this.userId.toString(),
@@ -152,60 +139,32 @@ export class ForumSession {
         if (this.headers) {
             Object.assign(init, { headers: this.headers });
         }
-        return fetch(
-            "https://artofproblemsolving.com/m/community/ajax.php",
-            init,
-        ).then((response) => {
-            return response.json();
-        });
+        return fetch("https://artofproblemsolving.com/m/community/ajax.php", init)
+            .then((response) => response.json());
     }
 
-    /**
-     *
-     * @param {number} id
-     * @param {Function?} checkToStop
-     */
     async getForum(id, checkToStop = null) {
-        let r = await this.sendRequest(
-            ForumSession.payload(FETCH_.FORUM, { id: id }),
-        );
+        let r = await this.sendRequest(ForumSession.payload(ApiMethod.FORUM, { id }));
         let posts = [];
-        let checkStopTest = checkToStop === null ? () => false : checkToStop;
+        let shouldStop = checkToStop ?? (() => false);
         while (!r["no_more_topics"]) {
-            if (r.response["topics"].length === 0) {
-                break;
-            }
+            if (r.response["topics"].length === 0) break;
             posts.push(...r.response["topics"]);
-            if (checkStopTest(posts)) {
-                return posts;
-            }
+            if (shouldStop(posts)) return posts;
             r = await this.sendRequest({
-                ...ForumSession.payload(FETCH_.FORUM, { id: id }),
-                ...{
-                    fetch_before: [
-                        r.response.topics[
-                            r.response.topics.length - 1
-                        ].last_post_time.toString(),
-                    ],
-                },
+                ...ForumSession.payload(ApiMethod.FORUM, { id }),
+                fetch_before: [
+                    r.response.topics[r.response.topics.length - 1].last_post_time.toString(),
+                ],
             });
         }
         return posts;
     }
 
-    async getAllTests(
-        id,
-        type = null,
-        shownDepth = 1,
-        done = new Set(),
-        returnDone = false,
-        removeDuplicates = true,
-    ) {
+    async getAllTests(id, type = null, shownDepth = 1, done = new Set(), returnDone = false) {
         let doneProblems = [];
         let response = (
-            await this.sendRequest(
-                ForumSession.payload(FETCH_.CATEGORY_DATA, { id: id }),
-            )
+            await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }))
         ).response;
         this.log(response);
 
@@ -217,362 +176,257 @@ export class ForumSession {
         if (type == null) {
             type = ForumSession.inferType(name, true);
         }
+
         while (!response.no_more_items) {
             response = (
                 await this.sendRequest(
-                    ForumSession.payload(FETCH_.ITEMS_CATEGORIES, {
-                        id: id,
+                    ForumSession.payload(ApiMethod.ITEMS_CATEGORIES, {
+                        id,
                         start_num: items.length,
                     }),
                 )
             ).response;
-            if (response.no_more_items) {
-                break;
-            }
+            if (response.no_more_items) break;
             items.push(...response.new_items);
         }
-        for (let i = 0; i < items.length; ++i) {
-            if (
-                items[i].item_type === "forum" ||
-                items[i].item_type === "post"
-            ) {
-                // ignore forums
-                items[i] = null;
-                continue;
+
+        items = items.filter((item) => {
+            if (item.item_type === "forum" || item.item_type === "post") return false;
+            if (CONTEST_IDS.IGNORE.includes(item.item_id) || done.has(item.item_id)) {
+                this.log(`Ignoring: ${item.item_id}`);
+                return false;
             }
-            if (
-                CONTEST_IDS.IGNORE.includes(items[i].item_id) ||
-                done.has(items[i].item_id)
-            ) {
-                // ignore already done things
-                this.log(`Ignoring: ${items[i].item_id}`);
-                items[i] = null;
-                continue;
-            }
-        }
-        items = items.filter((item) => item !== null);
+            return true;
+        });
+
         for (let i = 0; i < items.length; i++) {
             this.log(items[i]);
             switch (items[i].item_type) {
-                case "folder":
+                case "folder": {
                     this.log("========");
                     done.add(items[i].item_id);
-                    let subTests = await this.getAllTests(
-                        items[i].item_id,
-                        type,
-                        shownDepth - 1,
-                        done,
-                    );
+                    let subTests = await this.getAllTests(items[i].item_id, type, shownDepth - 1, done);
                     pCount += subTests.count;
-                    if (subTests.count === 0) {
-                        break;
-                    }
+                    if (subTests.count === 0) break;
                     if (shownDepth > 0) {
                         tests.push(subTests);
                     } else {
                         tests.push(...subTests["tests"]);
                     }
-                    subTests = null;
                     break;
-                case "view_posts": // Test
+                }
+                case "view_posts": {
                     done.add(items[i].item_id);
-                    let t = await this.getTest(
-                        items[i].item_id,
-                        type,
-                        doneProblems,
-                    );
+                    let t = await this.getTest(items[i].item_id, type, doneProblems);
                     pCount += t.count;
-                    if (t.count > 0) {
-                        tests.push(t);
-                    }
+                    if (t.count > 0) tests.push(t);
                     break;
+                }
                 default:
-                    this.log("What da " + items[i].item_type);
+                    this.log("Unexpected item_type: " + items[i].item_type);
                     break;
             }
         }
-        let all = {
-            name: name,
-            tests: tests,
-            count: pCount,
-        };
-        if (returnDone) {
-            all["done"] = done;
-        }
-        return all;
+
+        let result = { name, tests, count: pCount };
+        if (returnDone) result["done"] = done;
+        return result;
     }
 
-    static isPostDesc(item) {
-        return (
-            item.post_data.post_type === "view_posts_text" ||
-            item.post_data.topic_id === 0
-        );
-    }
-
-    /**
-     * Spaghetti, refactor later
-     * @param {number} id
-     * @param {number | null} testType Type of Test (AMC, etc) or infer type
-     * @param {number[]} done
-     */
     async getTest(id, testType = null, done = []) {
-        let test = {
-            sections: [],
-            problems: [],
-            id: id,
-        };
+        let test = { sections: [], problems: [], id };
         let response = (
-            await this.sendRequest(
-                ForumSession.payload(FETCH_.CATEGORY_DATA, { id: id }),
-            )
+            await this.sendRequest(ForumSession.payload(ApiMethod.CATEGORY_DATA, { id }))
         ).response;
         this.log(response);
+
         test.name = response.category.category_name;
         test.year = CleanupText.extractYear(test.name);
-        let type = ForumSession.inferType(
-            response.category.category_name,
-            true,
-        );
-        if (type == null) {
-            type = testType || TYPES.UNKNOWN;
-        }
+
+        let type = ForumSession.inferType(response.category.category_name, true);
+        if (type == null) type = testType || TYPES.UNKNOWN;
 
         this.log(`Test ${id} | Type: ${type.name}`);
+
         let sectionCounter = -1;
-        let n = 0;
+        let problemIndex = 0;
         let isPrevMulti = false;
         let pCount = 0;
-
-        let item;
         let isOly = type.computational === false;
+        let lastItem = null;
+
         for (let i = 0; i < response.category.items.length; ++i) {
-            item = response.category.items[i];
-            // day 1, day 2 oly is treated no as separate
+            let item = response.category.items[i];
+            lastItem = item;
+
             if (!isOly && ForumSession.isPostDesc(item)) {
-                // multi-section header OR just problems
                 let isSameAs = /^same as ([a-zA-Z]+ ){1,3}(\d+)$/.test(
                     item.post_data.post_canonical,
                 );
                 if (
                     (i + 1 < response.category.items.length &&
-                        ForumSession.isPostDesc(
-                            response.category.items[i + 1],
-                        )) ||
+                        ForumSession.isPostDesc(response.category.items[i + 1])) ||
                     isSameAs
                 ) {
-                    if (isSameAs) {
-                        n++;
-                    }
+                    if (isSameAs) problemIndex++;
                     continue;
                 }
                 if (/^(?:[dD]ay)\s\d+$/.test(item.post_data.post_canonical)) {
-                    // isOly = true, but since we already ...
                     type = TYPES.AMO;
                 }
-                // Ignore mixer round of chmmc
                 if (item.post_data.post_canonical.trim() === "Mixer Round") {
                     continue;
                 }
-                // double post of individual round as separate (see c3012774)
-                if (
-                    test.sections.length > 0 &&
-                    item.post_data.post_canonical.trim() ===
-                        test.sections[test.sections.length - 1]
-                ) {
-                }
                 test.sections.push(item.post_data.post_canonical.trim());
                 sectionCounter++;
-                n = 0;
+                problemIndex = 0;
                 isPrevMulti = false;
                 test.problems.push([]);
+
             } else if (
                 item.post_data.post_type === "forum" &&
                 item.item_type !== "post_hidden" &&
-                item.post_data.post_id !== 4956172 && // MAA copyright post
-                item.item_text !== "Mixer" && // Chmmc mixer rounds are pain to parse
+                item.post_data.post_id !== MAA_COPYRIGHT_POST_ID &&
+                item.item_text !== CHMMC_MIXER_ITEM_TEXT &&
                 !done.includes(item.post_data.topic_id)
             ) {
                 let processed = CleanupText.toAsyLinks(
                     item.post_data.post_canonical,
                     item.post_data.post_rendered,
                 );
+
                 let isMulti;
                 if (
-                    (n === 0 || isPrevMulti) &&
-                    (isMulti = CleanupText.checkContainsMultiple(
-                        processed,
-                        n + 1,
-                    )).length > 1
+                    (problemIndex === 0 || isPrevMulti) &&
+                    (isMulti = CleanupText.checkContainsMultiple(processed, problemIndex + 1)).length > 1
                 ) {
                     isPrevMulti = true;
                     let answers;
                     if (type.computational) {
-                        answers = await this.searchTopicForAnswer(
-                            item.post_data.topic_id,
-                            true,
-                        );
+                        answers = await this.searchTopicForAnswer(item.post_data.topic_id, true);
                     }
                     for (let j = 0; j < isMulti.length; ++j) {
                         let problem = {
                             statement: CleanupText.cleanChoices(isMulti[j]),
                             post_id: item.post_data.post_id,
                             topic_id: item.post_data.topic_id,
-                            n: j + n,
+                            n: j + problemIndex,
                         };
                         if (type.computational) {
-                            let answer = answers[(j + 1).toString()] || null;
+                            let answer = answers?.[(j + 1).toString()] ?? null;
                             if (type.choices) {
-                                problem.choices = CleanupText.extractChoices(
-                                    isMulti[j],
-                                );
-                                problem.answer =
-                                    problem.choices.indexOf(answer);
+                                problem.choices = CleanupText.extractChoices(isMulti[j]);
+                                problem.answer = problem.choices.indexOf(answer);
                             } else {
                                 problem.choices = [answer];
-                                problem.answer = 1;
+                                problem.answer = 0;
                             }
                         }
-
-                        addProblem(problem, sectionCounter, test);
-                        done.push(item["post_data"]["topic_id"]);
-                        problem = null;
+                        addProblemToTest(problem, sectionCounter, test, this.onProblemAdd);
+                        done.push(item.post_data.topic_id);
                         pCount++;
                     }
+                    problemIndex += isMulti.length;
 
-                    // done.push()
-                    n += isMulti.length;
                 } else {
-                    let problem = await this.getProblem(
-                        processed,
-                        type,
-                        item.post_data.topic_id,
-                    );
-                    problem["post_id"] = item.post_data.post_id;
-                    problem["topic_id"] = item.post_data.topic_id;
-                    problem.n = n;
-                    addProblem(problem, sectionCounter, test);
-                    done.push(problem["topic_id"]);
+                    let problem = await this.getProblem(processed, type, item.post_data.topic_id);
+                    problem.post_id = item.post_data.post_id;
+                    problem.topic_id = item.post_data.topic_id;
+                    problem.n = problemIndex;
+                    addProblemToTest(problem, sectionCounter, test, this.onProblemAdd);
+                    done.push(problem.topic_id);
                     pCount++;
-                    n++;
+                    problemIndex++;
                 }
             }
         }
+
         test.computational = type.computational;
         test.type = type.name;
-        if (test.sections.length === 2) {
-            // why c3676367
-            if (test.problems[1].length === 1) {
-                test.sections.pop();
-            }
-        }
-        if (test.sections.length === 1) {
-            test.sections.pop();
-            let np = [];
-            for (let i = 0; i < test.problems.length; i++) {
-                if (Array.isArray(test.problems[i])) {
-                    np.push(...test.problems[i]);
-                } else {
-                    np.push(test.problems[i]);
-                }
-            }
-            test.problems = np;
-        }
-        if (type.name === "AIME") {
-            if (item.item_text.toLowerCase() === "answer key") {
-                let r = /(?:1[0-5]|[1-9])\.\s(\d{3})/g;
-                if (r.test(item.post_data.post_canonical)) {
-                    let ansy = [
-                        ...item.post_data.post_canonical.matchAll(r),
-                    ].map((m) => m[1]);
-                    for (let i = 0; i < 15; ++i) {
-                        test.problems[i].choices = [ansy[i]];
-                    }
-                }
-            }
-        }
+        this._normalizeSections(test);
+        this._applyAIMEAnswerKey(test, type, lastItem);
         test.count = pCount;
-        ForumSession.MORE_INFO = null;
+        this._permissionDenied = false;
         return test;
     }
 
+    _normalizeSections(test) {
+        if (test.sections.length === 2 && test.problems[1].length === 1) {
+            test.sections.pop();
+        }
+        if (test.sections.length === 1) {
+            test.sections.pop();
+            test.problems = test.problems.flat();
+        }
+    }
+
+    _applyAIMEAnswerKey(test, type, lastItem) {
+        if (type.name !== "AIME") return;
+        if (lastItem?.item_text?.toLowerCase() !== "answer key") return;
+        const answerPattern = /(?:1[0-5]|[1-9])\.\s(\d{3})/g;
+        if (!answerPattern.test(lastItem.post_data.post_canonical)) return;
+        const answers = [...lastItem.post_data.post_canonical.matchAll(answerPattern)].map(m => m[1]);
+        for (let i = 0; i < AIME_PROBLEM_COUNT; ++i) {
+            test.problems[i].choices = [answers[i]];
+        }
+    }
+
     async getProblem(processed, type, topic_id) {
-        let problem = {
-            statement: CleanupText.cleanProblem(processed),
-        };
+        let problem = { statement: CleanupText.cleanProblem(processed) };
         problem.answer = null;
-        if (type.computational) {
-            // Look for answer
-            problem.answer =
-                ForumSession.MORE_INFO === "NO_PERMISSION"
-                    ? null
-                    : await this.searchTopicForAnswer(topic_id);
-            if (type.choices) {
-                problem.choices = CleanupText.extractChoices(problem.statement);
-                problem.statement = CleanupText.cleanChoices(
-                    problem.statement,
-                ).trim();
-                if (problem.answer != null) {
-                    let bruh = CleanupText.parseMCQAns(problem.answer);
-                    if (bruh == null) {
-                        problem.answer = -1;
-                    } else {
-                        if (bruh.type === "letter") {
-                            problem.answer = [
-                                "A",
-                                "B",
-                                "C",
-                                "D",
-                                "E",
-                                "F",
-                                "G",
-                                "H",
-                                "I",
-                                "J",
-                            ].indexOf(bruh.value);
-                        } else {
-                            problem.answer = problem.choices.indexOf(
-                                bruh.value,
-                            );
-                        }
-                    }
-                    // problem.answer = problem.choices.indexOf(problem.answer)
-                } else {
+
+        if (!type.computational) return problem;
+
+        problem.answer = await this.searchTopicForAnswer(topic_id);
+
+        if (type.choices) {
+            problem.choices = CleanupText.extractChoices(problem.statement);
+            problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+            if (problem.answer != null) {
+                let parsed = CleanupText.parseMCQAns(problem.answer);
+                if (parsed == null) {
                     problem.answer = -1;
+                } else if (parsed.type === "letter") {
+                    problem.answer = MCQ_LETTERS.indexOf(parsed.value);
+                } else {
+                    problem.answer = problem.choices.indexOf(parsed.value);
                 }
             } else {
-                problem.choices = [problem.answer];
-                problem.answer = 0;
+                problem.answer = -1;
             }
+        } else {
+            problem.choices = [problem.answer];
+            problem.answer = 0;
         }
+
         return problem;
     }
 
     async searchTopicForAnswer(id, searchManyProblems = false) {
-        let response = await this.sendRequest(
-            ForumSession.payload(FETCH_.TOPIC, { id: id }),
-        );
+        if (this._permissionDenied) return null;
+
+        let response = await this.sendRequest(ForumSession.payload(ApiMethod.TOPIC, { id }));
+
         if (response.error_code === "E_NO_PERMISSION") {
-            ForumSession.MORE_INFO = "NO_PERMISSION";
+            this._permissionDenied = true;
             return null;
         }
+
         if (searchManyProblems) {
             let answers = {};
             let hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
             for (let post of response.response.topic.posts_data) {
                 for (let matches of post["post_canonical"].matchAll(hideTag)) {
                     let answer = CleanupText.getBoxed(matches[2]);
-                    if (answer) {
-                        answers[matches[1]] = answer;
-                    }
+                    if (answer) answers[matches[1]] = answer;
                 }
             }
             return answers;
         }
+
         for (let post of response.response.topic.posts_data) {
             let a = CleanupText.getBoxed(post.post_canonical);
-            if (a != null) {
-                return a;
-            }
+            if (a != null) return a;
         }
         return null;
     }
