@@ -239,6 +239,8 @@ Heuristically maps a category/test name to a contest type from `TYPES`.
 
 The single low-level fetch call. Adds auth fields, applies the random delay, posts to `ajax.php`, and returns parsed JSON. Retries up to 3 times on Cloudflare challenge pages (with exponential backoff) and on JSON parse failures.
 
+If `session.cache` is set (a `ResponseCache` instance, see `src/ResponseCache.js`), `sendRequest` first checks the cache: on a hit it returns the cached response immediately, skipping the network call and the request delay entirely. On a miss it performs the fetch as normal and writes the parsed response to the cache before returning. Cache keys are derived deterministically from `bodyInput` (the payload, which excludes user-specific auth fields), so cached responses are user-independent. The cache is opt-in via the "Use response cache?" prompt in the `scrape` command and stored as plain JSON files under `./response_cache`.
+
 **Input:**
 
 | Param | Type | Description |

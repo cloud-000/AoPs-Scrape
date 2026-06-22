@@ -2,6 +2,7 @@
 import { input, confirm, select, search } from "@inquirer/prompts";
 import { ENV } from "../.env.js";
 import { ApiMethod, ForumSession } from "../src/ForumSession.js";
+import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
 import { CleanupText } from "../src/CleanupText.js";
@@ -45,6 +46,15 @@ async function main() {
             session.enableStickyAnswerKey = true;
 
             let method = await getMethod();
+            if (
+                await confirm({
+                    message: "Use response cache?",
+                    default: false,
+                })
+            ) {
+                session.cache = new ResponseCache("./response_cache");
+                console.log("Response cache enabled (./response_cache)");
+            }
             if (!(await confirm({ message: `Confirm ${id}?` }))) {
                 console.log("Exiting");
                 break;

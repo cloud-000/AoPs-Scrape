@@ -127,6 +127,7 @@ export class ForumSession {
         this._currentForumCategoryId = null;
         this.enableStickyAnswerKey = false;
         this.requestDelay = [100, 250];
+        this.cache = null;
     }
 
     log(message) {
@@ -136,6 +137,10 @@ export class ForumSession {
     }
 
     async sendRequest(bodyInput) {
+        if (this.cache && this.cache.has(bodyInput)) {
+            return await this.cache.get(bodyInput);
+        }
+
         const formData = {
             aops_logged_in: this.loggedIn ? "1" : "0",
             aops_user_id: this.userId.toString(),
@@ -185,7 +190,9 @@ export class ForumSession {
                 continue;
             }
             try {
-                return JSON.parse(text);
+                const parsed = JSON.parse(text);
+                if (this.cache) await this.cache.set(bodyInput, parsed);
+                return parsed;
             } catch (e) {
                 if (attempt === MAX_RETRIES) {
                     console.error(
