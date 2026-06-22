@@ -7,6 +7,8 @@ import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
 import { CleanupText } from "../src/CleanupText.js";
 import { initDB, upsertScrapeResults } from "../src/db.js";
+import { unlinkSync, existsSync } from "node:fs";
+
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
 
@@ -164,9 +166,41 @@ async function main() {
             break;
         }
 
+        case "clear-db": {
+            const force = process.argv.includes("--yes") || process.argv.includes("-y") || process.argv[3] === "--yes" || process.argv[3] === "-y";
+            if (
+                force ||
+                await confirm({
+                    message: `Are you sure you want to clear the database (${DB_PATH})? This will delete all tables and data.`,
+                    default: false,
+                })
+            ) {
+                try {
+                    if (existsSync(DB_PATH)) {
+                        unlinkSync(DB_PATH);
+                    }
+                    if (existsSync(`${DB_PATH}-wal`)) {
+                        unlinkSync(`${DB_PATH}-wal`);
+                    }
+                    if (existsSync(`${DB_PATH}-shm`)) {
+                        unlinkSync(`${DB_PATH}-shm`);
+                    }
+                    console.log("Database file deleted.");
+                } catch (err) {
+                    console.error("Failed to delete database files:", err.message);
+                }
+                const db = initDB(DB_PATH);
+                db.close();
+                console.log(`Database cleared and re-initialized at ${DB_PATH}`);
+            } else {
+                console.log("Database clear cancelled.");
+            }
+            break;
+        }
+
         default:
             console.log(
-                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, preprocess",
+                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, preprocess, clear-db",
             );
             break;
     }
