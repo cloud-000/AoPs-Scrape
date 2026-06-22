@@ -193,6 +193,7 @@ async function exportToCSV(seriesList) {
         seriesRows.push({
             id: seriesId,
             name: series.name,
+            aops_id: series.id ?? -1,
             is_official: false,
         });
 
