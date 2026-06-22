@@ -48,10 +48,10 @@ CREATE TABLE IF NOT EXISTS problems (
 
   topic            TEXT,
   tags             TEXT,
-  is_computational INTEGER DEFAULT 0,
+  is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty       INTEGER DEFAULT 0,
   quality          INTEGER DEFAULT 0,
-  verified         INTEGER DEFAULT 0,
+  verified         BOOLEAN NOT NULL DEFAULT FALSE CHECK (verified IN (0, 1)),
   notes            TEXT,
 
   created_at TEXT DEFAULT (datetime('now')),
@@ -98,6 +98,41 @@ CREATE TABLE IF NOT EXISTS problem_history (
   old_statement TEXT,
   new_statement TEXT,
   changed_at    TEXT DEFAULT (datetime('now'))
+);
+
+-- Clean, denormalized, standalone export table. Purely derived from problems +
+-- solutions via buildProductionProblems(); rebuilt on demand, holds no manual
+-- state of its own. No aops_*/pdf_* source columns.
+CREATE TABLE IF NOT EXISTS production_problems (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+
+  -- denormalized contest identity
+  series_name        TEXT,
+  test_name          TEXT,
+  test_year          INTEGER,
+  test_type          TEXT,
+  is_official        BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official IN (0, 1)),
+  n                  INTEGER NOT NULL,
+  section            INTEGER NOT NULL DEFAULT -1,
+
+  -- merged content
+  statement          TEXT,
+  choices            TEXT,    -- JSON array of choice texts; NULL if not MCQ
+  answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
+  official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
+
+  -- metadata (carried over from problems)
+  topic              TEXT,
+  tags               TEXT,    -- JSON array
+  is_computational   BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
+  difficulty         INTEGER DEFAULT 0,
+  quality            INTEGER DEFAULT 0,
+  verified           BOOLEAN NOT NULL DEFAULT FALSE CHECK (verified IN (0, 1)),
+  notes              TEXT,
+
+  built_at           TEXT DEFAULT (datetime('now')),
+
+  UNIQUE(series_name, test_name, test_year, section, n)
 );
 `;
 
@@ -460,4 +495,71 @@ export function upsertScrapeResults(db, raw) {
             }
         }
     })();
+}
+
+// Rebuilds the denormalized production_problems table from the curated problems
+// + solutions data. The table is purely derived, so we wipe and rebuild it in a
+// single transaction (no stale rows, no dedup logic). Returns the row count.
+export function buildProductionProblems(db) {
+    let count = 0;
+    db.transaction(() => {
+        db.run(`DELETE FROM production_problems`);
+
+        // To restrict production to vetted rows, add a WHERE here
+        // (e.g. `WHERE p.verified = 1` or `WHERE p.statement IS NOT NULL`).
+        const rows = db
+            .query(
+                `
+            SELECT p.id, p.n, p.section, p.statement, p.aops_choices AS choices,
+                   p.answer_index, p.topic, p.tags, p.is_computational,
+                   p.difficulty, p.quality, p.verified, p.notes,
+                   t.name AS test_name, t.year AS test_year, t.type AS test_type,
+                   s.name AS series_name, s.is_official
+            FROM problems p
+            JOIN tests t ON p.test_id = t.id
+            JOIN series s ON t.series_id = s.id
+            ORDER BY s.name, t.year, t.name, p.section, p.n
+        `,
+            )
+            .all();
+
+        const solStmt = db.query(
+            `SELECT content FROM solutions
+             WHERE problem_id = ? AND is_official = 1 ORDER BY id`,
+        );
+        const insert = db.query(`
+            INSERT INTO production_problems (
+                series_name, test_name, test_year, test_type, is_official, n, section,
+                statement, choices, answer_index, official_solutions,
+                topic, tags, is_computational, difficulty, quality, verified, notes
+            ) VALUES (?,?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+        `);
+
+        for (const r of rows) {
+            const sols = solStmt.all(r.id).map((x) => x.content);
+            const officialSolutions = sols.length ? JSON.stringify(sols) : null;
+            insert.run(
+                r.series_name,
+                r.test_name,
+                r.test_year,
+                r.test_type,
+                r.is_official,
+                r.n,
+                r.section,
+                r.statement,
+                r.choices,
+                r.answer_index,
+                officialSolutions,
+                r.topic,
+                r.tags,
+                r.is_computational,
+                r.difficulty,
+                r.quality,
+                r.verified,
+                r.notes,
+            );
+            count++;
+        }
+    })();
+    return count;
 }

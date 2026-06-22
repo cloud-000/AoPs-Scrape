@@ -6,7 +6,11 @@ import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
 import { CleanupText } from "../src/CleanupText.js";
-import { initDB, upsertScrapeResults } from "../src/db.js";
+import {
+    initDB,
+    upsertScrapeResults,
+    buildProductionProblems,
+} from "../src/db.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
@@ -165,6 +169,14 @@ async function main() {
             break;
         }
 
+        case "build-production": {
+            const db = initDB(DB_PATH);
+            const n = buildProductionProblems(db);
+            console.log(`Built production_problems: ${n} rows.`);
+            db.close();
+            break;
+        }
+
         case "clear-db": {
             const force =
                 process.argv.includes("--yes") ||
@@ -208,7 +220,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, preprocess, clear-db",
+                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, build-production, preprocess, clear-db",
             );
             break;
     }
