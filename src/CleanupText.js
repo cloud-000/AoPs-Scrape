@@ -284,12 +284,28 @@ export class CleanupText {
         return text.replace(/P\.?S\.?.*hide for answers.*$/i, "").trim();
     }
 
-    static parseAnswerKey(content) {
+    static parseAnswerKey(content, name = null) {
         const result = {};
 
-        // Extract hide tag contents
-        const hideRe = /\[hide[^\]]*\]([\s\S]*?)\[\/hide\]/gi;
-        const hideSegments = [...content.matchAll(hideRe)].map((m) => m[1]);
+        // Extract hide tag contents, keeping the [hide=label] label so that a
+        // post carrying several answer keys can be disambiguated by `name`.
+        const hideRe = /\[hide(?:\s*=\s*"?([^\]"]*)"?)?\]([\s\S]*?)\[\/hide\]/gi;
+        const hideBlocks = [...content.matchAll(hideRe)].map((m) => ({
+            label: (m[1] ?? "").trim(),
+            body: m[2],
+        }));
+        const hideSegments = hideBlocks.map((b) => b.body);
+
+        // A real answer key is numbered 1..N with no gaps. Requiring that before
+        // short-circuiting keeps a partial match (e.g. only the lines whose
+        // values are short enough for Format A, or a stray trailing "4. 8")
+        // from pre-empting the more general formats below.
+        const isContiguousFrom1 = (m) => {
+            const n = Object.keys(m).length;
+            if (n === 0) return false;
+            for (let i = 1; i <= n; i++) if (!m[String(i)]) return false;
+            return true;
+        };
 
         // Format A: numbered list on full content + inside hide tags
         const numberedRe = /^\s*(\d+)[.)]\s+([A-Ea-e]|\d{1,3})\s*$/gm;
@@ -298,7 +314,72 @@ export class CleanupText {
                 if (!result[m[1]]) result[m[1]] = m[2].toUpperCase();
             }
         }
-        if (Object.keys(result).length > 0) return result;
+        if (isContiguousFrom1(result)) return result;
+
+        // Format A2: numbered list with $...$ math answers, e.g.
+        //   "4. $\frac{17}{6}$" or "5. $310-320$". Keeps the LaTeX verbatim
+        //   (no uppercasing) and stops at the first non-matching line.
+        const numberedMathRe = /^\s*(\d+)[.)]\s*\$([\s\S]+?)\$\s*[.;]?\s*$/gm;
+        for (const text of [content, ...hideSegments]) {
+            for (const m of text.matchAll(numberedMathRe)) {
+                if (!result[m[1]]) result[m[1]] = m[2].trim();
+            }
+        }
+        if (isContiguousFrom1(result)) return result;
+
+        // Format C: general numbered list with free-form answers that may carry
+        // a " | author" annotation, e.g. "3. 1018081 | james4l", "9. 11/18 | …".
+        // When the post holds several [hide=label] answer keys (e.g. one per
+        // subtest), pick the block whose label best matches `name`.
+        const cleanAns = (s) => {
+            let v = s
+                .replace(/\s+\|\s+.*$/, "") // drop " | author" annotations
+                .trim()
+                .replace(/^\$(.+)\$$/, "$1") // unwrap $…$
+                .trim();
+            if (/^[a-e]$/i.test(v)) v = v.toUpperCase();
+            return v;
+        };
+        const parseBlock = (text) => {
+            const map = {};
+            for (const m of text.matchAll(/^\s*(\d+)[.)]\s+(\S.*?)\s*$/gm)) {
+                if (!map[m[1]]) map[m[1]] = cleanAns(m[2]);
+            }
+            // Only treat as an answer list when it starts at 1 with a few
+            // entries, so stray "1. …" prose lines don't masquerade as a key.
+            return map["1"] && Object.keys(map).length >= 3 ? map : {};
+        };
+
+        const blockMaps = hideBlocks
+            .map((b) => ({ label: b.label, map: parseBlock(b.body) }))
+            .filter((b) => Object.keys(b.map).length > 0);
+
+        if (blockMaps.length > 0) {
+            let chosen = blockMaps[0];
+            if (blockMaps.length > 1 && name) {
+                const nameWords = new Set(
+                    name.toLowerCase().match(/[a-z0-9]+/g) ?? [],
+                );
+                let bestScore = -1;
+                for (const b of blockMaps) {
+                    const labelWords = (
+                        b.label.toLowerCase().match(/[a-z0-9]+/g) ?? []
+                    ).filter((w) => !["answer", "key", "for"].includes(w));
+                    const score = labelWords.filter((w) =>
+                        nameWords.has(w),
+                    ).length;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        chosen = b;
+                    }
+                }
+            }
+            return chosen.map;
+        }
+
+        // No hide block held a list — try the full content as one block.
+        const fullMap = parseBlock(content);
+        if (Object.keys(fullMap).length > 0) return fullMap;
 
         // Format B: A-E letter block — packed ("DBBBC") or spaced ("D B B B C")
         // Try hide segments first; fall back to full content only if no hide tags present

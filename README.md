@@ -7,4 +7,5 @@ TODOS
     - save partial data
     - resume
 - cache for listing the contest of a subcollection etc
+    - refactor into subfolders
 - pdf merge

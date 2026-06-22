@@ -418,7 +418,16 @@ export class ForumSession {
 
         test.computational = type.computational;
         test.type = type.name;
-        if (
+
+        // Prefer an answer key embedded directly in the test category — it
+        // ships with the data we already fetched, no extra request. Fall back
+        // to the stickied forum lookup only when none is present.
+        const inCategoryKey = !isOly
+            ? this._extractInCategoryAnswerKey(items, name)
+            : null;
+        if (inCategoryKey) {
+            this._applyForumAnswerKey(test, inCategoryKey, type);
+        } else if (
             this.enableStickyAnswerKey &&
             !isOly &&
             this._currentForumCategoryId
@@ -544,10 +553,12 @@ export class ForumSession {
             };
             if (type.computational) {
                 const answer = answers?.[(j + 1).toString()] ?? null;
-                problem.raw_answer = answer;
                 if (type.choices) {
+                    problem.raw_answer = answer;
                     problem.choices = CleanupText.extractChoices(isMulti[j]);
                     problem.answer = problem.choices.indexOf(answer);
+                } else {
+                    this._setNumericAnswer(problem, answer);
                 }
             }
             addProblemToTest(problem, ctx, test, this.onProblemAdd);
@@ -580,6 +591,26 @@ export class ForumSession {
             test.sections.pop();
             test.problems = test.problems.flat();
         }
+    }
+
+    _extractInCategoryAnswerKey(items, name = null) {
+        // Some tests carry their answer key as a hidden post right inside the
+        // category (item_text like "answer key"). It is dropped from the
+        // problem list by _isProblemItem, so parse it here separately.
+        const keyItem = items.find(
+            (item) =>
+                item.item_type === "post_hidden" &&
+                /answers?\s*key/i.test(item.item_text ?? ""),
+        );
+        if (!keyItem) return null;
+
+        const answerMap = CleanupText.parseAnswerKey(
+            keyItem.post_data?.post_canonical ?? "",
+            name,
+        );
+        return answerMap && Object.keys(answerMap).length > 0
+            ? answerMap
+            : null;
     }
 
     async _fetchStickyAnswerKey(forumCategoryId, testName) {
@@ -625,7 +656,10 @@ export class ForumSession {
         const parsePosts = (posts) => {
             for (const post of posts) {
                 // If fetching sticky answers turn wrong, it might be parseAnswerKey not parsing correctly.
-                const parsed = CleanupText.parseAnswerKey(post.post_canonical);
+                const parsed = CleanupText.parseAnswerKey(
+                    post.post_canonical,
+                    testName,
+                );
                 if (!parsed) continue;
                 for (const [num, ans] of Object.entries(parsed)) {
                     if (!answerMap[num]) answerMap[num] = ans;
@@ -668,7 +702,7 @@ export class ForumSession {
                 }
             } else if (problem.raw_answer == null) {
                 // Numeric: only fill when \boxed{} found nothing
-                problem.raw_answer = ans;
+                this._setNumericAnswer(problem, ans);
             }
         };
 
@@ -678,6 +712,21 @@ export class ForumSession {
             }
         } else {
             for (const problem of test.problems) apply(problem);
+        }
+    }
+
+    _setNumericAnswer(problem, rawAnswer) {
+        // Numeric problems have no MCQ choices, but a known answer is still
+        // representable as a single-element choice list with the index at 0 —
+        // matching how the CSV/DB layer normalizes them. When no answer is
+        // known, leave choices null / answer -1 to signal "unresolved".
+        problem.raw_answer = rawAnswer ?? null;
+        if (rawAnswer != null) {
+            problem.choices = [rawAnswer];
+            problem.answer = 0;
+        } else {
+            problem.choices = null;
+            problem.answer = -1;
         }
     }
 
@@ -731,8 +780,7 @@ export class ForumSession {
             }
         } else {
             // Numeric (AIME, COMP, COLLEGE, etc.)
-            problem.choices = null;
-            problem.answer = -1; // no index concept for numeric answers
+            this._setNumericAnswer(problem, rawAnswer);
         }
 
         return problem;

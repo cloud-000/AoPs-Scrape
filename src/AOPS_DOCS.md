@@ -304,15 +304,36 @@ Fetches and parses a single test category into a structured test object.
   n: number,                // 0-based problem index
   topic_id: number,
   post_id: number,
-  choices: string[] | null, // MCQ options or [answer] for computational, null for proof-based
-  answer: number | null,    // index into choices, or -1 if unknown, or null for proof-based
+  choices: string[] | null, // MCQ options; [answer] for a numeric problem with a known answer; null when unresolved or proof-based
+  answer: number | null,    // index into choices (0 for a resolved numeric answer), -1 if unknown, or null for proof-based
   section: number,          // (only present if sectioned test) index into sections[]
 }
 ```
 
+Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) have no real choice list, but a *known* answer is still represented uniformly as `choices = [raw_answer]` with `answer = 0` (done by `_setNumericAnswer`), matching how the CSV/DB layer normalizes them. When no answer is found, `choices` stays `null` and `answer` stays `-1`. `raw_answer` always holds the original answer string (or `null`).
+
 Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat.
 
 Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topic_id === 0`.
+
+Answer keys: after the problem list is built (and only for computational tests), `getTest` always calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). If found, it is parsed with `CleanupText.parseAnswerKey(post_canonical, name)` and applied via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`); when a post packs multiple `[hide=label]` keys (e.g. one per subtest), the block whose label best matches `name` is chosen. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
+
+---
+
+### `_extractInCategoryAnswerKey(items, name = null)`
+
+Finds and parses an answer key embedded in a test category's own item list.
+
+**Input:**
+
+| Param | Type | Description |
+|---|---|---|
+| `items` | object[] | The category items array returned by `_fetchCategory(id)` |
+| `name` | string \| null | Test name, forwarded to `parseAnswerKey` to disambiguate multi-key posts |
+
+**Output:** `Record<string, string>` mapping 1-based problem number to answer string, or `null` if no answer-key item is found or it parses to nothing.
+
+Selects the first item with `item_type === "post_hidden"` whose `item_text` matches `/answers?\s*key/i`, then runs `CleanupText.parseAnswerKey(post_canonical, name)`. These items are excluded from the problem list by `_isProblemItem`, so they must be parsed separately here. No network request.
 
 ---
 
@@ -399,13 +420,13 @@ Looks for a stickied answer-key topic in a forum category and returns a parsed a
 1. Fetches first page of forum topics via `fetch_topics`.
 2. Filters for `announce_type === "local"` topics whose `topic_title` contains `"answer key"`.
 3. If multiple candidates, scores each by keyword overlap with `testName` (stripping "answer"/"key") and picks the highest scorer; returns `null` if all score 0.
-4. Fetches the winning topic and calls `CleanupText.parseAnswerKey` on each post, merging results (first hit per problem number wins).
+4. Fetches the winning topic and calls `CleanupText.parseAnswerKey(post_canonical, testName)` on each post, merging results (first hit per problem number wins).
 
 ---
 
 ### `_applyForumAnswerKey(test, answerMap, type)`
 
-Applies a parsed answer map (from `_fetchStickyAnswerKey`) to a test's problems.
+Applies a parsed answer map (from `_extractInCategoryAnswerKey` or `_fetchStickyAnswerKey`) to a test's problems.
 
 **Input:**
 
@@ -417,9 +438,15 @@ Applies a parsed answer map (from `_fetchStickyAnswerKey`) to a test's problems.
 
 **Behavior:**
 - **MCQ** (`type.choices`): answer key is authoritative — sets `raw_answer` and re-resolves `answer` index, overriding any `\boxed{}` result from the discussion thread.
-- **Numeric** (AIME, COMP, etc.): only sets `raw_answer` if it is currently `null`; never overrides a `\boxed{}` answer.
+- **Numeric** (AIME, COMP, etc.): only fills in the answer when `raw_answer` is currently `null` (never overrides a `\boxed{}` answer); when it does, it sets `raw_answer`, `choices = [answer]`, and `answer = 0` via `_setNumericAnswer`.
 - Problems with no entry in `answerMap` are untouched.
 - Works on both flat and section-nested `problems` arrays; uses a running counter (not `problem.n`) for 1-based numbering across sections.
+
+---
+
+### `_setNumericAnswer(problem, rawAnswer)`
+
+Writes a numeric (non-MCQ computational) answer onto a problem in the normalized shape. If `rawAnswer != null`, sets `raw_answer = rawAnswer`, `choices = [rawAnswer]`, `answer = 0`; otherwise sets `raw_answer = null`, `choices = null`, `answer = -1`. Used by `_buildProblem`, `_handleMultiProblem`, and `_applyForumAnswerKey` so every numeric path produces an identical representation.
 
 ---
 

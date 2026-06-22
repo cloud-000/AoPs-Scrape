@@ -9,7 +9,6 @@ import { CleanupText } from "../src/CleanupText.js";
 import { initDB, upsertScrapeResults } from "../src/db.js";
 import { unlinkSync, existsSync } from "node:fs";
 
-
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
 
 const command = process.argv[2];
@@ -62,17 +61,17 @@ async function main() {
                 break;
             }
             loader.add(new CLICount("Problems Collected:"));
-            // loader.start();
+            loader.start();
             let loaderInterval = setInterval(() => {
                 loader.calculate();
-                // loader.render();
+                loader.render();
             }, 300);
             let startTime = Date.now();
             data = await method(session, id);
             let elapsedTime = Date.now() - startTime;
             clearInterval(loaderInterval);
             await sleep(100);
-            // loader.clear();
+            loader.clear();
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );
@@ -167,13 +166,17 @@ async function main() {
         }
 
         case "clear-db": {
-            const force = process.argv.includes("--yes") || process.argv.includes("-y") || process.argv[3] === "--yes" || process.argv[3] === "-y";
+            const force =
+                process.argv.includes("--yes") ||
+                process.argv.includes("-y") ||
+                process.argv[3] === "--yes" ||
+                process.argv[3] === "-y";
             if (
                 force ||
-                await confirm({
+                (await confirm({
                     message: `Are you sure you want to clear the database (${DB_PATH})? This will delete all tables and data.`,
                     default: false,
-                })
+                }))
             ) {
                 try {
                     if (existsSync(DB_PATH)) {
@@ -187,11 +190,16 @@ async function main() {
                     }
                     console.log("Database file deleted.");
                 } catch (err) {
-                    console.error("Failed to delete database files:", err.message);
+                    console.error(
+                        "Failed to delete database files:",
+                        err.message,
+                    );
                 }
                 const db = initDB(DB_PATH);
                 db.close();
-                console.log(`Database cleared and re-initialized at ${DB_PATH}`);
+                console.log(
+                    `Database cleared and re-initialized at ${DB_PATH}`,
+                );
             } else {
                 console.log("Database clear cancelled.");
             }
