@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS solutions (
   updated_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- Dedup real AoPS solutions by post id; -1 (not on AoPS) rows are excluded
+-- so multiple sentinel rows can coexist.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_solutions_aops_post_id
+  ON solutions (aops_post_id) WHERE aops_post_id >= 0;
+
 CREATE TABLE IF NOT EXISTS oly_potential_solutions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   problem_id  INTEGER NOT NULL REFERENCES problems(id) UNIQUE,
@@ -147,34 +152,81 @@ function upsertSeries(db, name, aopsId = -1, isOfficial = false) {
     return db.query(`SELECT id FROM series WHERE name = ?`).get(name).id;
 }
 
+// Resolves an existing test id. Prefers the AoPS category id (stable when
+// present); otherwise falls back to the natural key (series_id, year, name) so
+// non-AoPS sources (e.g. Mandelbrot) dedup, and a PDF-first test can later be
+// linked to its AoPS category. Returns null if no match.
+function resolveTestId(db, { aopsCategoryId, seriesId, year, name }) {
+    if (aopsCategoryId != null) {
+        const byAops = db
+            .query(`SELECT id FROM tests WHERE aops_category_id = ?`)
+            .get(aopsCategoryId);
+        if (byAops) return byAops.id;
+    }
+    // `year IS ?` matches NULL years too (IS behaves like = for non-NULL).
+    const byNatural = db
+        .query(
+            `SELECT id FROM tests WHERE series_id = ? AND name = ? AND year IS ?`,
+        )
+        .get(seriesId, name, year ?? null);
+    return byNatural ? byNatural.id : null;
+}
+
 function upsertTest(
     db,
     { aopsCategoryId, name, year, type, isComputational },
     seriesId,
 ) {
+    const existingId = resolveTestId(db, {
+        aopsCategoryId,
+        seriesId,
+        year,
+        name,
+    });
+
+    if (existingId != null) {
+        db.run(
+            `
+            UPDATE tests SET
+                name             = ?,
+                year             = ?,
+                type             = ?,
+                is_computational = ?,
+                series_id        = ?,
+                -- Link the AoPS id when one arrives; never clobber an existing link.
+                aops_category_id = COALESCE(aops_category_id, ?)
+            WHERE id = ?
+        `,
+            [
+                name,
+                year ?? null,
+                type ?? null,
+                isComputational ? 1 : 0,
+                seriesId,
+                aopsCategoryId ?? null,
+                existingId,
+            ],
+        );
+        return existingId;
+    }
+
     db.run(
         `
         INSERT INTO tests (series_id, name, year, aops_category_id, type, is_computational)
         VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (aops_category_id) DO UPDATE SET
-            name             = excluded.name,
-            year             = excluded.year,
-            type             = excluded.type,
-            is_computational = excluded.is_computational,
-            series_id        = excluded.series_id
     `,
         [
             seriesId,
             name,
             year ?? null,
-            aopsCategoryId,
+            aopsCategoryId ?? null,
             type ?? null,
             isComputational ? 1 : 0,
         ],
     );
     return db
-        .query(`SELECT id FROM tests WHERE aops_category_id = ?`)
-        .get(aopsCategoryId).id;
+        .query(`SELECT id FROM tests WHERE rowid = last_insert_rowid()`)
+        .get().id;
 }
 
 function upsertSolutions(db, problemId, solutions, allPosts, isOly) {
@@ -183,14 +235,14 @@ function upsertSolutions(db, problemId, solutions, allPosts, isOly) {
             `
             INSERT INTO solutions (problem_id, source, aops_topic_id, aops_post_id, aops_user_id, aops_username, content, posted_at)
             VALUES (?, 'aops', ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (aops_post_id) DO UPDATE SET
+            ON CONFLICT (aops_post_id) WHERE aops_post_id >= 0 DO UPDATE SET
                 is_official = MAX(solutions.is_official, excluded.is_official),
                 content = excluded.content
         `,
             [
                 problemId,
                 sol.topic_id ?? null,
-                sol.post_id,
+                sol.post_id ?? null,
                 sol.user_id ?? null,
                 sol.username ?? null,
                 sol.content,
@@ -383,7 +435,7 @@ export function upsertScrapeResults(db, raw) {
             const testId = upsertTest(
                 db,
                 {
-                    aopsCategoryId: test.id.toString(),
+                    aopsCategoryId: test.id != null ? test.id.toString() : null,
                     name: test.name,
                     year: test.year ?? null,
                     type: test.type ?? null,

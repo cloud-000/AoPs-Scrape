@@ -612,14 +612,15 @@ export class ForumSession {
         parsePosts(best.posts_data ?? []);
 
         // Fall back to fetch_topic if topics_data only included a subset of posts
-        if (Object.keys(answerMap).length === 0) {
+        // Ignore for now
+        /*if (Object.keys(answerMap).length === 0) {
             const topicResponse = await this.sendRequest(
                 ForumSession.payload(ApiMethod.TOPIC, { id: best.topic_id }),
             );
             if (!topicResponse.error_code) {
                 parsePosts(topicResponse.response.topic.posts_data ?? []);
             }
-        }
+        }*/
 
         return Object.keys(answerMap).length > 0 ? answerMap : null;
     }
