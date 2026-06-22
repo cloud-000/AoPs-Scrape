@@ -165,7 +165,7 @@ Items returned inside `category.items` / `new_items` from `fetch_category_data` 
 
 - `item_type === "view_posts"` → a problem post (scrape it)
 - `item_type === "folder"` → a sub-folder containing more tests (recurse)
-- `item_type === "post"` or `post_type === "view_posts_text"` → a section marker or description post (not a problem)
+- `item_type === "post"` or `post_type === "view_posts_text"` → usually a section marker or description post (not a problem). **Exception:** some contests pack the entire test into one such post as a numbered list ("1. … 2. …" with MCQ choices) and expose no per-problem forum topics. `getTest` detects this via `_isPackedProblemPost` and routes the post through the multi-problem path instead of treating it as a section title. Such problems have `topic_id === 0` and therefore no discussion thread to mine for answers (answers stay `-1`/`null`).
 - `item_type === "post_hidden"` → hidden/locked post (skip)
 
 ---
@@ -312,6 +312,8 @@ Fetches and parses a single test category into a structured test object.
 
 Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat.
 
+Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topic_id === 0`.
+
 ---
 
 ### `getAllTests(id, type = null, shownDepth = 1, done = new Set(), returnDone = false)`
@@ -374,6 +376,7 @@ Fetches a problem topic's discussion thread and extracts the answer from reply p
 - If `searchManyProblems` is false: `string | null` — the raw `\boxed{…}` content of the first matching reply, or `null` if none found.
 - If `searchManyProblems` is true: `Record<string, string>` — map of problem number string → boxed answer string (e.g., `{ "1": "42", "2": "7" }`).
 - Returns `null` (and sets `_permissionDenied = true`) if the API returns `E_NO_PERMISSION`; subsequent calls within the same `getTest` are short-circuited.
+- Returns empty results immediately for a falsy `id` (e.g. `0`), since packed-post problems have no backing discussion topic.
 
 **Side effect:** caches `topic.category_id` from the response into `this._currentForumCategoryId` (used by `_fetchStickyAnswerKey`).
 

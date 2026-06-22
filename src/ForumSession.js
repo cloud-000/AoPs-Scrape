@@ -395,13 +395,22 @@ export class ForumSession {
             lastItem = item;
 
             if (!isOly && isPostDesc(item)) {
-                type = this._handleSectionMarker(
-                    item,
-                    items[i + 1],
-                    ctx,
-                    test,
-                    type,
-                );
+                // Normally a view_posts_text item is a section/description
+                // marker. But some contests pack the entire problem set into
+                // a single such post (numbered "1. … 2. …" with choices) and
+                // expose no per-problem forum topics. Detect that and route it
+                // through the problem path instead of dropping it as a title.
+                if (this._isPackedProblemPost(item, ctx)) {
+                    await this._handleProblemItem(item, type, ctx, test, done);
+                } else {
+                    type = this._handleSectionMarker(
+                        item,
+                        items[i + 1],
+                        ctx,
+                        test,
+                        type,
+                    );
+                }
             } else if (this._isProblemItem(item, done)) {
                 await this._handleProblemItem(item, type, ctx, test, done);
             }
@@ -425,6 +434,21 @@ export class ForumSession {
         test.count = ctx.pCount;
         this._permissionDenied = false;
         return test;
+    }
+
+    _isPackedProblemPost(item, ctx) {
+        // Only the first content item (or right after a multi-post) can begin
+        // a numbered set — this mirrors the multi-detection guard in
+        // _handleProblemItem so a match always routes to _handleMultiProblem.
+        if (ctx.problemIndex !== 0 && !ctx.isPrevMulti) return false;
+        const processed = CleanupText.toAsyLinks(
+            item.post_data.post_canonical,
+            item.post_data.post_rendered,
+        );
+        return (
+            CleanupText.checkContainsMultiple(processed, ctx.problemIndex + 1)
+                .length > 1
+        );
     }
 
     _isProblemItem(item, done) {
@@ -738,7 +762,9 @@ export class ForumSession {
         searchManyProblems = false,
         isOly = false,
     ) {
-        if (this._permissionDenied) {
+        // id 0 means the problems came from a packed view_posts_text post that
+        // has no backing discussion topic — nothing to fetch.
+        if (!id || this._permissionDenied) {
             return { answer: null, answers: {}, solutions: [], all_posts: [] };
         }
 
