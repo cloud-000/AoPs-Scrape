@@ -13,6 +13,7 @@ raw*.json
 cleaning_steps
 CLAUDE.md
 .claude/
+response_cache/
 
 # DB
 *.sqlite-shm

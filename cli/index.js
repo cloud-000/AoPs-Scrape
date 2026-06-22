@@ -37,23 +37,30 @@ async function main() {
             );
             session.debug = false;
             let id = await autoSearch("Enter id: ", ALL_CONTESTS);
+            const selectedContest = ALL_CONTESTS.find(
+                (c) => c.id === id || c.id === Number(id),
+            );
+
+            // session.enableStickyAnswerKey = selectedContest != null && !selectedContest.is_official;
+            session.enableStickyAnswerKey = true;
+
             let method = await getMethod();
             if (!(await confirm({ message: `Confirm ${id}?` }))) {
                 console.log("Exiting");
                 break;
             }
             loader.add(new CLICount("Problems Collected:"));
-            loader.start();
+            // loader.start();
             let loaderInterval = setInterval(() => {
                 loader.calculate();
-                loader.render();
+                // loader.render();
             }, 300);
             let startTime = Date.now();
             data = await method(session, id);
             let elapsedTime = Date.now() - startTime;
             clearInterval(loaderInterval);
             await sleep(100);
-            loader.clear();
+            // loader.clear();
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );

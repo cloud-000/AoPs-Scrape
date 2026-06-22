@@ -191,6 +191,8 @@ new ForumSession(loggedIn, userId, sessionId, headers = null, onProblemAdd = nul
 - `requestDelay: [min, max]` — random delay range in ms added before each request (default `[100, 250]`). Increase if hitting rate limits.
 - `debug: boolean` — logs raw API responses to stdout when true.
 - `_permissionDenied: boolean` — set to true when `E_NO_PERMISSION` is returned; causes `searchTopicForAnswer` to short-circuit for the rest of the current `getTest` call.
+- `enableStickyAnswerKey: boolean` — when true, `getTest` will attempt to find a stickied answer-key post in the parent forum and apply it. Should only be true for unofficial/user-made contests. Default `false`.
+- `_currentForumCategoryId: number | null` — cached forum category ID populated during `searchTopicForSolutions`; consumed and reset by `getTest`.
 
 ---
 
@@ -370,6 +372,49 @@ Fetches a problem topic's discussion thread and extracts the answer from reply p
 - If `searchManyProblems` is false: `string | null` — the raw `\boxed{…}` content of the first matching reply, or `null` if none found.
 - If `searchManyProblems` is true: `Record<string, string>` — map of problem number string → boxed answer string (e.g., `{ "1": "42", "2": "7" }`).
 - Returns `null` (and sets `_permissionDenied = true`) if the API returns `E_NO_PERMISSION`; subsequent calls within the same `getTest` are short-circuited.
+
+**Side effect:** caches `topic.category_id` from the response into `this._currentForumCategoryId` (used by `_fetchStickyAnswerKey`).
+
+---
+
+### `_fetchStickyAnswerKey(forumCategoryId, testName)`
+
+Looks for a stickied answer-key topic in a forum category and returns a parsed answer map.
+
+**Input:**
+
+| Param | Type | Description |
+|---|---|---|
+| `forumCategoryId` | number | The parent forum's category ID (from `_currentForumCategoryId`) |
+| `testName` | string | The test's category name, used to disambiguate multiple answer-key stickies |
+
+**Output:** `Record<string, string>` mapping 1-based problem number to answer string, or `null` if no answer key found.
+
+**Behavior:**
+1. Fetches first page of forum topics via `fetch_topics`.
+2. Filters for `announce_type === "local"` topics whose `topic_title` contains `"answer key"`.
+3. If multiple candidates, scores each by keyword overlap with `testName` (stripping "answer"/"key") and picks the highest scorer; returns `null` if all score 0.
+4. Fetches the winning topic and calls `CleanupText.parseAnswerKey` on each post, merging results (first hit per problem number wins).
+
+---
+
+### `_applyForumAnswerKey(test, answerMap, type)`
+
+Applies a parsed answer map (from `_fetchStickyAnswerKey`) to a test's problems.
+
+**Input:**
+
+| Param | Type | Description |
+|---|---|---|
+| `test` | object | Test object with `problems` array (flat or nested) |
+| `answerMap` | `Record<string, string>` | Map from 1-based problem number to raw answer |
+| `type` | `TYPES` entry | Used to determine MCQ vs. numeric behavior |
+
+**Behavior:**
+- **MCQ** (`type.choices`): answer key is authoritative — sets `raw_answer` and re-resolves `answer` index, overriding any `\boxed{}` result from the discussion thread.
+- **Numeric** (AIME, COMP, etc.): only sets `raw_answer` if it is currently `null`; never overrides a `\boxed{}` answer.
+- Problems with no entry in `answerMap` are untouched.
+- Works on both flat and section-nested `problems` arrays; uses a running counter (not `problem.n`) for 1-based numbering across sections.
 
 ---
 

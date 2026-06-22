@@ -10,7 +10,6 @@ export const ApiMethod = {
 
 const MAA_COPYRIGHT_POST_ID = 4956172;
 const CHMMC_MIXER_ITEM_TEXT = "Mixer";
-const AIME_PROBLEM_COUNT = 15;
 const MCQ_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
 
 function toSearchParams(formData) {
@@ -125,6 +124,8 @@ export class ForumSession {
         this.debug = true;
         this.onProblemAdd = onProblemAdd ?? (() => {});
         this._permissionDenied = false;
+        this._currentForumCategoryId = null;
+        this.enableStickyAnswerKey = false;
         this.requestDelay = [100, 250];
     }
 
@@ -341,10 +342,12 @@ export class ForumSession {
         for (const id of ids) {
             const { items } = await this._fetchCategory(id);
             // Check if this category is forum-type
-            const hasForum = items.some(item => item.item_type === "forum");
+            const hasForum = items.some((item) => item.item_type === "forum");
             if (hasForum) {
                 // Route to getForum behavior — skip for now, forum handling is separate
-                this.log(`Category ${id} appears to be forum-type, skipping in getAllTestsMulti`);
+                this.log(
+                    `Category ${id} appears to be forum-type, skipping in getAllTestsMulti`,
+                );
                 continue;
             }
             // Otherwise, treat as a regular test collection
@@ -353,10 +356,16 @@ export class ForumSession {
             totalCount += subResult.count;
         }
 
-        return { ids: ids.map(Number), name, tests: allTests, count: totalCount };
+        return {
+            ids: ids.map(Number),
+            name,
+            tests: allTests,
+            count: totalCount,
+        };
     }
 
     async getTest(id, testType = null, done = []) {
+        this._currentForumCategoryId = null;
         const { name, items } = await this._fetchCategory(id);
         const test = { sections: [], problems: [], id, name };
         test.year = CleanupText.extractYear(name);
@@ -393,8 +402,19 @@ export class ForumSession {
 
         test.computational = type.computational;
         test.type = type.name;
+        if (
+            this.enableStickyAnswerKey &&
+            !isOly &&
+            this._currentForumCategoryId
+        ) {
+            const answerMap = await this._fetchStickyAnswerKey(
+                this._currentForumCategoryId,
+                name,
+            );
+            if (answerMap) this._applyForumAnswerKey(test, answerMap, type);
+        }
+
         this._normalizeSections(test);
-        this._applyAIMEAnswerKey(test, type, lastItem);
         test.count = ctx.pCount;
         this._permissionDenied = false;
         return test;
@@ -471,7 +491,11 @@ export class ForumSession {
         let answers = null;
         let topicSolutions = [];
         if (type.computational) {
-            const topicData = await this.searchTopicForSolutions(item.post_data.topic_id, true, false);
+            const topicData = await this.searchTopicForSolutions(
+                item.post_data.topic_id,
+                true,
+                false,
+            );
             answers = topicData.answers; // for multi-problem, returns a map
             topicSolutions = topicData.solutions;
         }
@@ -527,16 +551,101 @@ export class ForumSession {
         }
     }
 
-    _applyAIMEAnswerKey(test, type, lastItem) {
-        if (type.name !== "AIME") return;
-        if (lastItem?.item_text?.toLowerCase() !== "answer key") return;
-        const answerPattern = /(?:1[0-5]|[1-9])\.\s(\d{3})/g;
-        if (!answerPattern.test(lastItem.post_data.post_canonical)) return;
-        const answers = [
-            ...lastItem.post_data.post_canonical.matchAll(answerPattern),
-        ].map((m) => m[1]);
-        for (let i = 0; i < AIME_PROBLEM_COUNT; i++) {
-            test.problems[i].choices = [answers[i]];
+    async _fetchStickyAnswerKey(forumCategoryId, testName) {
+        const fullResponse = await this.sendRequest(
+            ForumSession.payload(ApiMethod.CATEGORY_DATA, {
+                id: forumCategoryId,
+            }),
+        );
+
+        if (fullResponse.error_code) return null;
+        const topicsData = fullResponse.response.category?.topics_data ?? {};
+
+        const candidates = Object.values(topicsData).filter(
+            (t) =>
+                t.announce_type === "local" &&
+                /answer\s*key/i.test(t.topic_title ?? ""),
+        );
+
+        if (candidates.length === 0) return null;
+
+        let best = candidates[0];
+
+        if (candidates.length > 1) {
+            const testWords = new Set(testName.toLowerCase().split(/\s+/));
+            let bestScore = -1;
+            for (const c of candidates) {
+                const stripped = (c.topic_title ?? "")
+                    .toLowerCase()
+                    .replace(/\banswer\b|\bkey\b/g, "")
+                    .trim();
+                const score = stripped
+                    .split(/\s+/)
+                    .filter((w) => w && testWords.has(w)).length;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = c;
+                }
+            }
+            if (bestScore === 0) return null;
+        }
+
+        const answerMap = {};
+        const parsePosts = (posts) => {
+            for (const post of posts) {
+                // If fetching sticky answers turn wrong, it might be parseAnswerKey not parsing correctly.
+                const parsed = CleanupText.parseAnswerKey(post.post_canonical);
+                if (!parsed) continue;
+                for (const [num, ans] of Object.entries(parsed)) {
+                    if (!answerMap[num]) answerMap[num] = ans;
+                }
+            }
+        };
+
+        parsePosts(best.posts_data ?? []);
+
+        // Fall back to fetch_topic if topics_data only included a subset of posts
+        if (Object.keys(answerMap).length === 0) {
+            const topicResponse = await this.sendRequest(
+                ForumSession.payload(ApiMethod.TOPIC, { id: best.topic_id }),
+            );
+            if (!topicResponse.error_code) {
+                parsePosts(topicResponse.response.topic.posts_data ?? []);
+            }
+        }
+
+        return Object.keys(answerMap).length > 0 ? answerMap : null;
+    }
+
+    _applyForumAnswerKey(test, answerMap, type) {
+        let counter = 0;
+        const apply = (problem) => {
+            counter++;
+            const ans = answerMap[String(counter)];
+            if (ans == null) return;
+            if (type.choices) {
+                // MCQ: answer key is authoritative — override \boxed{} result
+                problem.raw_answer = ans;
+                const parsed = CleanupText.parseMCQAns(ans);
+                if (parsed?.type === "letter") {
+                    problem.answer = MCQ_LETTERS.indexOf(parsed.value);
+                } else if (parsed) {
+                    problem.answer = (problem.choices ?? []).indexOf(
+                        parsed.value,
+                    );
+                }
+            } else if (problem.raw_answer == null) {
+                // Numeric: only fill when \boxed{} found nothing
+                problem.raw_answer = ans;
+            }
+        };
+
+        if (test.problems.length > 0 && Array.isArray(test.problems[0])) {
+            for (const section of test.problems) {
+                for (const problem of section) apply(problem);
+            }
+        } else {
+            for (const problem of test.problems) apply(problem);
         }
     }
 
@@ -552,13 +661,21 @@ export class ForumSession {
 
         if (!type.computational) {
             // OLY — fetch all posts for potential solutions
-            const topicData = await this.searchTopicForSolutions(topic_id, false, true);
+            const topicData = await this.searchTopicForSolutions(
+                topic_id,
+                false,
+                true,
+            );
             problem.solutions = topicData.solutions;
             problem.all_posts = topicData.all_posts;
             return problem;
         }
 
-        const topicData = await this.searchTopicForSolutions(topic_id, false, false);
+        const topicData = await this.searchTopicForSolutions(
+            topic_id,
+            false,
+            false,
+        );
         const rawAnswer = topicData.answer;
         problem.solutions = topicData.solutions;
         problem.raw_answer = rawAnswer;
@@ -566,7 +683,9 @@ export class ForumSession {
         if (type.choices) {
             // MCQ (e.g. AMC)
             problem.choices = CleanupText.extractChoices(problem.statement);
-            problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+            problem.statement = CleanupText.cleanChoices(
+                problem.statement,
+            ).trim();
             if (rawAnswer != null) {
                 const parsed = CleanupText.parseMCQAns(rawAnswer);
                 if (parsed == null) {
@@ -593,15 +712,24 @@ export class ForumSession {
         // Rule 2: QED markers
         if (/Q\.?E\.?D\.?|\\blacksquare|\\square/.test(content)) return true;
         // Rule 3: known solution poster
-        if (post.poster_id && (SOLUTIONS_USERS ?? []).some(u => u.id === post.poster_id)) return true;
+        if (
+            post.poster_id &&
+            (SOLUTIONS_USERS ?? []).some((u) => u.id === post.poster_id)
+        )
+            return true;
         // Rule 4: contains \boxed{} (computational answer marker)
         if (/\\boxed\s*\{/.test(content)) return true;
         // Rule 5: starts with "Proof", "Solution", "Sol."
-        if (/^\s*(?:proof|solution|sol\.)/i.test(content.slice(0, 50))) return true;
+        if (/^\s*(?:proof|solution|sol\.)/i.test(content.slice(0, 50)))
+            return true;
         return false;
     }
 
-    async searchTopicForSolutions(id, searchManyProblems = false, isOly = false) {
+    async searchTopicForSolutions(
+        id,
+        searchManyProblems = false,
+        isOly = false,
+    ) {
         if (this._permissionDenied) {
             return { answer: null, answers: {}, solutions: [], all_posts: [] };
         }
@@ -615,7 +743,11 @@ export class ForumSession {
             return { answer: null, answers: {}, solutions: [], all_posts: [] };
         }
 
-        const posts = response.response.topic.posts_data ?? [];
+        const topic = response.response.topic;
+        if (topic?.category_id && !this._currentForumCategoryId) {
+            this._currentForumCategoryId = topic.category_id;
+        }
+        const posts = topic.posts_data ?? [];
         const solutions = [];
         const all_posts = [];
         let answer = null;
@@ -626,7 +758,8 @@ export class ForumSession {
 
             // Extract answers
             if (searchManyProblems) {
-                const hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
+                const hideTag =
+                    /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
                 for (const match of content.matchAll(hideTag)) {
                     const boxed = CleanupText.getBoxed(match[2]);
                     if (boxed) answers[match[1]] = boxed;
@@ -642,12 +775,14 @@ export class ForumSession {
                     user_id: post.poster_id ?? null,
                     username: post.username ?? null,
                     content,
-                    posted_at: post.post_time ? new Date(post.post_time * 1000).toISOString() : null,
+                    posted_at: post.post_time
+                        ? new Date(post.post_time * 1000).toISOString()
+                        : null,
                 });
             }
 
             // Classify solution posts (skip post_type === 'view_posts_text' which is the problem statement)
-            if (post.post_type === 'view_posts_text') continue;
+            if (post.post_type === "view_posts_text") continue;
             if (this._isSolutionPost(post, content)) {
                 solutions.push({
                     post_id: post.post_id,
@@ -655,7 +790,9 @@ export class ForumSession {
                     user_id: post.poster_id ?? null,
                     username: post.username ?? null,
                     content,
-                    posted_at: post.post_time ? new Date(post.post_time * 1000).toISOString() : null,
+                    posted_at: post.post_time
+                        ? new Date(post.post_time * 1000).toISOString()
+                        : null,
                 });
             }
         }
@@ -664,7 +801,11 @@ export class ForumSession {
     }
 
     async searchTopicForAnswer(id, searchManyProblems = false) {
-        const result = await this.searchTopicForSolutions(id, searchManyProblems, false);
+        const result = await this.searchTopicForSolutions(
+            id,
+            searchManyProblems,
+            false,
+        );
         if (searchManyProblems) return result.answers;
         return result.answer;
     }
