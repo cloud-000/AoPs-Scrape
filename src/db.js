@@ -100,22 +100,20 @@ CREATE TABLE IF NOT EXISTS problem_history (
   changed_at    TEXT DEFAULT (datetime('now'))
 );
 
--- Clean, denormalized, standalone export table. Purely derived from problems +
--- solutions via buildProductionProblems(); rebuilt on demand, holds no manual
--- state of its own. No aops_*/pdf_* source columns.
+-- Clean, standalone export table. Purely derived from problems + solutions via
+-- buildProductionProblems(); rebuilt on demand, holds no manual state of its own.
+-- No aops_*/pdf_* source columns. Array-typed columns (Postgres text[]) are
+-- stored here as JSON text, since SQLite has no native array type.
 CREATE TABLE IF NOT EXISTS production_problems (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
 
-  -- denormalized contest identity
-  series_name        TEXT,
-  test_name          TEXT,
-  test_year          INTEGER,
-  test_type          TEXT,
-  is_official        BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official IN (0, 1)),
-  n                  INTEGER NOT NULL,
+  -- relational link back to the source test
+  test_id            INTEGER REFERENCES tests(id) ON DELETE CASCADE,
+  n                  INTEGER NOT NULL,        -- problem number within the test
   section            INTEGER NOT NULL DEFAULT -1,
+  aops_id            INTEGER,
 
-  -- merged content
+  -- content
   statement          TEXT,
   choices            TEXT,    -- JSON array of choice texts; NULL if not MCQ
   answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
@@ -132,7 +130,7 @@ CREATE TABLE IF NOT EXISTS production_problems (
 
   built_at           TEXT DEFAULT (datetime('now')),
 
-  UNIQUE(series_name, test_name, test_year, section, n)
+  UNIQUE(test_id, n, section)
 );
 `;
 
@@ -171,6 +169,17 @@ export function initDB(dbPath) {
     }
     db.exec(`UPDATE series SET aops_id = -1 WHERE aops_id IS NULL`);
     db.exec(`DROP INDEX IF EXISTS idx_series_aops_id`);
+
+    // Migration: production_problems was redesigned/extended. It holds only
+    // derived data, so drop the stale shape and let SCHEMA recreate the new one.
+    const prodCols = db
+        .query("PRAGMA table_info(production_problems)")
+        .all()
+        .map((r) => r.name);
+    if (prodCols.length > 0 && (!prodCols.includes("test_id") || !prodCols.includes("aops_id"))) {
+        db.exec(`DROP TABLE production_problems`);
+        db.exec(SCHEMA);
+    }
 
     return db;
 }
@@ -510,15 +519,11 @@ export function buildProductionProblems(db) {
         const rows = db
             .query(
                 `
-            SELECT p.id, p.n, p.section, p.statement, p.aops_choices AS choices,
-                   p.answer_index, p.topic, p.tags, p.is_computational,
-                   p.difficulty, p.quality, p.verified, p.notes,
-                   t.name AS test_name, t.year AS test_year, t.type AS test_type,
-                   s.name AS series_name, s.is_official
+            SELECT p.id, p.test_id, p.n, p.section, p.aops_topic_id AS aops_id, p.statement,
+                   p.aops_choices AS choices, p.answer_index, p.topic, p.tags,
+                   p.is_computational, p.difficulty, p.quality, p.verified, p.notes
             FROM problems p
-            JOIN tests t ON p.test_id = t.id
-            JOIN series s ON t.series_id = s.id
-            ORDER BY s.name, t.year, t.name, p.section, p.n
+            ORDER BY p.test_id, p.section, p.n
         `,
             )
             .all();
@@ -529,23 +534,20 @@ export function buildProductionProblems(db) {
         );
         const insert = db.query(`
             INSERT INTO production_problems (
-                series_name, test_name, test_year, test_type, is_official, n, section,
+                test_id, n, section, aops_id,
                 statement, choices, answer_index, official_solutions,
                 topic, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
         `);
 
         for (const r of rows) {
             const sols = solStmt.all(r.id).map((x) => x.content);
             const officialSolutions = sols.length ? JSON.stringify(sols) : null;
             insert.run(
-                r.series_name,
-                r.test_name,
-                r.test_year,
-                r.test_type,
-                r.is_official,
+                r.test_id,
                 r.n,
                 r.section,
+                r.aops_id,
                 r.statement,
                 r.choices,
                 r.answer_index,

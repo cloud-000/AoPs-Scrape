@@ -11,6 +11,7 @@ scrape_data/
 **/.env
 raw*.json
 cleaning_steps
+AGENTS.md
 CLAUDE.md
 .claude/
 response_cache/
