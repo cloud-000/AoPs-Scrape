@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS series (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL UNIQUE,
   aops_id     INTEGER DEFAULT -1,
-  is_official INTEGER DEFAULT 0
+  is_official BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS tests (
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS tests (
   year             INTEGER,
   aops_category_id TEXT UNIQUE,
   type             TEXT,
-  is_computational INTEGER DEFAULT 0,
+  is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty       INTEGER DEFAULT 0,
   quality          INTEGER DEFAULT 0,
   aops_url TEXT GENERATED ALWAYS AS ('https://artofproblemsolving.com/community/c' || aops_category_id) STORED
@@ -103,25 +103,24 @@ CREATE TABLE IF NOT EXISTS problem_history (
 -- Clean, standalone export table. Purely derived from problems + solutions via
 -- buildProductionProblems(); rebuilt on demand, holds no manual state of its own.
 -- No aops_*/pdf_* source columns. Array-typed columns (Postgres text[]) are
--- stored here as JSON text, since SQLite has no native array type.
+-- stored here as TEXT[] arrays (custom type).
 CREATE TABLE IF NOT EXISTS production_problems (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
 
   -- relational link back to the source test
   test_id            INTEGER REFERENCES tests(id) ON DELETE CASCADE,
   n                  INTEGER NOT NULL,        -- problem number within the test
-  section            INTEGER NOT NULL DEFAULT -1,
   aops_id            INTEGER,
 
   -- content
   statement          TEXT,
-  choices            TEXT,    -- JSON array of choice texts; NULL if not MCQ
+  choices            TEXT[],   -- TEXT[] array (custom type); NULL if not MCQ
   answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
   official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
 
   -- metadata (carried over from problems)
   topic              TEXT,
-  tags               TEXT,    -- JSON array
+  tags               TEXT[],   -- TEXT[] array (custom type)
   is_computational   BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty         INTEGER DEFAULT 0,
   quality            INTEGER DEFAULT 0,
@@ -130,7 +129,7 @@ CREATE TABLE IF NOT EXISTS production_problems (
 
   built_at           TEXT DEFAULT (datetime('now')),
 
-  UNIQUE(test_id, n, section)
+  UNIQUE(test_id, n)
 );
 `;
 
@@ -170,13 +169,78 @@ export function initDB(dbPath) {
     db.exec(`UPDATE series SET aops_id = -1 WHERE aops_id IS NULL`);
     db.exec(`DROP INDEX IF EXISTS idx_series_aops_id`);
 
-    // Migration: production_problems was redesigned/extended. It holds only
+    // Migration: tests table changes (make is_computational BOOLEAN)
+    const testsColsInfo = db.query("PRAGMA table_info(tests)").all();
+    const isCompCol = testsColsInfo.find((r) => r.name === "is_computational");
+    if (isCompCol && isCompCol.type === "INTEGER") {
+        db.transaction(() => {
+            db.exec(`PRAGMA foreign_keys = OFF;`);
+            db.exec(`ALTER TABLE tests RENAME TO tests_old;`);
+            db.exec(`
+CREATE TABLE IF NOT EXISTS tests (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  series_id        INTEGER REFERENCES series(id),
+  name             TEXT NOT NULL,
+  year             INTEGER,
+  aops_category_id TEXT UNIQUE,
+  type             TEXT,
+  is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
+  difficulty       INTEGER DEFAULT 0,
+  quality          INTEGER DEFAULT 0,
+  aops_url TEXT GENERATED ALWAYS AS ('https://artofproblemsolving.com/community/c' || aops_category_id) STORED
+);
+            `);
+            db.exec(`
+INSERT INTO tests (id, series_id, name, year, aops_category_id, type, is_computational, difficulty, quality)
+SELECT id, series_id, name, year, aops_category_id, type, COALESCE(is_computational, 0), difficulty, quality
+FROM tests_old;
+            `);
+            db.exec(`DROP TABLE tests_old;`);
+            db.exec(`PRAGMA foreign_keys = ON;`);
+        })();
+    }
+
+    // Migration: series table changes (make is_official BOOLEAN)
+    const seriesColsInfo = db.query("PRAGMA table_info(series)").all();
+    const isOffCol = seriesColsInfo.find((r) => r.name === "is_official");
+    if (isOffCol && isOffCol.type === "INTEGER") {
+        db.transaction(() => {
+            db.exec(`PRAGMA foreign_keys = OFF;`);
+            db.exec(`ALTER TABLE series RENAME TO series_old;`);
+            db.exec(`
+CREATE TABLE IF NOT EXISTS series (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL UNIQUE,
+  aops_id     INTEGER DEFAULT -1,
+  is_official BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official IN (0, 1))
+);
+            `);
+            db.exec(`
+INSERT INTO series (id, name, aops_id, is_official)
+SELECT id, name, aops_id, COALESCE(is_official, 0)
+FROM series_old;
+            `);
+            db.exec(`DROP TABLE series_old;`);
+            db.exec(`PRAGMA foreign_keys = ON;`);
+        })();
+    }
+
+    // Migration: production_problems was redesigned/extended or schema changed. It holds only
     // derived data, so drop the stale shape and let SCHEMA recreate the new one.
-    const prodCols = db
-        .query("PRAGMA table_info(production_problems)")
-        .all()
-        .map((r) => r.name);
-    if (prodCols.length > 0 && (!prodCols.includes("test_id") || !prodCols.includes("aops_id"))) {
+    const prodTableInfo = db.query("PRAGMA table_info(production_problems)").all();
+    const prodCols = prodTableInfo.map((r) => r.name);
+    const choicesCol = prodTableInfo.find((r) => r.name === "choices");
+    const tagsCol = prodTableInfo.find((r) => r.name === "tags");
+
+    const needsRecreate = prodCols.length > 0 && (
+        !prodCols.includes("test_id") ||
+        !prodCols.includes("aops_id") ||
+        prodCols.includes("section") ||
+        (choicesCol && choicesCol.type !== "TEXT[]") ||
+        (tagsCol && tagsCol.type !== "TEXT[]")
+    );
+
+    if (needsRecreate) {
         db.exec(`DROP TABLE production_problems`);
         db.exec(SCHEMA);
     }
@@ -506,6 +570,39 @@ export function upsertScrapeResults(db, raw) {
     })();
 }
 
+/**
+ * Formats a JavaScript array (or JSON string representing an array)
+ * into a Postgres-style TEXT[] literal representation: e.g. {"a", "b", "c"}
+ */
+export function toPostgresTextArray(value) {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    let arr = value;
+    if (typeof value === "string") {
+        try {
+            arr = JSON.parse(value);
+        } catch (e) {
+            if (value.startsWith("{") && value.endsWith("}")) {
+                return value;
+            }
+            return null;
+        }
+    }
+    if (!Array.isArray(arr)) {
+        return null;
+    }
+    const escapedElements = arr.map((item) => {
+        if (item === null || item === undefined) {
+            return "NULL";
+        }
+        const str = String(item);
+        const escaped = str.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        return `"${escaped}"`;
+    });
+    return `{${escapedElements.join(",")}}`;
+}
+
 // Rebuilds the denormalized production_problems table from the curated problems
 // + solutions data. The table is purely derived, so we wipe and rebuild it in a
 // single transaction (no stale rows, no dedup logic). Returns the row count.
@@ -534,10 +631,10 @@ export function buildProductionProblems(db) {
         );
         const insert = db.query(`
             INSERT INTO production_problems (
-                test_id, n, section, aops_id,
+                test_id, n, aops_id,
                 statement, choices, answer_index, official_solutions,
                 topic, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
         `);
 
         for (const r of rows) {
@@ -546,14 +643,13 @@ export function buildProductionProblems(db) {
             insert.run(
                 r.test_id,
                 r.n,
-                r.section,
                 r.aops_id,
                 r.statement,
-                r.choices,
+                toPostgresTextArray(r.choices),
                 r.answer_index,
                 officialSolutions,
                 r.topic,
-                r.tags,
+                toPostgresTextArray(r.tags),
                 r.is_computational,
                 r.difficulty,
                 r.quality,
