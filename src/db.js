@@ -2,6 +2,27 @@ import { Database } from "bun:sqlite";
 import { CleanupText } from "./CleanupText.js";
 import { getAutoTags } from "./autoTags.js";
 
+// ---------------------------------------------------------------------------
+// MERGE CONTRACT (how a re-scrape combines with existing rows)
+//
+//   aops_*          Always overwritten by the latest scrape (raw AoPS facts).
+//   pdf_*           Manual overrides. Never touched by the scraper.
+//   statement,      Resolved/merged values production reads. Prefer the manual
+//   answer_index,   pdf_* / verified value, otherwise fall back to the freshest
+//   answer_value    aops_* value.
+//   acgn            Inferred Algebra/Combinatorics/Geometry/NumberTheory class.
+//                   Set once on insert; never overwritten by the scraper
+//                   (re-run explicitly via `preprocess`).
+//   tags            Accumulated (UNION'd) across scrapes, never lost.
+//   verified,       Manual curation. Never touched by the scraper.
+//   difficulty,
+//   quality, notes
+//
+//   Orphan cleanup: re-scraping a test removes its non-curated problem rows
+//   whose (n, section) no longer appears in the scrape (e.g. when a test's
+//   section structure changes). Rows with pdf_statement or verified are kept.
+// ---------------------------------------------------------------------------
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,14 +60,14 @@ CREATE TABLE IF NOT EXISTS problems (
 
   pdf_statement TEXT,
   pdf_answer    TEXT,
-  pdf_solutions TEXT,
   pdf_source    TEXT,
 
+  -- Resolved/merged values (prefer manual pdf_*/verified, else freshest aops_*)
   statement    TEXT,
-  answer_index INTEGER DEFAULT -1,
-  answers      TEXT,
+  answer_index INTEGER DEFAULT -1,  -- index into aops_choices for MCQ; -1 if numeric/unknown
+  answer_value TEXT,                -- literal answer: letter for MCQ, number for numeric; NULL if unknown
 
-  topic            TEXT,
+  acgn             TEXT,   -- inferred Algebra/Combinatorics/Geometry/NumberTheory class
   tags             TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty       INTEGER DEFAULT 0,
@@ -115,11 +136,12 @@ CREATE TABLE IF NOT EXISTS production_problems (
   -- content
   statement          TEXT,
   choices            TEXT[],   -- TEXT[] array (custom type); NULL if not MCQ
-  answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
+  answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = numeric/unknown
+  answer_value       TEXT,     -- literal answer: letter for MCQ, number for numeric; NULL if unknown
   official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
 
   -- metadata (carried over from problems)
-  topic              TEXT,
+  acgn               TEXT,   -- Algebra/Combinatorics/Geometry/NumberTheory class
   tags               TEXT[],   -- TEXT[] array (custom type)
   is_computational   BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty         INTEGER DEFAULT 0,
@@ -157,6 +179,49 @@ export function initDB(dbPath) {
     }
     if (!existingCols.includes("tags")) {
         db.exec(`ALTER TABLE problems ADD COLUMN tags TEXT`);
+    }
+
+    // Migration: reshape the resolved/merged columns and rename topic→acgn.
+    //   answers      -> answer_value (literal answer = COALESCE(pdf_answer, aops_answer))
+    //   topic        -> acgn
+    //   pdf_solutions-> dropped (was never written/read)
+    // Rebuild the table from the current SCHEMA (preserving id so child FKs in
+    // solutions/oly_potential_solutions/problem_history stay valid).
+    if (
+        existingCols.includes("answers") ||
+        existingCols.includes("topic") ||
+        existingCols.includes("pdf_solutions")
+    ) {
+        db.transaction(() => {
+            db.exec(`PRAGMA foreign_keys = OFF;`);
+            db.exec(`ALTER TABLE problems RENAME TO problems_old;`);
+            // The index follows the rename to problems_old and keeps its name;
+            // drop it so SCHEMA can recreate it on the new table.
+            db.exec(`DROP INDEX IF EXISTS idx_problems_aops_topic;`);
+            // CREATE TABLE IF NOT EXISTS in SCHEMA recreates `problems` with the
+            // new shape; all other tables already exist and are skipped.
+            db.exec(SCHEMA);
+            db.exec(`
+INSERT INTO problems (
+  id, test_id, n, section,
+  aops_topic_id, aops_post_id, aops_statement, aops_answer_index, aops_choices, aops_answer,
+  pdf_statement, pdf_answer, pdf_source,
+  statement, answer_index, answer_value,
+  acgn, tags, is_computational, difficulty, quality, verified, notes,
+  created_at, updated_at
+)
+SELECT
+  id, test_id, n, section,
+  aops_topic_id, aops_post_id, aops_statement, aops_answer_index, aops_choices, aops_answer,
+  pdf_statement, pdf_answer, pdf_source,
+  statement, answer_index, COALESCE(pdf_answer, aops_answer),
+  topic, tags, is_computational, difficulty, quality, verified, notes,
+  created_at, updated_at
+FROM problems_old;
+            `);
+            db.exec(`DROP TABLE problems_old;`);
+            db.exec(`PRAGMA foreign_keys = ON;`);
+        })();
     }
 
     const existingSeriesCols = db
@@ -235,6 +300,8 @@ FROM series_old;
     const needsRecreate = prodCols.length > 0 && (
         !prodCols.includes("test_id") ||
         !prodCols.includes("aops_id") ||
+        !prodCols.includes("answer_value") ||
+        prodCols.includes("topic") ||
         prodCols.includes("section") ||
         (choicesCol && choicesCol.type !== "TEXT[]") ||
         (tagsCol && tagsCol.type !== "TEXT[]")
@@ -374,21 +441,15 @@ function upsertSolutions(db, problemId, solutions, allPosts, isOly) {
 }
 
 function upsertProblem(db, problem, testId) {
-    // New column split: choices vs raw answer
     const aopsChoices =
         problem.choices != null ? JSON.stringify(problem.choices) : null;
-    const aopsAnswer = problem.raw_answer ?? null;
-    const aopsAnswerIndex = problem.answer ?? -1;
+    const aopsAnswer = problem.answerValue ?? null; // literal answer (letter or number)
+    const aopsAnswerIndex = problem.answerIndex ?? -1; // index into choices for MCQ
     const section = problem.section ?? -1;
-    const topic = CleanupText.inferACGN(problem.statement);
+    const acgn = CleanupText.inferACGN(problem.statement);
     const autoTagsList = getAutoTags(problem.statement);
     const tagsJson =
         autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
-
-    // For `answers` column: MCQ → choices texts; AIME/COMP → singleton with raw answer
-    const aopsAnswersForDisplay =
-        aopsChoices ??
-        (aopsAnswer != null ? JSON.stringify([aopsAnswer]) : null);
 
     // Check for statement change BEFORE the upsert so we can log the old value
     const existing = db
@@ -418,8 +479,8 @@ function upsertProblem(db, problem, testId) {
         INSERT INTO problems (
             test_id, n, section, aops_topic_id, aops_post_id,
             aops_statement, aops_answer_index, aops_choices, aops_answer,
-            statement, answer_index, answers,
-            topic, tags, is_computational
+            statement, answer_index, answer_value,
+            acgn, tags, is_computational
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (test_id, n, section) DO UPDATE SET
             aops_topic_id     = excluded.aops_topic_id,
@@ -429,17 +490,18 @@ function upsertProblem(db, problem, testId) {
             aops_choices      = excluded.aops_choices,
             aops_answer       = excluded.aops_answer,
             statement    = COALESCE(problems.pdf_statement, excluded.aops_statement),
-            answers      = CASE
-                WHEN problems.pdf_answer IS NOT NULL THEN json_array(problems.pdf_answer)
-                ELSE excluded.answers
+            answer_value = CASE
+                WHEN problems.verified THEN problems.answer_value
+                WHEN problems.pdf_answer IS NOT NULL THEN problems.pdf_answer
+                ELSE excluded.aops_answer
             END,
             answer_index = CASE
                 WHEN problems.verified THEN problems.answer_index
                 WHEN problems.pdf_answer IS NOT NULL THEN problems.answer_index
                 ELSE excluded.aops_answer_index
             END,
-            -- Scraper-immutable: topic never overwritten after INSERT
-            topic = problems.topic,
+            -- Scraper-immutable: acgn never overwritten after INSERT (re-run via preprocess)
+            acgn = problems.acgn,
             -- Scraper-immutable: tags are UNION'd, never overwritten
             tags = CASE
                 WHEN problems.tags IS NULL THEN excluded.tags
@@ -465,16 +527,16 @@ function upsertProblem(db, problem, testId) {
             testId,
             problem.n,
             section,
-            problem.topic_id ?? null,
-            problem.post_id ?? null,
+            problem.topicId ?? null,
+            problem.postId ?? null,
             problem.statement,
             aopsAnswerIndex,
             aopsChoices,
             aopsAnswer,
             problem.statement,
             aopsAnswerIndex,
-            aopsAnswersForDisplay,
-            topic,
+            aopsAnswer,
+            acgn,
             tagsJson,
             problem.is_computational ? 1 : 0,
         ],
@@ -486,15 +548,35 @@ function upsertProblem(db, problem, testId) {
             `SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = ?`,
         )
         .get(testId, problem.n, section);
-    if (row && (problem.solutions?.length || problem.all_posts?.length)) {
+    if (row && (problem.solutions?.length || problem.posts?.length)) {
         const isOly = problem.is_computational === false;
-        upsertSolutions(
-            db,
-            row.id,
-            problem.solutions,
-            problem.all_posts,
-            isOly,
-        );
+        upsertSolutions(db, row.id, problem.solutions, problem.posts, isOly);
+    }
+}
+
+// Removes a test's stale problem rows after a re-scrape: any row whose
+// (n, section) is no longer produced by the scrape (e.g. the test's section
+// structure changed). Manually-curated rows (pdf_statement set, or verified)
+// are always kept. Child rows in solutions / oly_potential_solutions /
+// problem_history are deleted alongside their problems.
+function cleanupOrphanProblems(db, testId, keepPairs) {
+    if (keepPairs.length === 0) return; // never wipe a test on an empty scrape
+    const keys = keepPairs.map((p) => `${p.n}|${p.section}`);
+    const placeholders = keys.map(() => "?").join(",");
+    const orphans = db
+        .query(
+            `SELECT id FROM problems
+             WHERE test_id = ?
+               AND pdf_statement IS NULL AND verified = 0
+               AND (n || '|' || section) NOT IN (${placeholders})`,
+        )
+        .all(testId, ...keys);
+
+    for (const { id } of orphans) {
+        db.run(`DELETE FROM solutions WHERE problem_id = ?`, [id]);
+        db.run(`DELETE FROM oly_potential_solutions WHERE problem_id = ?`, [id]);
+        db.run(`DELETE FROM problem_history WHERE problem_id = ?`, [id]);
+        db.run(`DELETE FROM problems WHERE id = ?`, [id]);
     }
 }
 
@@ -566,6 +648,13 @@ export function upsertScrapeResults(db, raw) {
                     testId,
                 );
             }
+
+            // Drop rows from a previous scrape that this scrape no longer produced.
+            cleanupOrphanProblems(
+                db,
+                testId,
+                problems.map((p) => ({ n: p.n, section: p.section ?? -1 })),
+            );
         }
     })();
 }
@@ -617,7 +706,7 @@ export function buildProductionProblems(db) {
             .query(
                 `
             SELECT p.id, p.test_id, p.n, p.section, p.aops_topic_id AS aops_id, p.statement,
-                   p.aops_choices AS choices, p.answer_index, p.topic, p.tags,
+                   p.aops_choices AS choices, p.answer_index, p.answer_value, p.acgn, p.tags,
                    p.is_computational, p.difficulty, p.quality, p.verified, p.notes
             FROM problems p
             ORDER BY p.test_id, p.section, p.n
@@ -632,9 +721,9 @@ export function buildProductionProblems(db) {
         const insert = db.query(`
             INSERT INTO production_problems (
                 test_id, n, aops_id,
-                statement, choices, answer_index, official_solutions,
-                topic, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+                statement, choices, answer_index, answer_value, official_solutions,
+                acgn, tags, is_computational, difficulty, quality, verified, notes
+            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?)
         `);
 
         for (const r of rows) {
@@ -647,8 +736,9 @@ export function buildProductionProblems(db) {
                 r.statement,
                 toPostgresTextArray(r.choices),
                 r.answer_index,
+                r.answer_value,
                 officialSolutions,
-                r.topic,
+                r.acgn,
                 toPostgresTextArray(r.tags),
                 r.is_computational,
                 r.difficulty,

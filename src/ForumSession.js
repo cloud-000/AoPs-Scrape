@@ -31,6 +31,25 @@ function isPostDesc(item) {
     );
 }
 
+// Single source of truth for the scraped-problem shape. Both the single- and
+// multi-problem paths build through this so every problem has identical fields.
+// See ScrapedProblem in src/types.js.
+function makeProblem(fields) {
+    return {
+        statement: "",
+        n: 0,
+        section: -1,
+        topicId: null,
+        postId: null,
+        choices: null, // MCQ options; null for numeric
+        answerIndex: -1, // index into choices for MCQ; -1 if numeric/unknown
+        answerValue: null, // literal answer: letter for MCQ, number for numeric
+        solutions: [],
+        posts: [], // all discussion posts (used for OLY solution curation)
+        ...fields,
+    };
+}
+
 function addProblemToTest(problem, ctx, test, onProblemAdd) {
     if (ctx.sectionCounter >= 0) {
         problem.section = ctx.sectionCounter;
@@ -272,17 +291,17 @@ export class ForumSession {
         id,
         type = null,
         shownDepth = 1,
-        done = new Set(),
-        returnDone = false,
+        seenCategoryIds = new Set(),
+        returnSeen = false,
     ) {
-        const doneProblems = [];
+        const seenTopicIds = [];
         const { name, items: allItems } = await this._fetchCategory(id);
 
         if (type == null) {
             type = ForumSession.inferType(name, true);
         }
 
-        let pCount = 0;
+        let problemCount = 0;
         const tests = [];
 
         const items = allItems.filter((item) => {
@@ -290,7 +309,7 @@ export class ForumSession {
                 return false;
             if (
                 CONTEST_IDS.IGNORE.includes(item.item_id) ||
-                done.has(item.item_id)
+                seenCategoryIds.has(item.item_id)
             ) {
                 this.log(`Ignoring: ${item.item_id}`);
                 return false;
@@ -303,14 +322,14 @@ export class ForumSession {
             switch (item.item_type) {
                 case "folder": {
                     this.log("========");
-                    done.add(item.item_id);
+                    seenCategoryIds.add(item.item_id);
                     const subTests = await this.getAllTests(
                         item.item_id,
                         type,
                         shownDepth - 1,
-                        done,
+                        seenCategoryIds,
                     );
-                    pCount += subTests.count;
+                    problemCount += subTests.count;
                     if (subTests.count === 0) break;
                     if (shownDepth > 0) {
                         tests.push(subTests);
@@ -320,13 +339,13 @@ export class ForumSession {
                     break;
                 }
                 case "view_posts": {
-                    done.add(item.item_id);
+                    seenCategoryIds.add(item.item_id);
                     const t = await this.getTest(
                         item.item_id,
                         type,
-                        doneProblems,
+                        seenTopicIds,
                     );
-                    pCount += t.count;
+                    problemCount += t.count;
                     if (t.count > 0) tests.push(t);
                     break;
                 }
@@ -336,15 +355,15 @@ export class ForumSession {
             }
         }
 
-        const result = { id: Number(id), name, tests, count: pCount };
-        if (returnDone) result["done"] = done;
+        const result = { id: Number(id), name, tests, count: problemCount };
+        if (returnSeen) result["seenCategoryIds"] = seenCategoryIds;
         return result;
     }
 
     async getAllTestsMulti(ids, name, type = null) {
         const allTests = [];
         let totalCount = 0;
-        const done = new Set();
+        const seenCategoryIds = new Set();
 
         for (const id of ids) {
             const { items } = await this._fetchCategory(id);
@@ -358,7 +377,13 @@ export class ForumSession {
                 continue;
             }
             // Otherwise, treat as a regular test collection
-            const subResult = await this.getAllTests(id, type, 0, done, false);
+            const subResult = await this.getAllTests(
+                id,
+                type,
+                0,
+                seenCategoryIds,
+                false,
+            );
             allTests.push(...subResult.tests);
             totalCount += subResult.count;
         }
@@ -371,7 +396,7 @@ export class ForumSession {
         };
     }
 
-    async getTest(id, testType = null, done = []) {
+    async getTest(id, testType = null, seenTopicIds = []) {
         this._currentForumCategoryId = null;
         const { name, items } = await this._fetchCategory(id);
         const test = { sections: [], problems: [], id, name };
@@ -386,7 +411,7 @@ export class ForumSession {
             sectionCounter: -1,
             problemIndex: 0,
             isPrevMulti: false,
-            pCount: 0,
+            problemCount: 0,
         };
         let lastItem = null;
 
@@ -401,7 +426,13 @@ export class ForumSession {
                 // expose no per-problem forum topics. Detect that and route it
                 // through the problem path instead of dropping it as a title.
                 if (this._isPackedProblemPost(item, ctx)) {
-                    await this._handleProblemItem(item, type, ctx, test, done);
+                    await this._handleProblemItem(
+                        item,
+                        type,
+                        ctx,
+                        test,
+                        seenTopicIds,
+                    );
                 } else {
                     type = this._handleSectionMarker(
                         item,
@@ -411,8 +442,14 @@ export class ForumSession {
                         type,
                     );
                 }
-            } else if (this._isProblemItem(item, done)) {
-                await this._handleProblemItem(item, type, ctx, test, done);
+            } else if (this._isProblemItem(item, seenTopicIds)) {
+                await this._handleProblemItem(
+                    item,
+                    type,
+                    ctx,
+                    test,
+                    seenTopicIds,
+                );
             }
         }
 
@@ -440,7 +477,7 @@ export class ForumSession {
         }
 
         this._normalizeSections(test);
-        test.count = ctx.pCount;
+        test.count = ctx.problemCount;
         this._permissionDenied = false;
         return test;
     }
@@ -460,13 +497,13 @@ export class ForumSession {
         );
     }
 
-    _isProblemItem(item, done) {
+    _isProblemItem(item, seenTopicIds) {
         return (
             item.post_data.post_type === "forum" &&
             item.item_type !== "post_hidden" &&
             item.post_data.post_id !== MAA_COPYRIGHT_POST_ID &&
             item.item_text !== CHMMC_MIXER_ITEM_TEXT &&
-            !done.includes(item.post_data.topic_id)
+            !seenTopicIds.includes(item.post_data.topic_id)
         );
     }
 
@@ -492,7 +529,7 @@ export class ForumSession {
         return type;
     }
 
-    async _handleProblemItem(item, type, ctx, test, done) {
+    async _handleProblemItem(item, type, ctx, test, seenTopicIds) {
         const processed = CleanupText.toAsyLinks(
             item.post_data.post_canonical,
             item.post_data.post_rendered,
@@ -512,7 +549,7 @@ export class ForumSession {
                 type,
                 ctx,
                 test,
-                done,
+                seenTopicIds,
             );
         } else {
             await this._handleSingleProblem(
@@ -521,12 +558,12 @@ export class ForumSession {
                 type,
                 ctx,
                 test,
-                done,
+                seenTopicIds,
             );
         }
     }
 
-    async _handleMultiProblem(isMulti, item, type, ctx, test, done) {
+    async _handleMultiProblem(isMulti, item, type, ctx, test, seenTopicIds) {
         ctx.isPrevMulti = true;
         let answers = null;
         let topicSolutions = [];
@@ -540,46 +577,42 @@ export class ForumSession {
             topicSolutions = topicData.solutions;
         }
         for (let j = 0; j < isMulti.length; j++) {
-            const problem = {
+            const problem = makeProblem({
                 statement: CleanupText.cleanChoices(isMulti[j]),
-                post_id: item.post_data.post_id,
-                topic_id: item.post_data.topic_id,
+                postId: item.post_data.post_id,
+                topicId: item.post_data.topic_id,
                 n: j + ctx.problemIndex,
-                choices: null,
-                raw_answer: null,
-                answer: -1,
                 solutions: j === 0 ? topicSolutions : [],
-                all_posts: [],
-            };
+            });
             if (type.computational) {
                 const answer = answers?.[(j + 1).toString()] ?? null;
                 if (type.choices) {
-                    problem.raw_answer = answer;
+                    problem.answerValue = answer;
                     problem.choices = CleanupText.extractChoices(isMulti[j]);
-                    problem.answer = problem.choices.indexOf(answer);
+                    problem.answerIndex = problem.choices.indexOf(answer);
                 } else {
                     this._setNumericAnswer(problem, answer);
                 }
             }
             addProblemToTest(problem, ctx, test, this.onProblemAdd);
-            done.push(item.post_data.topic_id);
-            ctx.pCount++;
+            seenTopicIds.push(item.post_data.topic_id);
+            ctx.problemCount++;
         }
         ctx.problemIndex += isMulti.length;
     }
 
-    async _handleSingleProblem(processed, item, type, ctx, test, done) {
+    async _handleSingleProblem(processed, item, type, ctx, test, seenTopicIds) {
         const problem = await this._buildProblem(
             processed,
             type,
             item.post_data.topic_id,
         );
-        problem.post_id = item.post_data.post_id;
-        problem.topic_id = item.post_data.topic_id;
+        problem.postId = item.post_data.post_id;
+        problem.topicId = item.post_data.topic_id;
         problem.n = ctx.problemIndex;
         addProblemToTest(problem, ctx, test, this.onProblemAdd);
-        done.push(problem.topic_id);
-        ctx.pCount++;
+        seenTopicIds.push(problem.topicId);
+        ctx.problemCount++;
         ctx.problemIndex++;
     }
 
@@ -691,16 +724,16 @@ export class ForumSession {
             if (ans == null) return;
             if (type.choices) {
                 // MCQ: answer key is authoritative — override \boxed{} result
-                problem.raw_answer = ans;
+                problem.answerValue = ans;
                 const parsed = CleanupText.parseMCQAns(ans);
                 if (parsed?.type === "letter") {
-                    problem.answer = MCQ_LETTERS.indexOf(parsed.value);
+                    problem.answerIndex = MCQ_LETTERS.indexOf(parsed.value);
                 } else if (parsed) {
-                    problem.answer = (problem.choices ?? []).indexOf(
+                    problem.answerIndex = (problem.choices ?? []).indexOf(
                         parsed.value,
                     );
                 }
-            } else if (problem.raw_answer == null) {
+            } else if (problem.answerValue == null) {
                 // Numeric: only fill when \boxed{} found nothing
                 this._setNumericAnswer(problem, ans);
             }
@@ -716,50 +749,38 @@ export class ForumSession {
     }
 
     _setNumericAnswer(problem, rawAnswer) {
-        // Numeric problems have no MCQ choices, but a known answer is still
-        // representable as a single-element choice list with the index at 0 —
-        // matching how the CSV/DB layer normalizes them. When no answer is
-        // known, leave choices null / answer -1 to signal "unresolved".
-        problem.raw_answer = rawAnswer ?? null;
-        if (rawAnswer != null) {
-            problem.choices = [rawAnswer];
-            problem.answer = 0;
-        } else {
-            problem.choices = null;
-            problem.answer = -1;
-        }
+        // Numeric problems have no MCQ choices. The known answer lives in
+        // answerValue; choices stays null and answerIndex stays -1.
+        problem.answerValue = rawAnswer ?? null;
+        problem.choices = null;
+        problem.answerIndex = -1;
     }
 
-    async _buildProblem(processed, type, topic_id) {
-        const problem = {
+    async _buildProblem(processed, type, topicId) {
+        const problem = makeProblem({
             statement: CleanupText.cleanProblem(processed),
-            answer: -1,
-            choices: null,
-            raw_answer: null,
-            solutions: [],
-            all_posts: [],
-        };
+        });
 
         if (!type.computational) {
             // OLY — fetch all posts for potential solutions
             const topicData = await this.searchTopicForSolutions(
-                topic_id,
+                topicId,
                 false,
                 true,
             );
             problem.solutions = topicData.solutions;
-            problem.all_posts = topicData.all_posts;
+            problem.posts = topicData.posts;
             return problem;
         }
 
         const topicData = await this.searchTopicForSolutions(
-            topic_id,
+            topicId,
             false,
             false,
         );
         const rawAnswer = topicData.answer;
         problem.solutions = topicData.solutions;
-        problem.raw_answer = rawAnswer;
+        problem.answerValue = rawAnswer;
 
         if (type.choices) {
             // MCQ (e.g. AMC)
@@ -770,12 +791,12 @@ export class ForumSession {
             if (rawAnswer != null) {
                 const parsed = CleanupText.parseMCQAns(rawAnswer);
                 if (parsed == null) {
-                    problem.answer = -1;
+                    problem.answerIndex = -1;
                 } else if (parsed.type === "letter") {
-                    problem.raw_answer = parsed.value; // normalize to just the letter
-                    problem.answer = MCQ_LETTERS.indexOf(parsed.value);
+                    problem.answerValue = parsed.value; // normalize to just the letter
+                    problem.answerIndex = MCQ_LETTERS.indexOf(parsed.value);
                 } else {
-                    problem.answer = problem.choices.indexOf(parsed.value);
+                    problem.answerIndex = problem.choices.indexOf(parsed.value);
                 }
             }
         } else {
@@ -813,7 +834,7 @@ export class ForumSession {
         // id 0 means the problems came from a packed view_posts_text post that
         // has no backing discussion topic — nothing to fetch.
         if (!id || this._permissionDenied) {
-            return { answer: null, answers: {}, solutions: [], all_posts: [] };
+            return { answer: null, answers: {}, solutions: [], posts: [] };
         }
 
         const response = await this.sendRequest(
@@ -822,20 +843,20 @@ export class ForumSession {
 
         if (response.error_code === "E_NO_PERMISSION") {
             this._permissionDenied = true;
-            return { answer: null, answers: {}, solutions: [], all_posts: [] };
+            return { answer: null, answers: {}, solutions: [], posts: [] };
         }
 
         const topic = response.response.topic;
         if (topic?.category_id && !this._currentForumCategoryId) {
             this._currentForumCategoryId = topic.category_id;
         }
-        const posts = topic.posts_data ?? [];
+        const rawPosts = topic.posts_data ?? [];
         const solutions = [];
-        const all_posts = [];
+        const posts = [];
         let answer = null;
         const answers = {};
 
-        for (const post of posts) {
+        for (const post of rawPosts) {
             const content = post.post_canonical;
 
             // Extract answers
@@ -852,7 +873,7 @@ export class ForumSession {
 
             // Collect all posts for OLY
             if (isOly) {
-                all_posts.push({
+                posts.push({
                     post_id: post.post_id,
                     user_id: post.poster_id ?? null,
                     username: post.username ?? null,
@@ -879,7 +900,7 @@ export class ForumSession {
             }
         }
 
-        return { answer, answers, solutions, all_posts };
+        return { answer, answers, solutions, posts };
     }
 
     async searchTopicForAnswer(id, searchManyProblems = false) {

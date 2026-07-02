@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
-import { input, confirm, select, search } from "@inquirer/prompts";
+import { confirm, select, search } from "@inquirer/prompts";
 import { ENV } from "../.env.js";
 import { ApiMethod, ForumSession } from "../src/ForumSession.js";
 import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
-import { CleanupText } from "../src/CleanupText.js";
 import {
     initDB,
     upsertScrapeResults,
     buildProductionProblems,
 } from "../src/db.js";
+import { exportProductionCSV } from "../src/export.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
@@ -82,15 +82,12 @@ async function main() {
             if (await confirm({ message: "Log Data?" })) {
                 console.log(data);
             }
-            let saveFile = await input({
-                message: "Save to: ",
-                default: "raw.json",
-            });
-            if (saveFile) {
-                await Bun.write(saveFile, JSON.stringify(data, null, 2));
-                console.log("Saved to file: ", saveFile);
-            } else {
-                console.log("Data not saved");
+            // SQLite is the source of truth. A raw JSON dump is optional and only
+            // for debugging / re-import — pass `--dump` or `--dump=<file>`.
+            const dumpFile = parseDumpFlag();
+            if (dumpFile) {
+                await Bun.write(dumpFile, JSON.stringify(data, null, 2));
+                console.log(`Dumped raw scrape to ${dumpFile}`);
             }
             if (
                 await confirm({
@@ -106,7 +103,7 @@ async function main() {
             break;
         }
 
-        case "save-to-db": {
+        case "import": {
             const srcFile = process.argv[3] ?? "raw.json";
             data = await Bun.file(srcFile).json();
             const db = initDB(DB_PATH);
@@ -119,24 +116,6 @@ async function main() {
             break;
         }
 
-        case "json-to-csv": {
-            console.log("JSON-TO-CSV");
-            data = await Bun.file("raw.json").json();
-            if (!Array.isArray(data)) data = [data];
-            await exportToCSV(data);
-            console.log("Done!");
-            break;
-        }
-
-        case "to-csv": {
-            console.log("TO-CSV (from DB)");
-            const db = initDB(DB_PATH);
-            await exportToCSVFromDB(db);
-            db.close();
-            console.log("Done!");
-            break;
-        }
-
         case "preprocess": {
             const db = initDB(DB_PATH);
             const { runPreprocess } = await import("../src/preprocess.js");
@@ -145,20 +124,19 @@ async function main() {
             break;
         }
 
-        case "quick-fix": {
-            data = await Bun.file("scrape_data/problems.json").json();
-            for (let p of data) {
-                if (p.answers.length === 0) {
-                    p.answers = CleanupText.extractChoices(p.statement);
-                }
-                p.statement = CleanupText.cleanChoices(p.statement);
-            }
-            await Bun.write(
-                "scrape_data/problems.json",
-                JSON.stringify(data, null, 2),
-            );
-            await Bun.write("scrape_data/problems.csv", JSONToCSV(data));
-            console.log("Saved!");
+        case "build": {
+            const db = initDB(DB_PATH);
+            const n = buildProductionProblems(db);
+            console.log(`Built production_problems: ${n} rows.`);
+            db.close();
+            break;
+        }
+
+        case "export": {
+            const db = initDB(DB_PATH);
+            const n = await exportProductionCSV(db);
+            db.close();
+            if (n > 0) console.log(`Exported ${n} problems to scrape_data/`);
             break;
         }
 
@@ -166,14 +144,6 @@ async function main() {
             const db = initDB(DB_PATH);
             db.close();
             console.log(`Database initialized at ${DB_PATH}`);
-            break;
-        }
-
-        case "build-production": {
-            const db = initDB(DB_PATH);
-            const n = buildProductionProblems(db);
-            console.log(`Built production_problems: ${n} rows.`);
-            db.close();
             break;
         }
 
@@ -220,175 +190,20 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape, save-to-db, to-csv, json-to-csv, quick-fix, init-db, build-production, preprocess, clear-db",
+                "Available commands: scrape [--dump[=file]], import [file], preprocess, build, export, init-db, clear-db",
             );
             break;
     }
 }
 
-async function exportToCSV(seriesList) {
-    let seriesRows = [];
-    let testRows = [];
-    let problemRows = [];
-    let seriesId = 0,
-        testId = 0,
-        problemId = 0;
-
-    let addProblem = (problem, test) => {
-        problemRows.push({
-            id: problemId,
-            test_id: testId,
-            section: problem.section ?? -1,
-            statement: problem.statement,
-            n: problem.n,
-            answer_index:
-                (problem?.choices[0] === null
-                    ? null
-                    : problem.answer === null
-                      ? null
-                      : problem.answer) ??
-                (problem.raw_answer != null ? 0 : -1),
-            answers:
-                (problem.choices.length > 0 ? problem.choices : null) ??
-                (problem.raw_answer != null ? [problem.raw_answer] : []),
-            difficulty: 0,
-            quality: 0,
-            verified: false,
-            aops_id: problem["topic_id"],
-            topic: CleanupText.inferACGN(problem.statement),
-            is_computational: test.computational || false,
-        });
-    };
-
-    for (let series of seriesList) {
-        seriesRows.push({
-            id: seriesId,
-            name: series.name,
-            aops_id: series.id ?? -1,
-            is_official: false,
-        });
-
-        for (let test of series.tests) {
-            testRows.push({
-                id: testId,
-                series: seriesId,
-                name: test.name,
-                year: test.year ?? -1,
-                links: [],
-                quality: 0,
-                difficulty: 0,
-                aops_id: test.id,
-                is_computational: test.computational,
-            });
-
-            if (test.sections.length > 0) {
-                for (let i = 0; i < test.sections.length; i++) {
-                    for (let problem of test.problems[i]) {
-                        addProblem({ ...problem, section: i }, test);
-                        problemId++;
-                    }
-                }
-            } else {
-                for (let problem of test.problems) {
-                    addProblem({ ...problem, section: -1 }, test);
-                    problemId++;
-                }
-            }
-            testId++;
-        }
-        seriesId++;
-    }
-
-    await Bun.write(
-        "scrape_data/problems.json",
-        JSON.stringify(problemRows, null, 2),
+// Returns the raw-dump file path if `--dump` / `--dump=<file>` was passed to
+// `scrape`, else null. The dump is a debug artifact; SQLite is the source of truth.
+function parseDumpFlag() {
+    const flag = process.argv.find(
+        (a) => a === "--dump" || a.startsWith("--dump="),
     );
-    await Bun.write("scrape_data/series.csv", JSONToCSV(seriesRows));
-    await Bun.write("scrape_data/tests.csv", JSONToCSV(testRows));
-    await Bun.write("scrape_data/problems.csv", JSONToCSV(problemRows));
-}
-
-async function exportToCSVFromDB(db) {
-    const problems = db
-        .query(
-            `
-        SELECT
-            p.id,
-            p.test_id,
-            p.n,
-            p.section,
-            p.statement,
-            p.answer_index,
-            p.answers,
-            p.topic,
-            p.tags,
-            p.is_computational,
-            p.difficulty,
-            p.quality,
-            p.verified,
-            p.aops_topic_id,
-            p.aops_choices,
-            p.aops_answer,
-            p.aops_answer_index,
-            t.name AS test_name,
-            t.year AS test_year,
-            t.type AS test_type,
-            t.aops_category_id,
-            s.name AS series_name,
-            s.is_official
-        FROM problems p
-        JOIN tests t ON p.test_id = t.id
-        JOIN series s ON t.series_id = s.id
-        ORDER BY s.name, t.year, t.name, p.section, p.n
-    `,
-        )
-        .all();
-
-    const tests = db
-        .query(
-            `
-        SELECT t.*, s.name AS series_name, s.is_official
-        FROM tests t JOIN series s ON t.series_id = s.id
-        ORDER BY s.name, t.year, t.name
-    `,
-        )
-        .all();
-
-    const seriesList = db.query(`SELECT * FROM series ORDER BY name`).all();
-
-    await Bun.write("scrape_data/series.csv", JSONToCSV(seriesList));
-    await Bun.write("scrape_data/tests.csv", JSONToCSV(tests));
-    await Bun.write(
-        "scrape_data/problems.json",
-        JSON.stringify(problems, null, 2),
-    );
-    await Bun.write("scrape_data/problems.csv", JSONToCSV(problems));
-}
-
-function JSONToCSV(data) {
-    let keys = Object.keys(data[0]);
-    let text = keys.join(",") + "\n";
-    for (let i = 0; i < data.length; i++) {
-        for (let j = 0; j < keys.length; j++) {
-            let d = data[i][keys[j]];
-            if (Array.isArray(d)) {
-                text += `"[${d.map((a) => `""${a.replace(/\\/g, "\\\\")}""`).join(",")}]"`;
-            } else if (d != null) {
-                text += typeof d === "string" ? sanitizeStringCSV(d) : d;
-            }
-            if (j < keys.length - 1) text += ",";
-        }
-        if (i < data.length - 1) text += "\n";
-    }
-    return text;
-}
-
-function sanitizeStringCSV(content) {
-    content = content.replace(/\r\n/g, "\n");
-    if (/[",\n\r]/.test(content)) {
-        return `"${content.replace(/"/g, '""')}"`;
-    }
-    return content;
+    if (!flag) return null;
+    return flag.includes("=") ? flag.split("=")[1] || "raw.json" : "raw.json";
 }
 
 async function sleep(ms) {

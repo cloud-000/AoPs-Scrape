@@ -269,7 +269,7 @@ Throws if the API returns an `error_code` or if the category is not found.
 
 ---
 
-### `getTest(id, testType = null, done = [])`
+### `getTest(id, testType = null, seenTopicIds = [])`
 
 Fetches and parses a single test category into a structured test object.
 
@@ -279,7 +279,7 @@ Fetches and parses a single test category into a structured test object.
 |---|---|---|
 | `id` | number | AoPS category ID of the test |
 | `testType` | `TYPES` entry \| null | Fallback type if the name heuristic returns null |
-| `done` | number[] | List of `topic_id`s already processed (prevents duplicates in multi-test scrapes) |
+| `seenTopicIds` | number[] | List of `topicId`s already processed (prevents duplicates in multi-test scrapes) |
 
 **Output:**
 
@@ -296,25 +296,28 @@ Fetches and parses a single test category into a structured test object.
 }
 ```
 
-**Problem shape:**
+**Problem shape:** (built via the `makeProblem()` factory; full typedef in `src/types.js`)
 
 ```js
 {
   statement: string,        // cleaned LaTeX/BBCode
   n: number,                // 0-based problem index
-  topic_id: number,
-  post_id: number,
-  choices: string[] | null, // MCQ options; [answer] for a numeric problem with a known answer; null when unresolved or proof-based
-  answer: number | null,    // index into choices (0 for a resolved numeric answer), -1 if unknown, or null for proof-based
-  section: number,          // (only present if sectioned test) index into sections[]
+  section: number,          // section index; -1 if the test has no sections
+  topicId: number | null,
+  postId: number | null,
+  choices: string[] | null, // MCQ options; null for numeric / proof-based
+  answerIndex: number,      // index into choices for MCQ; -1 if numeric/unknown
+  answerValue: string | null, // literal answer: letter for MCQ, number for numeric; null if unknown
+  solutions: Solution[],    // classified solution posts
+  posts: ForumPost[],       // all discussion posts (used for OLY solution curation)
 }
 ```
 
-Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) have no real choice list, but a *known* answer is still represented uniformly as `choices = [raw_answer]` with `answer = 0` (done by `_setNumericAnswer`), matching how the CSV/DB layer normalizes them. When no answer is found, `choices` stays `null` and `answer` stays `-1`. `raw_answer` always holds the original answer string (or `null`).
+Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter.
 
 Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat.
 
-Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topic_id === 0`.
+Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topicId === 0`.
 
 Answer keys: after the problem list is built (and only for computational tests), `getTest` always calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). If found, it is parsed with `CleanupText.parseAnswerKey(post_canonical, name)` and applied via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`); when a post packs multiple `[hide=label]` keys (e.g. one per subtest), the block whose label best matches `name` is chosen. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
 
@@ -337,7 +340,7 @@ Selects the first item with `item_type === "post_hidden"` whose `item_text` matc
 
 ---
 
-### `getAllTests(id, type = null, shownDepth = 1, done = new Set(), returnDone = false)`
+### `getAllTests(id, type = null, shownDepth = 1, seenCategoryIds = new Set(), returnSeen = false)`
 
 Recursively scrapes a folder hierarchy, returning a tree of test results.
 
@@ -348,8 +351,8 @@ Recursively scrapes a folder hierarchy, returning a tree of test results.
 | `id` | number | AoPS category ID of the top-level folder |
 | `type` | `TYPES` entry \| null | Type override propagated to child tests |
 | `shownDepth` | number | Controls tree nesting: at depth > 0 sub-folders are wrapped as `{ name, tests[], count }`; at depth ≤ 0 their children are flattened into the parent's `tests[]` |
-| `done` | Set\<number\> | Set of category IDs already visited (prevents infinite recursion) |
-| `returnDone` | boolean | If true, includes the `done` set in the return value |
+| `seenCategoryIds` | Set\<number\> | Set of category IDs already visited (prevents infinite recursion) |
+| `returnSeen` | boolean | If true, includes the `seenCategoryIds` set in the return value |
 
 **Output:**
 
@@ -359,11 +362,11 @@ Recursively scrapes a folder hierarchy, returning a tree of test results.
   name: string,
   tests: (TestResult | FolderResult)[],  // mix of getTest results and nested getAllTests results
   count: number,
-  done?: Set<number>,  // only present if returnDone is true
+  seenCategoryIds?: Set<number>,  // only present if returnSeen is true
 }
 ```
 
-Items with `item_type === "folder"` are recursed; `item_type === "view_posts"` items are passed to `getTest`. Items in `CONTEST_IDS.IGNORE` or already in `done` are skipped.
+Items with `item_type === "folder"` are recursed; `item_type === "view_posts"` items are passed to `getTest`. Items in `CONTEST_IDS.IGNORE` or already in `seenCategoryIds` are skipped.
 
 ---
 
@@ -401,6 +404,8 @@ Fetches a problem topic's discussion thread and extracts the answer from reply p
 
 **Side effect:** caches `topic.category_id` from the response into `this._currentForumCategoryId` (used by `_fetchStickyAnswerKey`).
 
+`searchTopicForAnswer` is a thin wrapper over `searchTopicForSolutions(id, searchManyProblems, isOly=false)`, which returns `{ answer, answers, solutions, posts }` — `answer` (single boxed string), `answers` (number→string map for packed posts), `solutions` (classified solution posts), and `posts` (all discussion posts, populated only when `isOly` is true). `searchTopicForAnswer` returns just `answer` or `answers`.
+
 ---
 
 ### `_fetchStickyAnswerKey(forumCategoryId, testName)`
@@ -437,8 +442,8 @@ Applies a parsed answer map (from `_extractInCategoryAnswerKey` or `_fetchSticky
 | `type` | `TYPES` entry | Used to determine MCQ vs. numeric behavior |
 
 **Behavior:**
-- **MCQ** (`type.choices`): answer key is authoritative — sets `raw_answer` and re-resolves `answer` index, overriding any `\boxed{}` result from the discussion thread.
-- **Numeric** (AIME, COMP, etc.): only fills in the answer when `raw_answer` is currently `null` (never overrides a `\boxed{}` answer); when it does, it sets `raw_answer`, `choices = [answer]`, and `answer = 0` via `_setNumericAnswer`.
+- **MCQ** (`type.choices`): answer key is authoritative — sets `answerValue` and re-resolves the `answerIndex`, overriding any `\boxed{}` result from the discussion thread.
+- **Numeric** (AIME, COMP, etc.): only fills in the answer when `answerValue` is currently `null` (never overrides a `\boxed{}` answer); when it does, it sets `answerValue` via `_setNumericAnswer`.
 - Problems with no entry in `answerMap` are untouched.
 - Works on both flat and section-nested `problems` arrays; uses a running counter (not `problem.n`) for 1-based numbering across sections.
 
@@ -446,7 +451,7 @@ Applies a parsed answer map (from `_extractInCategoryAnswerKey` or `_fetchSticky
 
 ### `_setNumericAnswer(problem, rawAnswer)`
 
-Writes a numeric (non-MCQ computational) answer onto a problem in the normalized shape. If `rawAnswer != null`, sets `raw_answer = rawAnswer`, `choices = [rawAnswer]`, `answer = 0`; otherwise sets `raw_answer = null`, `choices = null`, `answer = -1`. Used by `_buildProblem`, `_handleMultiProblem`, and `_applyForumAnswerKey` so every numeric path produces an identical representation.
+Writes a numeric (non-MCQ computational) answer onto a problem: sets `answerValue = rawAnswer ?? null`, leaving `choices = null` and `answerIndex = -1`. Used by `_buildProblem`, `_handleMultiProblem`, and `_applyForumAnswerKey` so every numeric path produces an identical representation.
 
 ---
 
