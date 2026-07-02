@@ -13,6 +13,7 @@ raw*.json
 cleaning_steps
 AGENTS.md
 CLAUDE.md
+GEMINI.md
 .claude/
 response_cache/
 debug_data/

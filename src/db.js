@@ -682,6 +682,59 @@ function upsertProblem(db, problem, testId) {
     }
 }
 
+// Upserts a problem from a PDF/OCR source. Writes the manual pdf_* columns and
+// re-resolves statement/answer_value following the same merge contract the
+// scraper uses (pdf_* / verified outrank aops_*). Unlike upsertProblem it never
+// touches aops_*, acgn, tags, verified, difficulty, quality or notes on an
+// existing row, and a missing OCR answer never wipes an existing pdf_answer.
+// PDF import is additive only — no orphan cleanup — so AoPS-only rows survive.
+export function upsertPdfProblem(db, problem, testId) {
+    const section = -1; // section lives on the test row; problems always -1
+    const statement = problem.statement;
+    const answer = problem.answer ?? null;
+    const source = problem.source ?? null;
+    const acgn = CleanupText.inferACGN(statement);
+    const autoTagsList = getAutoTags(statement);
+    const tagsJson =
+        autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
+
+    db.run(
+        `
+        INSERT INTO problems (
+            test_id, n, section,
+            pdf_statement, pdf_answer, pdf_source,
+            statement, answer_index, answer_value,
+            acgn, tags, is_computational
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (test_id, n, section) DO UPDATE SET
+            pdf_statement = excluded.pdf_statement,
+            -- A missing OCR answer must not wipe an existing one.
+            pdf_answer    = COALESCE(excluded.pdf_answer, problems.pdf_answer),
+            pdf_source    = excluded.pdf_source,
+            statement    = COALESCE(excluded.pdf_statement, problems.aops_statement),
+            answer_value = CASE
+                WHEN problems.verified THEN problems.answer_value
+                ELSE COALESCE(excluded.pdf_answer, problems.pdf_answer, problems.aops_answer)
+            END,
+            updated_at = datetime('now')
+    `,
+        [
+            testId,
+            problem.n,
+            section,
+            statement,
+            answer,
+            source,
+            statement,
+            -1,
+            answer,
+            acgn,
+            tagsJson,
+            problem.is_computational ? 1 : 0,
+        ],
+    );
+}
+
 // Removes a test's stale problem rows after a re-scrape: any row whose
 // (n, section) is no longer produced by the scrape (e.g. the test's section
 // structure changed). Manually-curated rows (pdf_statement set, or verified)

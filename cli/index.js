@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-import { confirm, select, search } from "@inquirer/prompts";
-import { ENV } from "../.env.js";
+import { confirm, select, search, checkbox } from "@inquirer/prompts";
+import { ENV, PDF_DATA_DIR } from "../.env.js";
 import { ApiMethod, ForumSession } from "../src/ForumSession.js";
 import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
@@ -116,6 +116,65 @@ async function main() {
             break;
         }
 
+        case "import-pdf": {
+            const args = process.argv.slice(3);
+            const flag = (name) => {
+                const hit = args.find((a) => a.startsWith(`--${name}=`));
+                return hit
+                    ? hit
+                          .slice(name.length + 3)
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean)
+                    : null;
+            };
+            const outDir =
+                args.find((a) => !a.startsWith("--")) ??
+                process.env.OCR_OUT_DIR ??
+                PDF_DATA_DIR;
+            let series = flag("series"); // OCR series folder(s), comma-separated
+            let tests = flag("test"); // test folder(s), comma-separated
+            const all = args.includes("--all");
+
+            const { importPdfProblems, listPdfSeries, listPdfTests } =
+                await import("../src/pdfImport.js");
+
+            // No explicit filter and interactive: let the user pick series/tests.
+            if (!series && !tests && !all && process.stdin.isTTY) {
+                const available = listPdfSeries(outDir);
+                if (available.length === 0) {
+                    console.log(`No importable series found in ${outDir}.`);
+                    break;
+                }
+                series = await checkbox({
+                    message:
+                        "Which series? (space to toggle, enter to confirm; none = all)",
+                    choices: available.map((s) => ({ name: s, value: s })),
+                });
+                if (series.length === 0) series = null; // treat "none selected" as all
+                const testChoices = (series ?? available).flatMap((s) =>
+                    listPdfTests(outDir, s).map((t) => ({
+                        name: `${s}/${t}`,
+                        value: t,
+                    })),
+                );
+                tests = await checkbox({
+                    message: "Which tests? (none = all in the chosen series)",
+                    choices: testChoices,
+                });
+                if (tests.length === 0) tests = null;
+            }
+
+            const db = initDB(DB_PATH);
+            const s = importPdfProblems(db, outDir, { series, tests });
+            const { c } = db.query("SELECT count(*) as c FROM problems").get();
+            db.close();
+            console.log(
+                `Imported PDF problems from ${outDir}: ${s.problems} problems across ${s.tests} tests in ${s.series} series (${c} total problems in DB).`,
+            );
+            break;
+        }
+
         case "preprocess": {
             const db = initDB(DB_PATH);
             const { runPreprocess } = await import("../src/preprocess.js");
@@ -190,7 +249,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], import [file], preprocess, build, export, init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, init-db, clear-db",
             );
             break;
     }
