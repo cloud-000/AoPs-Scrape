@@ -295,7 +295,9 @@ export class ForumSession {
         returnSeen = false,
     ) {
         const seenTopicIds = [];
-        const { name, items: allItems } = await this._fetchCategory(id);
+        const { name: rawName, items: allItems } =
+            await this._fetchCategory(id);
+        const name = CleanupText.normalizeContestName(rawName);
 
         if (type == null) {
             type = ForumSession.inferType(name, true);
@@ -398,7 +400,8 @@ export class ForumSession {
 
     async getTest(id, testType = null, seenTopicIds = []) {
         this._currentForumCategoryId = null;
-        const { name, items } = await this._fetchCategory(id);
+        const { name: rawName, items } = await this._fetchCategory(id);
+        const name = CleanupText.normalizeContestName(rawName);
         const test = { sections: [], problems: [], id, name };
         test.year = CleanupText.extractYear(name);
 
@@ -621,6 +624,12 @@ export class ForumSession {
             test.sections.pop();
         }
         if (test.sections.length === 1) {
+            // A lone section is folded into a flat test. If its header carries
+            // identifying info (High School / Middle School / A / B), append it
+            // to the test name; otherwise the header is noise (problem count,
+            // time limit, …) and is dropped.
+            const label = CleanupText.extractSectionLabel(test.sections[0]);
+            if (label) test.name = `${test.name} ${label}`;
             test.sections.pop();
             test.problems = test.problems.flat();
         }

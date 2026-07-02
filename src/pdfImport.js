@@ -23,18 +23,21 @@ const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 // test folder name into the DB test's { name, year, section, sectionName }.
 export const SERIES_CONFIG = {
     purplecomet: {
-        seriesName: "Purple Comet Problems",
+        seriesName: "Purple Comet",
         isOfficial: false,
         isComputational: true,
-        // "2026_HS" -> "2026 Purple Comet Problems High School"
+        // "2026_HS" -> "2026 Purple Comet High School". Flat test: the level is
+        // baked into the name (not a DB section), mirroring how the scraper
+        // folds a single-section AoPS category — see
+        // ForumSession._normalizeSections — so PDF rows merge onto AoPS rows.
         parseTest(folder) {
             const [year, level] = folder.split("_");
-            const sectionName = PURPLE_LEVELS[level] ?? level;
+            const label = PURPLE_LEVELS[level] ?? level;
             return {
-                name: `${year} Purple Comet Problems ${sectionName}`,
+                name: `${year} Purple Comet ${label}`,
                 year: Number(year),
-                section: level === "MS" ? 1 : 0,
-                sectionName,
+                section: -1,
+                sectionName: null,
             };
         },
     },
@@ -189,6 +192,9 @@ export function importPdfProblems(db, outDir, options = {}) {
                         year: meta.year ?? null,
                         type: null,
                         isComputational: cfg.isComputational,
+                        // Section structure is scraper-owned; PDF import must
+                        // not rewrite section/section_name on an existing row.
+                        updateSection: false,
                     },
                     seriesId,
                 );

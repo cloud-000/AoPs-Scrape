@@ -315,7 +315,9 @@ Fetches and parses a single test category into a structured test object.
 
 Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter.
 
-Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat.
+Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat. When collapsing, `_normalizeSections` checks the lone header via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`); noise headers (problem counts, time limits) are dropped.
+
+Name normalization: the category name is passed through `CleanupText.normalizeContestName` before it becomes the test/series name (currently rewrites `"Purple Comet Problems"` → `"Purple Comet"`).
 
 Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topicId === 0`.
 

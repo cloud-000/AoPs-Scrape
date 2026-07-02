@@ -431,6 +431,17 @@ FROM tests_old;
         db.exec(SCHEMA);
     }
 
+    // Data migration: the "Purple Comet Problems" series was renamed to
+    // "Purple Comet". Rename the series row (OR IGNORE in case a "Purple Comet"
+    // row already exists) and rewrite affected test names so existing rows line
+    // up with fresh scrapes / PDF imports. Idempotent.
+    db.run(
+        `UPDATE OR IGNORE series SET name = 'Purple Comet' WHERE name = 'Purple Comet Problems'`,
+    );
+    db.run(
+        `UPDATE tests SET name = REPLACE(name, 'Purple Comet Problems', 'Purple Comet') WHERE name LIKE '%Purple Comet Problems%'`,
+    );
+
     return db;
 }
 
@@ -468,9 +479,16 @@ export function resolveTestId(db, { aopsCategoryId, section = -1, seriesId, year
     return byNatural ? byNatural.id : null;
 }
 
+// `updateSection` controls whether an UPDATE (merge onto an existing row) may
+// rewrite section/section_name. The scraper owns a test's section structure, so
+// it passes true; non-scrape sources (PDF import) pass false so they never
+// disturb the section metadata of a row the scraper created — e.g. a PDF
+// "High School" test merging by name onto a genuinely two-section AoPS year must
+// not flatten a sibling section to -1 and collide on UNIQUE(aops_category_id,
+// section). A brand-new row still takes the caller's section on INSERT.
 export function upsertTest(
     db,
-    { aopsCategoryId, name, section = -1, sectionName = null, year, type, isComputational },
+    { aopsCategoryId, name, section = -1, sectionName = null, year, type, isComputational, updateSection = true },
     seriesId,
 ) {
     const existingId = resolveTestId(db, {
@@ -486,8 +504,8 @@ export function upsertTest(
             `
             UPDATE tests SET
                 name             = ?,
-                section          = ?,
-                section_name     = ?,
+                section          = CASE WHEN ? THEN ? ELSE section END,
+                section_name     = CASE WHEN ? THEN ? ELSE section_name END,
                 year             = ?,
                 type             = ?,
                 is_computational = ?,
@@ -498,7 +516,9 @@ export function upsertTest(
         `,
             [
                 name,
+                updateSection ? 1 : 0,
                 section,
+                updateSection ? 1 : 0,
                 sectionName ?? null,
                 year ?? null,
                 type ?? null,

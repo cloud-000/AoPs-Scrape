@@ -255,6 +255,42 @@ export class CleanupText {
         return match ? match[0] : null;
     }
 
+    // Identifying section headers we fold into the test name when a category
+    // has a single section (see ForumSession._normalizeSections). AoPS often
+    // labels a one-section test only by its header ("High School", "Middle
+    // School", "... A"/"... B") — that header carries identity we want in the
+    // name. Other single-section headers (e.g. "30 problems, 90 minutes") are
+    // noise and return null so the section is simply dropped. Returns the
+    // canonical label to append, or null.
+    static extractSectionLabel(sectionName) {
+        if (!sectionName) return null;
+        const s = sectionName.trim();
+        if (/middle\s*school/i.test(s)) return "Middle School";
+        if (/high\s*school/i.test(s)) return "High School";
+        // "A"/"B" test/version identifiers (e.g. an AMC 10 A vs. B split that
+        // AoPS files as a single-section category). Kept conservative: the
+        // header must be essentially just the letter, optionally prefixed by
+        // Test/Version/Round/Paper/Contest.
+        const ab = s.match(
+            /^(?:(?:test|version|round|paper|contest)\s+)?\(?([AB])\)?$/i,
+        );
+        if (ab) return ab[1].toUpperCase();
+        return null;
+    }
+
+    // Canonicalizes AoPS category/folder names before they become series/test
+    // names. Currently just trims the redundant "Problems" suffix off Purple
+    // Comet so the series reads "Purple Comet" everywhere. Idempotent.
+    static CONTEST_NAME_RENAMES = [[/Purple Comet Problems/gi, "Purple Comet"]];
+    static normalizeContestName(name) {
+        if (!name) return name;
+        let out = name;
+        for (const [re, rep] of this.CONTEST_NAME_RENAMES) {
+            out = out.replace(re, rep);
+        }
+        return out.replace(/\s{2,}/g, " ").trim();
+    }
+
     static inferACGN(text) {
         const lowerCase = text
             .replace(/\[asy=.*?]\s*.*?\[\/asy]/gs, "")
