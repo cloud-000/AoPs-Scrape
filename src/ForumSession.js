@@ -34,7 +34,7 @@ function isPostDesc(item) {
 // Single source of truth for the scraped-problem shape. Both the single- and
 // multi-problem paths build through this so every problem has identical fields.
 // See ScrapedProblem in src/types.js.
-function makeProblem(fields) {
+export function makeProblem(fields) {
     return {
         statement: "",
         n: 0,

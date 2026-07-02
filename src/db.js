@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS problems (
   aops_choices     TEXT,   -- JSON array of MCQ choice texts; NULL if not MCQ
   aops_answer      TEXT,   -- raw answer string (letter "A"-"E" for MCQ, or numeric string for AIME/COMP); NULL if unknown
 
+  -- Wiki source tier (trust: pdf > wiki > aops). Structurally mirrors aops_*.
+  wiki_page         TEXT,   -- source wiki page title (e.g. "2021 AMC 10A Problems/Problem 1")
+  wiki_statement    TEXT,
+  wiki_choices      TEXT,   -- JSON array of MCQ choice texts; NULL if not MCQ
+  wiki_answer_index INTEGER,
+  wiki_answer       TEXT,   -- literal answer: letter "A"-"E" for MCQ, or numeric string; NULL if unknown
+
   pdf_statement TEXT,
   pdf_answer    TEXT,
   pdf_source    TEXT,
@@ -442,6 +449,26 @@ FROM tests_old;
         `UPDATE tests SET name = REPLACE(name, 'Purple Comet Problems', 'Purple Comet') WHERE name LIKE '%Purple Comet Problems%'`,
     );
 
+    // Migration: add the wiki_* source-tier columns to already-migrated DBs.
+    // New DBs (and DBs that pass through the rename→recreate reshape above) get
+    // these from SCHEMA; a production DB past that reshape needs explicit ALTERs.
+    // Re-read table_info so we see the post-reshape shape.
+    const problemsColsNow = db
+        .query("PRAGMA table_info(problems)")
+        .all()
+        .map((r) => r.name);
+    for (const [col, type] of [
+        ["wiki_page", "TEXT"],
+        ["wiki_statement", "TEXT"],
+        ["wiki_choices", "TEXT"],
+        ["wiki_answer_index", "INTEGER"],
+        ["wiki_answer", "TEXT"],
+    ]) {
+        if (!problemsColsNow.includes(col)) {
+            db.exec(`ALTER TABLE problems ADD COLUMN ${col} ${type}`);
+        }
+    }
+
     return db;
 }
 
@@ -637,15 +664,21 @@ function upsertProblem(db, problem, testId) {
             aops_answer_index = excluded.aops_answer_index,
             aops_choices      = excluded.aops_choices,
             aops_answer       = excluded.aops_answer,
-            statement    = COALESCE(problems.pdf_statement, excluded.aops_statement),
+            -- Resolved values, trust order verified > pdf > wiki > aops. This
+            -- (aops) path reads its own tier from excluded.*, other tiers from
+            -- problems.*, so every write path computes the same result.
+            statement    = COALESCE(problems.pdf_statement, problems.wiki_statement, excluded.aops_statement),
             answer_value = CASE
                 WHEN problems.verified THEN problems.answer_value
                 WHEN problems.pdf_answer IS NOT NULL THEN problems.pdf_answer
+                WHEN problems.wiki_answer IS NOT NULL THEN problems.wiki_answer
                 ELSE excluded.aops_answer
             END,
+            -- answer_index keys off which choices win (wiki_choices > aops_choices)
+            -- so it always indexes into the resolved choices array.
             answer_index = CASE
                 WHEN problems.verified THEN problems.answer_index
-                WHEN problems.pdf_answer IS NOT NULL THEN problems.answer_index
+                WHEN problems.wiki_choices IS NOT NULL THEN problems.wiki_answer_index
                 ELSE excluded.aops_answer_index
             END,
             -- Scraper-immutable: acgn never overwritten after INSERT (re-run via preprocess)
@@ -731,10 +764,19 @@ export function upsertPdfProblem(db, problem, testId) {
             -- A missing OCR answer must not wipe an existing one.
             pdf_answer    = COALESCE(excluded.pdf_answer, problems.pdf_answer),
             pdf_source    = excluded.pdf_source,
-            statement    = COALESCE(excluded.pdf_statement, problems.aops_statement),
+            -- Resolved values, trust order verified > pdf > wiki > aops. pdf tier
+            -- from excluded.*, wiki/aops from problems.*.
+            statement    = COALESCE(excluded.pdf_statement, problems.wiki_statement, problems.aops_statement),
             answer_value = CASE
                 WHEN problems.verified THEN problems.answer_value
-                ELSE COALESCE(excluded.pdf_answer, problems.pdf_answer, problems.aops_answer)
+                ELSE COALESCE(excluded.pdf_answer, problems.pdf_answer, problems.wiki_answer, problems.aops_answer)
+            END,
+            -- pdf carries no choice index; the resolved index rides on whichever
+            -- choices win (wiki > aops), keeping it order-independent.
+            answer_index = CASE
+                WHEN problems.verified THEN problems.answer_index
+                WHEN problems.wiki_choices IS NOT NULL THEN problems.wiki_answer_index
+                ELSE problems.aops_answer_index
             END,
             updated_at = datetime('now')
     `,
@@ -753,6 +795,102 @@ export function upsertPdfProblem(db, problem, testId) {
             problem.is_computational ? 1 : 0,
         ],
     );
+}
+
+// Upserts a problem from the AoPS Wiki. Writes the wiki_* tier (statement,
+// choices, answer index/value) and re-resolves statement/answer following the
+// merge contract (verified > pdf > wiki > aops). Like the PDF path it is
+// additive: it never touches aops_*, verified, difficulty, quality, notes or
+// tags on an existing row, sets acgn only on a fresh insert, and there is no
+// orphan cleanup. Wiki solutions (source='wiki') are refreshed alongside.
+export function upsertWikiProblem(db, problem, testId) {
+    const section = -1; // section lives on the test row; problems always -1
+    const wikiChoices =
+        problem.choices != null ? JSON.stringify(problem.choices) : null;
+    const wikiAnswer = problem.answerValue ?? null;
+    const wikiAnswerIndex = problem.answerIndex ?? -1;
+    const statement = problem.statement;
+    const acgn = CleanupText.inferACGN(statement);
+    const autoTagsList = getAutoTags(statement);
+    const tagsJson =
+        autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
+
+    db.run(
+        `
+        INSERT INTO problems (
+            test_id, n, section,
+            wiki_page, wiki_statement, wiki_choices, wiki_answer_index, wiki_answer,
+            statement, answer_index, answer_value,
+            acgn, tags, is_computational
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (test_id, n, section) DO UPDATE SET
+            wiki_page         = excluded.wiki_page,
+            wiki_statement    = excluded.wiki_statement,
+            wiki_choices      = excluded.wiki_choices,
+            wiki_answer_index = excluded.wiki_answer_index,
+            wiki_answer       = excluded.wiki_answer,
+            -- Resolved values, trust order verified > pdf > wiki > aops. wiki tier
+            -- from excluded.*, pdf/aops from problems.*.
+            statement    = COALESCE(problems.pdf_statement, excluded.wiki_statement, problems.aops_statement),
+            answer_value = CASE
+                WHEN problems.verified THEN problems.answer_value
+                WHEN problems.pdf_answer IS NOT NULL THEN problems.pdf_answer
+                WHEN excluded.wiki_answer IS NOT NULL THEN excluded.wiki_answer
+                ELSE problems.aops_answer
+            END,
+            answer_index = CASE
+                WHEN problems.verified THEN problems.answer_index
+                WHEN excluded.wiki_choices IS NOT NULL THEN excluded.wiki_answer_index
+                ELSE problems.aops_answer_index
+            END,
+            updated_at = datetime('now')
+    `,
+        [
+            testId,
+            problem.n,
+            section,
+            problem.page ?? null,
+            statement,
+            wikiChoices,
+            wikiAnswerIndex,
+            wikiAnswer,
+            statement,
+            wikiAnswerIndex,
+            wikiAnswer,
+            acgn,
+            tagsJson,
+            problem.is_computational ? 1 : 0,
+        ],
+    );
+
+    const row = db
+        .query(
+            `SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = ?`,
+        )
+        .get(testId, problem.n, section);
+    if (row && problem.solutions?.length) {
+        upsertWikiSolutions(db, row.id, problem.solutions);
+    }
+}
+
+// Wiki solutions carry no stable post id (the aops dedup index keys on
+// aops_post_id), so we can't upsert them individually. Instead replace this
+// problem's wiki solutions wholesale: delete the source='wiki' rows and
+// re-insert. aops_post_id = NULL is excluded from idx_solutions_aops_post_id,
+// so wiki rows coexist with aops rows. Marked is_official so they flow into
+// production_problems.official_solutions.
+function upsertWikiSolutions(db, problemId, solutions) {
+    db.run(`DELETE FROM solutions WHERE problem_id = ? AND source = 'wiki'`, [
+        problemId,
+    ]);
+    for (const sol of solutions ?? []) {
+        if (!sol?.content) continue;
+        db.run(
+            `INSERT INTO solutions (problem_id, source, aops_post_id, content, is_official)
+             VALUES (?, 'wiki', NULL, ?, ?)`,
+            [problemId, sol.content, sol.is_official === false ? 0 : 1],
+        );
+    }
 }
 
 // Removes a test's stale problem rows after a re-scrape: any row whose
@@ -882,6 +1020,54 @@ export function upsertScrapeResults(db, raw) {
     })();
 }
 
+// Additive analog of upsertScrapeResults for AoPS Wiki scrapes. Merges wiki
+// problems onto existing forum/PDF rows via the natural key (series_id, name,
+// year): aopsCategoryId is null (wiki doesn't know the forum category id) and
+// updateSection is false (wiki must not disturb scraper-owned section metadata).
+// There is no orphan cleanup, so forum/PDF-only rows always survive. Handles
+// flat tests only (AMC/AIME; AIME I/II are separate test rows, not sections).
+export function upsertWikiResults(db, raw) {
+    const pairs = collectTestPairs(raw, null, null);
+
+    db.transaction(() => {
+        const seriesCache = new Map();
+
+        for (const { seriesName, test } of pairs) {
+            if (!seriesCache.has(seriesName)) {
+                seriesCache.set(
+                    seriesName,
+                    upsertSeries(db, seriesName, -1, raw.is_official ?? false),
+                );
+            }
+            const seriesId = seriesCache.get(seriesName);
+            const isComputational = test.computational ?? false;
+
+            const testId = upsertTest(
+                db,
+                {
+                    aopsCategoryId: null,
+                    name: test.name,
+                    section: -1,
+                    sectionName: null,
+                    year: test.year ?? null,
+                    type: test.type ?? null,
+                    isComputational,
+                    updateSection: false,
+                },
+                seriesId,
+            );
+
+            for (const problem of test.problems) {
+                upsertWikiProblem(
+                    db,
+                    { ...problem, section: -1, is_computational: isComputational },
+                    testId,
+                );
+            }
+        }
+    })();
+}
+
 /**
  * Formats a JavaScript array (or JSON string representing an array)
  * into a Postgres-style TEXT[] literal representation: e.g. {"a", "b", "c"}
@@ -929,7 +1115,7 @@ export function buildProductionProblems(db) {
             .query(
                 `
             SELECT p.id, p.test_id, p.n, p.section, p.aops_topic_id AS aops_id, p.statement,
-                   p.aops_choices AS choices, p.answer_index, p.answer_value, p.acgn, p.tags,
+                   COALESCE(p.wiki_choices, p.aops_choices) AS choices, p.answer_index, p.answer_value, p.acgn, p.tags,
                    p.is_computational, p.difficulty, p.quality, p.verified, p.notes
             FROM problems p
             ORDER BY p.test_id, p.section, p.n

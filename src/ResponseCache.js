@@ -18,6 +18,17 @@ export class ResponseCache {
     }
 
     _key(bodyInput) {
+        // Wiki (MediaWiki Action API) requests are keyed by page + section +
+        // prop so they're inspectable on disk. `action` distinguishes them from
+        // the forum's `a`-keyed payloads.
+        if (bodyInput.action === "parse") {
+            const section =
+                bodyInput.section != null ? `_s${bodyInput.section}` : "";
+            const prop = bodyInput.prop === "wikitext" ? "_wikitext" : "_html";
+            const page = String(bodyInput.page).replace(/[^\w.-]+/g, "_");
+            return join("wiki", `${page}${section}${prop}.json`);
+        }
+
         const a = Array.isArray(bodyInput.a) ? bodyInput.a[0] : bodyInput.a;
         const first = (v) => (Array.isArray(v) ? v[0] : v);
         switch (a) {

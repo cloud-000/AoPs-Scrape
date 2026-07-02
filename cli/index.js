@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
-import { confirm, select, search, checkbox } from "@inquirer/prompts";
+import { confirm, select, search, checkbox, input } from "@inquirer/prompts";
 import { ENV, PDF_DATA_DIR } from "../.env.js";
 import { ApiMethod, ForumSession } from "../src/ForumSession.js";
+import { WikiSession } from "../src/WikiSession.js";
 import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
 import { CLIBarManager, CLICount } from "./progress.js";
 import {
     initDB,
     upsertScrapeResults,
+    upsertWikiResults,
     buildProductionProblems,
 } from "../src/db.js";
 import { exportProductionCSV } from "../src/export.js";
@@ -97,6 +99,93 @@ async function main() {
             ) {
                 const db = initDB(DB_PATH);
                 upsertScrapeResults(db, data);
+                db.close();
+                console.log("Saved to database.");
+            }
+            break;
+        }
+
+        case "wiki": {
+            // Only contests that declare a `wiki` descriptor are scrapable here.
+            const WIKI_CONTESTS = ALL_CONTESTS.filter((c) => c.wiki);
+            let user = await getUser();
+            let session = new WikiSession(
+                user["logged-in"],
+                user["user-id"],
+                user["session-id"],
+                user["headers"] || null,
+                () => {
+                    loader.bars[0].count++;
+                },
+            );
+            session.debug = false;
+            let id = await autoSearch("Enter id: ", WIKI_CONTESTS);
+            const contest = WIKI_CONTESTS.find(
+                (c) => c.id === id || c.id === Number(id),
+            );
+            if (!contest) {
+                console.log(
+                    `No wiki descriptor for ${id}. Add a \`wiki\` field in contest_id.js.`,
+                );
+                break;
+            }
+
+            let method = await getWikiMethod();
+            // Collect all interactive input (variant/year/page) BEFORE the loader
+            // starts — its 300ms re-render otherwise paints over these prompts.
+            const methodArgs = await method.gather(contest);
+            if (
+                await confirm({
+                    message: "Use response cache?",
+                    default: false,
+                })
+            ) {
+                session.cache = new ResponseCache("./response_cache");
+                console.log("Response cache enabled (./response_cache)");
+            }
+            if (!(await confirm({ message: `Confirm ${contest.name}?` }))) {
+                console.log("Exiting");
+                break;
+            }
+            loader.add(new CLICount("Problems Collected:"));
+            loader.start();
+            let loaderInterval = setInterval(() => {
+                loader.calculate();
+                loader.render();
+            }, 300);
+            let startTime = Date.now();
+            const tests = await method.run(session, contest, methodArgs);
+            let elapsedTime = Date.now() - startTime;
+            clearInterval(loaderInterval);
+            await sleep(100);
+            loader.clear();
+            if (tests === null) break; // debug method already handled output/exit
+
+            data = {
+                name: contest.name,
+                is_official: contest.is_official ?? false,
+                tests,
+            };
+            const total = tests.reduce((s, t) => s + (t.count ?? 0), 0);
+            console.log(
+                `Collected ${total} problems across ${tests.length} tests in ${elapsedTime}ms from ${contest.name}`,
+            );
+            if (await confirm({ message: "Log Data?" })) {
+                console.log(JSON.stringify(data, null, 2));
+            }
+            const dumpFile = parseDumpFlag();
+            if (dumpFile) {
+                await Bun.write(dumpFile, JSON.stringify(data, null, 2));
+                console.log(`Dumped raw wiki scrape to ${dumpFile}`);
+            }
+            if (
+                await confirm({
+                    message: `Save to database (${DB_PATH})?`,
+                    default: true,
+                })
+            ) {
+                const db = initDB(DB_PATH);
+                upsertWikiResults(db, data);
                 db.close();
                 console.log("Saved to database.");
             }
@@ -249,7 +338,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, init-db, clear-db",
             );
             break;
     }
@@ -313,6 +402,86 @@ async function getMethod(message = "Select method") {
                 description: "Log raw topic response and exit",
             },
         ],
+    });
+}
+
+// Wiki scrape methods. Each option value is `{ gather, run }`: `gather(contest)`
+// collects any interactive input (variant, year, page title) and MUST run before
+// the progress loader starts, otherwise its 300ms re-render clobbers the prompt.
+// `run(session, contest, args)` does the fetching and returns an array of
+// ScrapedTest objects (or null for the debug method, which logs and skips the DB).
+async function getWikiMethod(message = "Select method") {
+    return await select({
+        message,
+        choices: [
+            {
+                name: "Single contest-year",
+                value: {
+                    gather: async (contest) => {
+                        const variant = await pickVariant(contest);
+                        const year = await input({ message: "Year:" });
+                        return { variant, year };
+                    },
+                    run: async (session, _contest, { variant, year }) => [
+                        await session.getContest(variant, year),
+                    ],
+                },
+                description: "One variant + year, e.g. 2021 AMC 10A",
+            },
+            {
+                name: "Whole contest (all years)",
+                value: {
+                    gather: async () => ({}),
+                    run: async (session, contest) => {
+                        const [start, end] = contest.wiki.years;
+                        const tests = [];
+                        for (const variant of contest.wiki.variants) {
+                            for (let year = start; year <= end; year++) {
+                                try {
+                                    const t = await session.getContest(
+                                        variant,
+                                        year,
+                                    );
+                                    if (t.count > 0) tests.push(t);
+                                } catch (e) {
+                                    console.log(
+                                        `\nSkipped ${year} ${variant}: ${e.message}`,
+                                    );
+                                }
+                            }
+                        }
+                        return tests;
+                    },
+                },
+                description: "Every variant across the configured year range",
+            },
+            {
+                name: "Single page (debug)",
+                value: {
+                    gather: async () => ({
+                        page: await input({
+                            message: "Page title:",
+                            default: "2021 AMC 10A Problems/Problem 1",
+                        }),
+                    }),
+                    run: async (session, _contest, { page }) => {
+                        const problem = await session.getProblemPage(page);
+                        console.log(JSON.stringify(problem, null, 2));
+                        return null;
+                    },
+                },
+                description: "Log a single parsed problem page and skip the DB",
+            },
+        ],
+    });
+}
+
+async function pickVariant(contest) {
+    const variants = contest.wiki?.variants ?? [contest.name];
+    if (variants.length === 1) return variants[0];
+    return await select({
+        message: "Which variant?",
+        choices: variants.map((v) => ({ name: v, value: v })),
     });
 }
 

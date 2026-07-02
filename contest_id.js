@@ -16,10 +16,30 @@ export const CONTEST_IDS = {
         2982588, // FMM duplicate
     ],
     MAA: [
-        { name: "AMC 8", id: 3413, is_official: true },
-        { name: "AMC 10", id: 3414, is_official: true },
-        { name: "AMC 12", id: 3415, is_official: true },
-        { name: "AIME", id: 3416, is_official: true },
+        {
+            name: "AMC 8",
+            id: 3413,
+            is_official: true,
+            wiki: { variants: ["AMC 8"], years: [1999, 2024] },
+        },
+        {
+            name: "AMC 10",
+            id: 3414,
+            is_official: true,
+            wiki: { variants: ["AMC 10A", "AMC 10B"], years: [2002, 2024] },
+        },
+        {
+            name: "AMC 12",
+            id: 3415,
+            is_official: true,
+            wiki: { variants: ["AMC 12A", "AMC 12B"], years: [2002, 2024] },
+        },
+        {
+            name: "AIME",
+            id: 3416,
+            is_official: true,
+            wiki: { variants: ["AIME I", "AIME II"], years: [2000, 2024] },
+        },
         {
             name: "USAMTS",
             id: 3412,

@@ -169,6 +169,94 @@ export class CleanupText {
         });
     }
 
+    // MediaWiki analog of toAsyLinks: pairs each <asy>…</asy> block in the raw
+    // wikitext with the rendered Asymptote <img> src from the page's rendered
+    // HTML, rewriting to the same [asy=URL]…[/asy] BBCode form the forum path
+    // produces (so downstream — inferACGN stripping, production — treats both
+    // sources uniformly). If the img/asy counts don't line up we can't trust the
+    // pairing, so we fall back to plain [asy]…[/asy] with no URL.
+    // NOTE: the wiki's asy <img> class differs from the forum's "asy-image"; the
+    // default regex below is best-effort and should be confirmed against a live
+    // rendered wiki page (see plan risk R6). Pass a custom `imgRegex` to override.
+    static toWikiAsyLinks(
+        wikitext,
+        rendered,
+        imgRegex = /<img\b[^>]*\b(?:class\s*=\s*["'][^"']*asy[^"']*["']|src\s*=\s*["'][^"']*[Aa]sy[^"']*["'])[^>]*>/gi,
+    ) {
+        const asyRegex = /<asy\b[^>]*>([\s\S]*?)<\/asy>/gi;
+        const asyCount = (wikitext.match(asyRegex) || []).length;
+        if (asyCount === 0) return wikitext;
+
+        const urls =
+            (rendered || "")
+                .match(imgRegex)
+                ?.map((e) => {
+                    const src = e.match(/src=["']([^"']*)["']/i)?.[1];
+                    if (!src) return null;
+                    return src.startsWith("http") ? src : "https:" + src;
+                })
+                .filter(Boolean) ?? [];
+
+        let count = 0;
+        const usable = urls.length >= asyCount;
+        return wikitext.replace(asyRegex, (_, content) => {
+            const url = usable ? urls[count] : null;
+            count++;
+            return url
+                ? `[asy=${url}]${content}[/asy]`
+                : `[asy]${content}[/asy]`;
+        });
+    }
+
+    // AoPS wiki wraps LaTeX in <math>/<imath> (inline) and <cmath> (display)
+    // tags, whereas the forum uses $…$/$$…$$. Normalize wiki math to the dollar
+    // form so the forum-oriented helpers (extractChoices, cleanChoices, getBoxed)
+    // work unchanged. `<cmath>` -> `$$`, inline `<math>`/`<imath>` -> `$`.
+    static normalizeWikiMath(str) {
+        return str
+            .replace(/<\s*cmath\b[^>]*>/gi, "$$$$")
+            .replace(/<\s*\/\s*cmath\s*>/gi, "$$$$")
+            .replace(/<\s*i?math\b[^>]*>/gi, "$")
+            .replace(/<\s*\/\s*i?math\s*>/gi, "$");
+    }
+
+    // MediaWiki analog of cleanProblem: strips wiki markup that isn't part of the
+    // problem statement — {{templates}}, [[Category:…]] tags, wikilinks (kept as
+    // their label/target text), stray ==headers==, and the trailing
+    // ==See Also==/==Video Solution==/==Solution== sections (defensive; the
+    // statement is usually fetched as section 0). Converts <asy> diagrams first
+    // when the rendered HTML is available. Returns the trimmed statement.
+    static cleanWikiProblem(str, rendered = null) {
+        let s = CleanupText.normalizeWikiMath(str);
+
+        // Convert Asymptote diagrams before we strip anything else.
+        if (/<asy\b/i.test(s)) {
+            s = CleanupText.toWikiAsyLinks(s, rendered);
+        }
+
+        // Cut off everything from the first solution/see-also/video header on.
+        s = s.replace(
+            /\n=+\s*(?:Solution|See\s*Also|Video\s*Solution|Notes?)\b[\s\S]*$/i,
+            "",
+        );
+
+        s = s
+            // {{AMC10 box}}, {{duplicate|…}}, {{stub}}, etc. (single level).
+            .replace(/\{\{[^{}]*\}\}/g, "")
+            // [[Category:…]] tags.
+            .replace(/\[\[Category:[^\]]*\]\]/gi, "")
+            // [[target|label]] -> label ; [[target]] -> target.
+            .replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, "$2")
+            .replace(/\[\[([^\]]*)\]\]/g, "$1")
+            // Any remaining wiki section headers.
+            .replace(/^\s*=+[^=\n]*=+\s*$/gm, "")
+            // MediaWiki magic words.
+            .replace(/__[A-Z]+__/g, "")
+            .trim();
+
+        return s;
+    }
+
     static checkContainsMultiple(str, startN = 1, loose = false) {
         if (loose) {
             str = str.replace(/^\[i\].*?\[\/i\]/i, "");
@@ -216,10 +304,18 @@ export class CleanupText {
             if (i % 2 === 1) {
                 choices.push(
                     parts[i]
-                        .replace(/\\qquad\s*$/, "")
-                        .replace(/^\\(\d+)/, "$1")
                         .replace(/\n[\s\S]*$/, "")
-                        .replace(/\${1,2}$/, "")
+                        // Strip the LaTeX spacing macros AoPS puts after the bold
+                        // label (e.g. `\textbf{(A) }\ 1` -> `1`): a leading run of
+                        // whitespace, escaped space `\ `, `\,`/`\;`/`\:`/`\!`, or
+                        // `\quad`/`\qquad`. A real value like `\frac{3}{10}` is kept.
+                        .replace(/^(?:\s|\\[ ,;:!]|\\q?quad\b)+/, "")
+                        .replace(/^\\(\d+)/, "$1")
+                        // Strip trailing separators/delimiters: whitespace, a
+                        // `\qquad`, a LaTeX line break `\\` (some pages, e.g. AMC 8
+                        // 2010 #23, break choices onto lines), or a closing `$`/`$$`
+                        // (from a converted </math>/</imath>/</cmath> on the last one).
+                        .replace(/(?:\s|\\qquad\b|\\\\|\${1,2})+$/, "")
                         .trim(),
                 );
             }
@@ -325,7 +421,8 @@ export class CleanupText {
 
         // Extract hide tag contents, keeping the [hide=label] label so that a
         // post carrying several answer keys can be disambiguated by `name`.
-        const hideRe = /\[hide(?:\s*=\s*"?([^\]"]*)"?)?\]([\s\S]*?)\[\/hide\]/gi;
+        const hideRe =
+            /\[hide(?:\s*=\s*"?([^\]"]*)"?)?\]([\s\S]*?)\[\/hide\]/gi;
         const hideBlocks = [...content.matchAll(hideRe)].map((m) => ({
             label: (m[1] ?? "").trim(),
             body: m[2],
@@ -419,7 +516,8 @@ export class CleanupText {
 
         // Format B: A-E letter block — packed ("DBBBC") or spaced ("D B B B C")
         // Try hide segments first; fall back to full content only if no hide tags present
-        const formatBTargets = hideSegments.length > 0 ? hideSegments : [content];
+        const formatBTargets =
+            hideSegments.length > 0 ? hideSegments : [content];
         for (const text of formatBTargets) {
             const letterSeq = [];
             let started = false;
@@ -427,7 +525,8 @@ export class CleanupText {
                 const t = line.trim();
                 if (/^[A-Ea-e]+(\s+[A-Ea-e]+)*$/.test(t)) {
                     for (const token of t.split(/\s+/)) {
-                        for (const ch of token) letterSeq.push(ch.toUpperCase());
+                        for (const ch of token)
+                            letterSeq.push(ch.toUpperCase());
                     }
                     started = true;
                 } else if (started && t === "") {
