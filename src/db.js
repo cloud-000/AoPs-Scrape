@@ -21,6 +21,13 @@ import { getAutoTags } from "./autoTags.js";
 //   Orphan cleanup: re-scraping a test removes its non-curated problem rows
 //   whose (n, section) no longer appears in the scrape (e.g. when a test's
 //   section structure changes). Rows with pdf_statement or verified are kept.
+//
+//   Sectioned tests: a scraped category with N sections ("Day 1"/"Day 2", …)
+//   is materialized as N separate test rows, one per section, each named
+//   "<test name> <section name>" with tests.section = the section index and
+//   tests.section_name = the raw section title. Sibling section tests share the
+//   AoPS category id and are keyed by (aops_category_id, section). Each
+//   section's problems live under its own test with problems.section = -1.
 // ---------------------------------------------------------------------------
 
 const SCHEMA = `
@@ -35,13 +42,22 @@ CREATE TABLE IF NOT EXISTS tests (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   series_id        INTEGER REFERENCES series(id),
   name             TEXT NOT NULL,
+  -- A sectioned AoPS category ("Day 1"/"Day 2", …) is split into one test row
+  -- per section. section is the 0-based section index (-1 for a flat test);
+  -- section_name is the raw AoPS section title (NULL for a flat test). name
+  -- already includes the section title (e.g. "2024 USAMO Day 1").
+  section          INTEGER NOT NULL DEFAULT -1,
+  section_name     TEXT,
   year             INTEGER,
-  aops_category_id TEXT UNIQUE,
+  -- Not standalone-unique: sibling section tests share the AoPS category id and
+  -- are disambiguated by section.
+  aops_category_id TEXT,
   type             TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty       INTEGER DEFAULT 0,
   quality          INTEGER DEFAULT 0,
-  aops_url TEXT GENERATED ALWAYS AS ('https://artofproblemsolving.com/community/c' || aops_category_id) STORED
+  aops_url TEXT GENERATED ALWAYS AS ('https://artofproblemsolving.com/community/c' || aops_category_id) STORED,
+  UNIQUE(aops_category_id, section)
 );
 
 CREATE TABLE IF NOT EXISTS problems (
@@ -290,6 +306,109 @@ FROM series_old;
         })();
     }
 
+    // Migration: give tests per-section columns (section / section_name) and
+    // swap the standalone UNIQUE(aops_category_id) for UNIQUE(aops_category_id,
+    // section), then split any existing sectioned test (its problems carry
+    // section >= 0) into one test row per section. Section titles were never
+    // stored, so migrated section tests get a "Section N" placeholder name;
+    // a re-scrape re-links them by (aops_category_id, section) and backfills
+    // the real title. A test with a single section is treated as flat.
+    const testsMigCols = db
+        .query("PRAGMA table_info(tests)")
+        .all()
+        .map((r) => r.name);
+    if (!testsMigCols.includes("section_name")) {
+        db.transaction(() => {
+            db.exec(`PRAGMA foreign_keys = OFF;`);
+            db.exec(`ALTER TABLE tests RENAME TO tests_old;`);
+            // CREATE TABLE IF NOT EXISTS in SCHEMA recreates `tests` with the
+            // new shape; all other tables already exist and are skipped.
+            db.exec(SCHEMA);
+            db.exec(`
+INSERT INTO tests (id, series_id, name, section, section_name, year, aops_category_id, type, is_computational, difficulty, quality)
+SELECT id, series_id, name, -1, NULL, year, aops_category_id, type, COALESCE(is_computational, 0), difficulty, quality
+FROM tests_old;
+            `);
+            db.exec(`DROP TABLE tests_old;`);
+            db.exec(`PRAGMA foreign_keys = ON;`);
+
+            // Split existing sectioned tests into one test row per section.
+            const sectionRows = db
+                .query(
+                    `SELECT test_id, section FROM problems
+                     WHERE section >= 0
+                     GROUP BY test_id, section
+                     ORDER BY test_id, section`,
+                )
+                .all();
+            const sectionsByTest = new Map();
+            for (const { test_id, section } of sectionRows) {
+                if (!sectionsByTest.has(test_id))
+                    sectionsByTest.set(test_id, []);
+                sectionsByTest.get(test_id).push(section);
+            }
+
+            for (const [testId, sections] of sectionsByTest) {
+                const base = db
+                    .query(`SELECT * FROM tests WHERE id = ?`)
+                    .get(testId);
+                if (!base) continue;
+
+                if (sections.length === 1) {
+                    // A single section is effectively a flat test: keep the row
+                    // and just flatten its problems to section = -1 (matches a
+                    // fresh scrape of a one-section category).
+                    db.run(`UPDATE problems SET section = -1 WHERE test_id = ?`, [
+                        testId,
+                    ]);
+                    continue;
+                }
+
+                sections.forEach((s, i) => {
+                    const placeholder = `Section ${s + 1}`;
+                    const name = `${base.name} ${placeholder}`;
+                    let sectionTestId;
+                    if (i === 0) {
+                        // Reuse the base row for the first section.
+                        db.run(
+                            `UPDATE tests SET name = ?, section = ?, section_name = ? WHERE id = ?`,
+                            [name, s, placeholder, testId],
+                        );
+                        sectionTestId = testId;
+                    } else {
+                        db.run(
+                            `INSERT INTO tests (series_id, name, section, section_name, year, aops_category_id, type, is_computational, difficulty, quality)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            [
+                                base.series_id,
+                                name,
+                                s,
+                                placeholder,
+                                base.year,
+                                base.aops_category_id,
+                                base.type,
+                                base.is_computational,
+                                base.difficulty,
+                                base.quality,
+                            ],
+                        );
+                        sectionTestId = db
+                            .query(
+                                `SELECT id FROM tests WHERE rowid = last_insert_rowid()`,
+                            )
+                            .get().id;
+                    }
+                    // Move this section's problems onto the section test,
+                    // flattening section to -1.
+                    db.run(
+                        `UPDATE problems SET test_id = ?, section = -1 WHERE test_id = ? AND section = ?`,
+                        [sectionTestId, testId, s],
+                    );
+                });
+            }
+        })();
+    }
+
     // Migration: production_problems was redesigned/extended or schema changed. It holds only
     // derived data, so drop the stale shape and let SCHEMA recreate the new one.
     const prodTableInfo = db.query("PRAGMA table_info(production_problems)").all();
@@ -315,7 +434,7 @@ FROM series_old;
     return db;
 }
 
-function upsertSeries(db, name, aopsId = -1, isOfficial = false) {
+export function upsertSeries(db, name, aopsId = -1, isOfficial = false) {
     const finalAopsId = aopsId === null || aopsId === undefined ? -1 : aopsId;
     db.run(
         `INSERT INTO series (name, aops_id, is_official) VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE SET
@@ -327,15 +446,17 @@ function upsertSeries(db, name, aopsId = -1, isOfficial = false) {
     return db.query(`SELECT id FROM series WHERE name = ?`).get(name).id;
 }
 
-// Resolves an existing test id. Prefers the AoPS category id (stable when
-// present); otherwise falls back to the natural key (series_id, year, name) so
-// non-AoPS sources (e.g. Mandelbrot) dedup, and a PDF-first test can later be
-// linked to its AoPS category. Returns null if no match.
-function resolveTestId(db, { aopsCategoryId, seriesId, year, name }) {
+// Resolves an existing test id. Prefers the AoPS category id + section (stable
+// when present); otherwise falls back to the natural key (series_id, year, name)
+// so non-AoPS sources (e.g. Mandelbrot) dedup, and a PDF-first test can later be
+// linked to its AoPS category. `section` defaults to -1 (a flat, unsectioned
+// test); sibling section tests share the AoPS category id and differ by section.
+// Returns null if no match.
+export function resolveTestId(db, { aopsCategoryId, section = -1, seriesId, year, name }) {
     if (aopsCategoryId != null) {
         const byAops = db
-            .query(`SELECT id FROM tests WHERE aops_category_id = ?`)
-            .get(aopsCategoryId);
+            .query(`SELECT id FROM tests WHERE aops_category_id = ? AND section = ?`)
+            .get(aopsCategoryId, section);
         if (byAops) return byAops.id;
     }
     // `year IS ?` matches NULL years too (IS behaves like = for non-NULL).
@@ -347,13 +468,14 @@ function resolveTestId(db, { aopsCategoryId, seriesId, year, name }) {
     return byNatural ? byNatural.id : null;
 }
 
-function upsertTest(
+export function upsertTest(
     db,
-    { aopsCategoryId, name, year, type, isComputational },
+    { aopsCategoryId, name, section = -1, sectionName = null, year, type, isComputational },
     seriesId,
 ) {
     const existingId = resolveTestId(db, {
         aopsCategoryId,
+        section,
         seriesId,
         year,
         name,
@@ -364,6 +486,8 @@ function upsertTest(
             `
             UPDATE tests SET
                 name             = ?,
+                section          = ?,
+                section_name     = ?,
                 year             = ?,
                 type             = ?,
                 is_computational = ?,
@@ -374,6 +498,8 @@ function upsertTest(
         `,
             [
                 name,
+                section,
+                sectionName ?? null,
                 year ?? null,
                 type ?? null,
                 isComputational ? 1 : 0,
@@ -387,12 +513,14 @@ function upsertTest(
 
     db.run(
         `
-        INSERT INTO tests (series_id, name, year, aops_category_id, type, is_computational)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO tests (series_id, name, section, section_name, year, aops_category_id, type, is_computational)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
         [
             seriesId,
             name,
+            section,
+            sectionName ?? null,
             year ?? null,
             aopsCategoryId ?? null,
             type ?? null,
@@ -621,40 +749,62 @@ export function upsertScrapeResults(db, raw) {
                 );
             }
             const seriesId = seriesCache.get(seriesName);
+            const aopsCategoryId = test.id != null ? test.id.toString() : null;
+            const isComputational = test.computational ?? false;
 
-            const testId = upsertTest(
-                db,
-                {
-                    aopsCategoryId: test.id != null ? test.id.toString() : null,
-                    name: test.name,
-                    year: test.year ?? null,
-                    type: test.type ?? null,
-                    isComputational: test.computational ?? false,
-                },
-                seriesId,
-            );
+            // A sectioned test (problems is a 2D array, one bucket per section
+            // name) is materialized as one test row per section, named
+            // "<test name> <section name>". A flat test is a single row with
+            // section = -1. `units` normalizes both into the same shape.
+            const sectioned = (test.sections?.length ?? 0) > 0;
+            const units = sectioned
+                ? test.sections.map((sectionName, i) => ({
+                      name: `${test.name} ${sectionName}`,
+                      section: i,
+                      sectionName,
+                      problems: test.problems[i] ?? [],
+                  }))
+                : [
+                      {
+                          name: test.name,
+                          section: -1,
+                          sectionName: null,
+                          problems: test.problems,
+                      },
+                  ];
 
-            // Sectioned tests have problems as a 2D array; problems already carry .section
-            const problems =
-                test.sections.length > 0 ? test.problems.flat() : test.problems;
-
-            for (const problem of problems) {
-                upsertProblem(
+            for (const unit of units) {
+                const testId = upsertTest(
                     db,
                     {
-                        ...problem,
-                        is_computational: test.computational ?? false,
+                        aopsCategoryId,
+                        name: unit.name,
+                        section: unit.section,
+                        sectionName: unit.sectionName,
+                        year: test.year ?? null,
+                        type: test.type ?? null,
+                        isComputational,
                     },
+                    seriesId,
+                );
+
+                // Each section is its own test now, so problems always store
+                // section = -1 (the section lives on the test row instead).
+                for (const problem of unit.problems) {
+                    upsertProblem(
+                        db,
+                        { ...problem, section: -1, is_computational: isComputational },
+                        testId,
+                    );
+                }
+
+                // Drop rows from a previous scrape that this scrape no longer produced.
+                cleanupOrphanProblems(
+                    db,
                     testId,
+                    unit.problems.map((p) => ({ n: p.n, section: -1 })),
                 );
             }
-
-            // Drop rows from a previous scrape that this scrape no longer produced.
-            cleanupOrphanProblems(
-                db,
-                testId,
-                problems.map((p) => ({ n: p.n, section: p.section ?? -1 })),
-            );
         }
     })();
 }
