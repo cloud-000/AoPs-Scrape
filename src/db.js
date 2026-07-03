@@ -158,9 +158,8 @@ CREATE TABLE IF NOT EXISTS production_problems (
 
   -- content
   statement          TEXT,
-  choices            TEXT[],   -- TEXT[] array (custom type); NULL if not MCQ
-  answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = numeric/unknown
-  answer_value       TEXT,     -- literal answer: letter for MCQ, number for numeric; NULL if unknown
+  choices            TEXT[],   -- MCQ options, or [answer] for known non-MCQ; empty if unknown
+  answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
   official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
 
   -- metadata (carried over from problems)
@@ -426,7 +425,7 @@ FROM tests_old;
     const needsRecreate = prodCols.length > 0 && (
         !prodCols.includes("test_id") ||
         !prodCols.includes("aops_id") ||
-        !prodCols.includes("answer_value") ||
+        prodCols.includes("answer_value") ||
         prodCols.includes("topic") ||
         prodCols.includes("section") ||
         (choicesCol && choicesCol.type !== "TEXT[]") ||
@@ -1130,22 +1129,33 @@ export function buildProductionProblems(db) {
         const insert = db.query(`
             INSERT INTO production_problems (
                 test_id, n, aops_id,
-                statement, choices, answer_index, answer_value, official_solutions,
+                statement, choices, answer_index, official_solutions,
                 acgn, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?)
+            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
         `);
 
         for (const r of rows) {
             const sols = solStmt.all(r.id).map((x) => x.content);
             const officialSolutions = sols.length ? JSON.stringify(sols) : null;
+            const hasSourceChoices = r.choices != null;
+            const hasAnswerValue = r.answer_value != null;
+            const productionChoices = hasSourceChoices
+                ? r.choices
+                : hasAnswerValue
+                  ? [r.answer_value]
+                  : [];
+            const productionAnswerIndex = hasSourceChoices
+                ? r.answer_index
+                : hasAnswerValue
+                  ? 0
+                  : -1;
             insert.run(
                 r.test_id,
                 r.n,
                 r.aops_id,
                 r.statement,
-                toPostgresTextArray(r.choices),
-                r.answer_index,
-                r.answer_value,
+                toPostgresTextArray(productionChoices),
+                productionAnswerIndex,
                 officialSolutions,
                 r.acgn,
                 toPostgresTextArray(r.tags),
