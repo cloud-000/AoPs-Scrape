@@ -37,7 +37,7 @@ export async function exportProductionCSV(db, outDir = "scrape_data") {
             `
         SELECT pp.test_id, pp.n, pp.aops_id, pp.statement, pp.choices,
                pp.answer_index, pp.official_solutions,
-               pp.acgn, pp.tags, pp.is_computational, pp.difficulty,
+               pp.topic, pp.tags, pp.is_computational, pp.difficulty,
                pp.quality, pp.verified, pp.notes,
                t.name AS test_name, t.year AS test_year,
                s.name AS series_name, s.is_official

@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS production_problems (
   official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
 
   -- metadata (carried over from problems)
-  acgn               TEXT,   -- Algebra/Combinatorics/Geometry/NumberTheory class
+  topic              TEXT,   -- Algebra/Combinatorics/Geometry/NumberTheory class
   tags               TEXT[],   -- TEXT[] array (custom type)
   is_computational   BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
   difficulty         INTEGER DEFAULT 0,
@@ -426,7 +426,8 @@ FROM tests_old;
         !prodCols.includes("test_id") ||
         !prodCols.includes("aops_id") ||
         prodCols.includes("answer_value") ||
-        prodCols.includes("topic") ||
+        prodCols.includes("acgn") ||
+        !prodCols.includes("topic") ||
         prodCols.includes("section") ||
         (choicesCol && choicesCol.type !== "TEXT[]") ||
         (tagsCol && tagsCol.type !== "TEXT[]")
@@ -1130,7 +1131,7 @@ export function buildProductionProblems(db) {
             INSERT INTO production_problems (
                 test_id, n, aops_id,
                 statement, choices, answer_index, official_solutions,
-                acgn, tags, is_computational, difficulty, quality, verified, notes
+                topic, tags, is_computational, difficulty, quality, verified, notes
             ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
         `);
 
