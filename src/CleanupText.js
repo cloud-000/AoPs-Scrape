@@ -375,9 +375,15 @@ export class CleanupText {
     }
 
     // Canonicalizes AoPS category/folder names before they become series/test
-    // names. Currently just trims the redundant "Problems" suffix off Purple
-    // Comet so the series reads "Purple Comet" everywhere. Idempotent.
-    static CONTEST_NAME_RENAMES = [[/Purple Comet Problems/gi, "Purple Comet"]];
+    // names. Trims redundant "Problems" suffixes so names match the curated
+    // registry / wiki spelling ("Purple Comet" not "Purple Comet Problems",
+    // "AIME"/"2010 AIME I" not "AIME Problems"/"2010 AIME I Problems"). This is
+    // what merges the forum "AIME Problems" folder onto the wiki "AIME" series.
+    // Idempotent.
+    static CONTEST_NAME_RENAMES = [
+        [/Purple Comet Problems/gi, "Purple Comet"],
+        [/(AIME(?:\s+I{1,3})?)\s+Problems/gi, "$1"],
+    ];
     static normalizeContestName(name) {
         if (!name) return name;
         let out = name;

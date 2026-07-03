@@ -52,7 +52,7 @@ async function main() {
             // session.enableStickyAnswerKey = selectedContest != null && !selectedContest.is_official;
             session.enableStickyAnswerKey = true;
 
-            let method = await getMethod();
+            let method = await getMethod(selectedContest);
             if (
                 await confirm({
                     message: "Use response cache?",
@@ -66,6 +66,14 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
+            // Collect any interactive input (e.g. picking one test out of a
+            // series) BEFORE the loader starts — its 300ms re-render otherwise
+            // paints over these prompts. `gather` returning null signals a bail.
+            const methodArgs = await method.gather(session, id);
+            if (methodArgs === null) {
+                console.log("Exiting");
+                break;
+            }
             loader.add(new CLICount("Problems Collected:"));
             loader.start();
             let loaderInterval = setInterval(() => {
@@ -73,7 +81,7 @@ async function main() {
                 loader.render();
             }, 300);
             let startTime = Date.now();
-            data = await method(session, id);
+            data = await method.run(session, id, methodArgs);
             let elapsedTime = Date.now() - startTime;
             clearInterval(loaderInterval);
             await sleep(100);
@@ -368,36 +376,88 @@ async function getUser(message = "Select user") {
     });
 }
 
-async function getMethod(message = "Select method") {
+// Forum scrape methods. Each option value is `{ gather, run }`, mirroring the
+// wiki path: `gather(session, id)` collects any interactive input and MUST run
+// before the progress loader starts (its 300ms re-render otherwise clobbers the
+// prompt); returning null signals a bail. `run(session, id, args)` does the
+// fetching and returns the scrape result to upsert.
+async function getMethod(contest, message = "Select method") {
     return await select({
         message,
         choices: [
             {
                 name: "Test",
-                value: (session, id) => session.getTest(id),
+                value: {
+                    gather: async () => ({}),
+                    run: (session, id) => session.getTest(id),
+                },
                 description: "Get single test",
             },
             {
                 name: "All Tests",
-                value: (session, id) =>
-                    session.getAllTests(id, null, 0, new Set(), false),
+                value: {
+                    gather: async () => ({}),
+                    run: (session, id) =>
+                        session.getAllTests(id, null, 0, new Set(), false),
+                },
                 description: "Get all tests from a collection",
             },
             {
+                name: "Add single test to series",
+                value: {
+                    gather: async (session, id) => {
+                        console.log("Fetching tests in series...");
+                        const { seriesName, tests } =
+                            await session.listTests(id);
+                        if (tests.length === 0) {
+                            console.log(
+                                `No sub-tests found under ${id} — it may be a single test itself. Use the "Test" method instead.`,
+                            );
+                            return null;
+                        }
+                        const testId = await select({
+                            message: `Which test to add to "${seriesName}"?`,
+                            choices: tests.map((t) => ({
+                                name: `${t.name} (${t.id})`,
+                                value: t.id,
+                            })),
+                        });
+                        return { seriesName, testId };
+                    },
+                    run: async (session, id, { seriesName, testId }) => {
+                        const t = await session.getTest(testId);
+                        return {
+                            id: Number(id),
+                            name: seriesName,
+                            is_official: contest?.is_official ?? false,
+                            tests: [t],
+                            count: t.count,
+                        };
+                    },
+                },
+                description: "Pick one test out of a series and add just it",
+            },
+            {
                 name: "Forum",
-                value: (session, id) => session.getForum(id),
+                value: {
+                    gather: async () => ({}),
+                    run: (session, id) => session.getForum(id),
+                },
                 description: "Gets all posts from a forum",
             },
             {
                 name: "Topic (debug)",
-                value: async (session, id) => {
-                    let r = (
-                        await session.sendRequest(
-                            ForumSession.payload(ApiMethod.TOPIC, { id }),
-                        )
-                    ).response;
-                    console.log(r);
-                    process.exit(0);
+                value: {
+                    gather: async () => ({}),
+                    run: async (session, id) => {
+                        let r = (
+                            await session.sendRequest(
+                                ForumSession.payload(ApiMethod.TOPIC, { id }),
+                            )
+                        ).response;
+                        console.log(r);
+                        process.exit(0);
+                    },
                 },
                 description: "Log raw topic response and exit",
             },

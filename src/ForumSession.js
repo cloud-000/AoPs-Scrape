@@ -398,6 +398,57 @@ export class ForumSession {
         };
     }
 
+    // Metadata-only walk of a series/folder: mirrors getAllTests' traversal but
+    // does NOT fetch any problems. Returns the parent series name (normalized from
+    // the top-level folder) plus a flat list of the leaf tests inside it, so a
+    // caller can let the user pick one leaf id to feed into getTest and attach it
+    // to the same series a full getAllTests scrape would produce.
+    async listTests(id, seenCategoryIds = new Set(), _isRoot = true) {
+        const { name: rawName, items: allItems } =
+            await this._fetchCategory(id);
+        const seriesName = CleanupText.normalizeContestName(rawName);
+
+        const items = allItems.filter((item) => {
+            if (item.item_type === "forum" || item.item_type === "post")
+                return false;
+            if (
+                CONTEST_IDS.IGNORE.includes(item.item_id) ||
+                seenCategoryIds.has(item.item_id)
+            ) {
+                return false;
+            }
+            return true;
+        });
+
+        const tests = [];
+        for (const item of items) {
+            switch (item.item_type) {
+                case "folder": {
+                    seenCategoryIds.add(item.item_id);
+                    const sub = await this.listTests(
+                        item.item_id,
+                        seenCategoryIds,
+                        false,
+                    );
+                    tests.push(...sub.tests);
+                    break;
+                }
+                case "view_posts": {
+                    seenCategoryIds.add(item.item_id);
+                    tests.push({
+                        id: item.item_id,
+                        name: CleanupText.normalizeContestName(item.item_text),
+                    });
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        return { seriesName, tests };
+    }
+
     async getTest(id, testType = null, seenTopicIds = []) {
         this._currentForumCategoryId = null;
         const { name: rawName, items } = await this._fetchCategory(id);
@@ -480,6 +531,16 @@ export class ForumSession {
         }
 
         this._normalizeSections(test);
+
+        // AIME quirk: AoPS files a year's two AIME administrations as one
+        // category with two date-labeled sections ("March 16th"/"March 31st").
+        // Rename them to the canonical "I"/"II" (in administration order) so the
+        // section tests become "<year> AIME I"/"<year> AIME II", matching the
+        // wiki series (which lists AIME I/II as separate tests) so they merge.
+        if (type.name === "AIME" && test.sections.length === 2) {
+            test.sections = ["I", "II"];
+        }
+
         test.count = ctx.problemCount;
         this._permissionDenied = false;
         return test;

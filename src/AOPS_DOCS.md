@@ -372,6 +372,31 @@ Items with `item_type === "folder"` are recursed; `item_type === "view_posts"` i
 
 ---
 
+### `listTests(id, seenCategoryIds = new Set(), _isRoot = true)`
+
+Metadata-only walk of a series/folder. Mirrors `getAllTests`' traversal (same filtering: skips `forum`/`post` items, `CONTEST_IDS.IGNORE`, and already-seen ids; recurses `folder` items) but fetches **no problems** — it only enumerates the leaf tests. Used by the CLI's "Add single test to series" method so the user can pick one test out of a series to scrape without re-scraping the whole folder.
+
+**Input:**
+
+| Param | Type | Description |
+|---|---|---|
+| `id` | number | AoPS category ID of the top-level folder |
+| `seenCategoryIds` | Set\<number\> | Category IDs already visited (prevents infinite recursion across nested folders) |
+| `_isRoot` | boolean | Internal recursion flag; callers omit it |
+
+**Output:**
+
+```js
+{
+  seriesName: string,              // normalized name of the top-level folder
+  tests: { id: number, name: string }[],  // flat list of leaf tests (view_posts), names normalized
+}
+```
+
+The `id` of each returned leaf test is a valid category id that can be passed straight to `getTest`. `seriesName` matches the series name a full `getAllTests` scrape would produce, so a single test wrapped as `{ id, name: seriesName, tests: [test] }` and passed to `upsertScrapeResults` attaches to the same series row.
+
+---
+
 ### `getForum(id, checkToStop = null)`
 
 Fetches all topics from a raw forum-type category, paginating via `fetch_before` until exhausted.
