@@ -12,7 +12,7 @@ import {
     upsertWikiResults,
     buildProductionProblems,
 } from "../src/db.js";
-import { exportProductionCSV } from "../src/export.js";
+import { exportProductionCSV, exportProductionSQL } from "../src/export.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
@@ -296,6 +296,20 @@ async function main() {
             break;
         }
 
+        case "export-sql": {
+            const args = parseExportSQLArgs(process.argv.slice(3));
+            const db = initDB(DB_PATH);
+            const result = await exportProductionSQL(db, args.outFile, {
+                includeSchema: args.includeSchema,
+                includeInserts: args.includeInserts,
+            });
+            db.close();
+            console.log(
+                `Exported PostgreSQL SQL to ${result.file} (${result.counts.series} series, ${result.counts.tests} tests, ${result.counts.problems} problems; schema=${result.includeSchema}, inserts=${result.includeInserts}).`,
+            );
+            break;
+        }
+
         case "init-db": {
             const db = initDB(DB_PATH);
             db.close();
@@ -346,10 +360,35 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], init-db, clear-db",
             );
             break;
     }
+}
+
+function parseExportSQLArgs(args) {
+    const outFile =
+        args.find((arg) => !arg.startsWith("--")) ??
+        "scrape_data/production_export.sql";
+    let includeSchema = true;
+    let includeInserts = true;
+
+    if (args.includes("--schema-only")) {
+        includeSchema = true;
+        includeInserts = false;
+    }
+    if (args.includes("--data-only") || args.includes("--inserts-only")) {
+        includeSchema = false;
+        includeInserts = true;
+    }
+    if (args.includes("--no-schema")) {
+        includeSchema = false;
+    }
+    if (args.includes("--no-inserts") || args.includes("--no-insert")) {
+        includeInserts = false;
+    }
+
+    return { outFile, includeSchema, includeInserts };
 }
 
 // Returns the raw-dump file path if `--dump` / `--dump=<file>` was passed to
