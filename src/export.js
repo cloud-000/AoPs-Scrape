@@ -266,6 +266,191 @@ function insertStatements(table, rows) {
     return `INSERT INTO ${quoteIdent(table.name)} (${columnSql}) VALUES\n${values};`;
 }
 
+// ---------------------------------------------------------------------------
+// Staging export for the ProblemCloud content-sync merge.
+//
+// Unlike exportProductionSQL (which DROPs + reloads and so wipes user data and
+// renumbers ids), this emits a DATA-ONLY, non-destructive load into the cloud's
+// _import_* staging tables. The cloud then runs public.sync_scraped_content(),
+// which upserts on `sync_key` — preserving every problem id (and the user
+// submissions/feedback FKs into it) and every curator edit. See
+// problem-cloud/supabase/schemas/content_sync.sql.
+//
+// The sync_key is the stable cross-database identity. It MUST match the SQL
+// formula in content_sync.sql byte-for-byte: delimiter chr(31) (U+001F), raw
+// values, no slug/case-folding.
+const SYNC_KEY_DELIM = "\x1f"; // U+001F unit separator == SQL chr(31)
+
+// aops-sourced tests key on (aops_category_id, section); PDF/manual-only tests
+// (no aops_category_id) fall back to (series_name, year, name, section).
+function testSyncKey(row) {
+    const d = SYNC_KEY_DELIM;
+    if (row.aops_category_id != null) {
+        return `aops${d}${row.aops_category_id}${d}${row.section}`;
+    }
+    const series = row.series_name ?? "";
+    const year = row.year == null ? "" : String(row.year);
+    return `manual${d}${series}${d}${year}${d}${row.name}${d}${row.section}`;
+}
+
+function problemSyncKey(testKey, n) {
+    const d = SYNC_KEY_DELIM;
+    return `${testKey}${d}n${d}${n}`;
+}
+
+const STAGING_TABLES = {
+    series: {
+        name: "_import_series",
+        columns: ["name", "aops_id", "is_official"],
+    },
+    tests: {
+        name: "_import_tests",
+        columns: [
+            "sync_key",
+            "series_name",
+            "name",
+            "year",
+            "aops_category_id",
+            "section",
+            "type",
+            "is_computational",
+            "difficulty",
+            "quality",
+        ],
+    },
+    problems: {
+        name: "_import_problems",
+        columns: [
+            "sync_key",
+            "test_sync_key",
+            "n",
+            "aops_id",
+            "statement",
+            "choices",
+            "answer_index",
+            "official_solutions",
+            "topic",
+            "tags",
+            "is_computational",
+            "difficulty",
+            "quality",
+            "verified",
+            "notes",
+        ],
+    },
+};
+
+// Like insertStatements, but schema-qualifies the target as public.<table>
+// (the staging tables live in public; the merge functions reference them so).
+function stagingInsert(table, rows) {
+    if (rows.length === 0) return `-- public.${table.name}: 0 rows`;
+    const columnSql = table.columns.map(quoteIdent).join(", ");
+    const values = rows
+        .map(
+            (row) =>
+                `(${table.columns
+                    .map((column) => sqlValue(row[column], column))
+                    .join(", ")})`,
+        )
+        .join(",\n");
+    return `INSERT INTO public.${quoteIdent(table.name)} (${columnSql}) VALUES\n${values};`;
+}
+
+// Writes a data-only staging load for the content-sync merge: TRUNCATE the
+// _import_* tables, reload them from series/tests/production_problems (with a
+// computed sync_key on each row), all in one transaction. Run this file against
+// the cloud, then `select * from sync_scraped_content(true|false)`.
+export async function exportStagingSQL(
+    db,
+    outFile = "scrape_data/staging_load.sql",
+) {
+    const series = db
+        .query(`SELECT name, aops_id, is_official FROM series ORDER BY name`)
+        .all();
+
+    // Tests must resolve to a series (the cloud requires series_name and the
+    // merge aborts on an unknown series), so INNER JOIN drops seriesless tests.
+    const tests = db
+        .query(
+            `
+        SELECT t.id, s.name AS series_name, t.name, t.year, t.aops_category_id,
+               t.section, t.type, t.is_computational, t.difficulty, t.quality
+        FROM tests t JOIN series s ON t.series_id = s.id
+        ORDER BY t.id
+    `,
+        )
+        .all();
+
+    const testKeyById = new Map();
+    for (const t of tests) {
+        t.sync_key = testSyncKey(t);
+        testKeyById.set(t.id, t.sync_key);
+    }
+
+    const allProblems = db
+        .query(
+            `
+        SELECT pp.test_id, pp.n, pp.aops_id, pp.statement, pp.choices,
+               pp.answer_index, pp.official_solutions, pp.topic, pp.tags,
+               pp.is_computational, pp.difficulty, pp.quality, pp.verified,
+               pp.notes
+        FROM production_problems pp
+        ORDER BY pp.test_id, pp.n
+    `,
+        )
+        .all();
+
+    // Problems whose test was dropped above (no series) can't be synced.
+    const problems = [];
+    let orphaned = 0;
+    for (const p of allProblems) {
+        const testKey = testKeyById.get(p.test_id);
+        if (testKey == null) {
+            orphaned++;
+            continue;
+        }
+        p.test_sync_key = testKey;
+        p.sync_key = problemSyncKey(testKey, p.n);
+        problems.push(p);
+    }
+
+    const parts = [
+        "-- Generated by aops-scrape `sync-export`.",
+        "-- Data-only, non-destructive staging load for the ProblemCloud",
+        "-- content-sync merge. After running this, execute:",
+        "--   select * from public.sync_scraped_content(true);   -- dry run",
+        "--   select * from public.sync_scraped_content(false);  -- apply",
+        "-- sync_key columns use a chr(31) (U+001F) delimiter; see content_sync.sql.",
+        "",
+        "BEGIN;",
+        "TRUNCATE public._import_series, public._import_tests, public._import_problems;",
+        "",
+        "-- series",
+        stagingInsert(STAGING_TABLES.series, series),
+        "",
+        "-- tests",
+        stagingInsert(STAGING_TABLES.tests, tests),
+        "",
+        "-- problems",
+        stagingInsert(STAGING_TABLES.problems, problems),
+        "",
+        "COMMIT;",
+    ];
+
+    mkdirSync(dirname(outFile), { recursive: true });
+    await Bun.write(outFile, `${parts.join("\n")}\n`);
+
+    return {
+        file: outFile,
+        counts: {
+            series: series.length,
+            tests: tests.length,
+            problems: problems.length,
+        },
+        orphaned,
+    };
+}
+
 // Writes a PostgreSQL-flavored SQL export for the deliverable tables. The
 // production_problems table is emitted as `problems`; tests intentionally omit
 // `section_name` but keep `section` for AoPS category uniqueness.

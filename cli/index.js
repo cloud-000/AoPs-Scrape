@@ -12,7 +12,11 @@ import {
     upsertWikiResults,
     buildProductionProblems,
 } from "../src/db.js";
-import { exportProductionCSV, exportProductionSQL } from "../src/export.js";
+import {
+    exportProductionCSV,
+    exportProductionSQL,
+    exportStagingSQL,
+} from "../src/export.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
@@ -310,6 +314,23 @@ async function main() {
             break;
         }
 
+        case "sync-export": {
+            const outFile = process.argv[3] ?? "scrape_data/staging_load.sql";
+            const db = initDB(DB_PATH);
+            const result = await exportStagingSQL(db, outFile);
+            db.close();
+            console.log(
+                `Wrote staging load to ${result.file} (${result.counts.series} series, ${result.counts.tests} tests, ${result.counts.problems} problems)` +
+                    (result.orphaned > 0
+                        ? `; skipped ${result.orphaned} problem(s) whose test has no series.`
+                        : "."),
+            );
+            console.log(
+                "Next: run it against the cloud, then `select * from public.sync_scraped_content(true)` (dry run) / `(false)` (apply).",
+            );
+            break;
+        }
+
         case "init-db": {
             const db = initDB(DB_PATH);
             db.close();
@@ -360,7 +381,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], sync-export [file], init-db, clear-db",
             );
             break;
     }

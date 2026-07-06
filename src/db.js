@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { CleanupText } from "./CleanupText.js";
 import { getAutoTags } from "./autoTags.js";
+import { SOLUTIONS_USERS } from "../contest_id.js";
 
 // ---------------------------------------------------------------------------
 // MERGE CONTRACT (how a re-scrape combines with existing rows)
@@ -108,26 +110,58 @@ CREATE TABLE IF NOT EXISTS problems (
 CREATE INDEX IF NOT EXISTS idx_problems_aops_topic ON problems(aops_topic_id);
 
 CREATE TABLE IF NOT EXISTS solutions (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  problem_id      INTEGER NOT NULL REFERENCES problems(id),
-  source          TEXT NOT NULL DEFAULT 'aops',
-  aops_topic_id   INTEGER,
-  aops_post_id    INTEGER,
-  aops_user_id    INTEGER,
-  aops_username   TEXT,
-  content         TEXT NOT NULL,
-  posted_at       TEXT,
-  is_official     INTEGER DEFAULT 0,
-  quality         INTEGER DEFAULT 0,
-  verified        INTEGER DEFAULT 0,
-  created_at      TEXT DEFAULT (datetime('now')),
-  updated_at      TEXT DEFAULT (datetime('now'))
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  problem_id               INTEGER NOT NULL REFERENCES problems(id),
+  content                  TEXT NOT NULL,
+  content_format           TEXT NOT NULL DEFAULT 'latex_bbcode',
+  normalized_hash          TEXT NOT NULL,
+  status                   TEXT NOT NULL DEFAULT 'candidate'
+                             CHECK (status IN ('candidate', 'accepted', 'needs_review', 'rejected', 'duplicate', 'superseded')),
+  status_source            TEXT NOT NULL DEFAULT 'auto'
+                             CHECK (status_source IN ('auto', 'manual')),
+  solution_type            TEXT NOT NULL DEFAULT 'unknown'
+                             CHECK (solution_type IN ('full', 'sketch', 'answer_only', 'discussion', 'unknown')),
+  quality_score            INTEGER NOT NULL DEFAULT 0 CHECK (quality_score BETWEEN 0 AND 100),
+  quality_flags            TEXT,
+  classifier_version       TEXT,
+  classifier_reasons       TEXT,
+  is_official              BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official IN (0, 1)),
+  duplicate_of_solution_id INTEGER REFERENCES solutions(id),
+  selected_rank            INTEGER,
+  reviewed_by              TEXT,
+  reviewed_at              TEXT,
+  review_notes             TEXT,
+  created_at               TEXT DEFAULT (datetime('now')),
+  updated_at               TEXT DEFAULT (datetime('now')),
+  UNIQUE(problem_id, normalized_hash)
 );
 
--- Dedup real AoPS solutions by post id; -1 (not on AoPS) rows are excluded
--- so multiple sentinel rows can coexist.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_solutions_aops_post_id
-  ON solutions (aops_post_id) WHERE aops_post_id >= 0;
+CREATE TABLE IF NOT EXISTS solution_sources (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  solution_id         INTEGER NOT NULL REFERENCES solutions(id),
+  problem_id          INTEGER NOT NULL REFERENCES problems(id),
+  source              TEXT NOT NULL CHECK (source IN ('aops', 'wiki', 'manual', 'import')),
+  source_key          TEXT NOT NULL,
+  source_url          TEXT,
+  raw_content         TEXT,
+  source_content_hash TEXT,
+  aops_topic_id       INTEGER,
+  aops_post_id        INTEGER,
+  aops_user_id        INTEGER,
+  aops_username       TEXT,
+  wiki_page           TEXT,
+  wiki_section        TEXT,
+  posted_at           TEXT,
+  first_seen_at       TEXT DEFAULT (datetime('now')),
+  last_seen_at        TEXT DEFAULT (datetime('now')),
+  is_official_hint    BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_official_hint IN (0, 1)),
+  reliability_hint    INTEGER NOT NULL DEFAULT 0 CHECK (reliability_hint BETWEEN 0 AND 100),
+  UNIQUE(problem_id, source, source_key)
+);
+CREATE INDEX IF NOT EXISTS idx_solution_sources_solution
+  ON solution_sources (solution_id);
+CREATE INDEX IF NOT EXISTS idx_solution_sources_aops_post
+  ON solution_sources (aops_post_id) WHERE aops_post_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS oly_potential_solutions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +194,7 @@ CREATE TABLE IF NOT EXISTS production_problems (
   statement          TEXT,
   choices            TEXT[],   -- MCQ options, or [answer] for known non-MCQ; empty if unknown
   answer_index       INTEGER DEFAULT -1,  -- 0-based index into choices; -1 = unknown
-  official_solutions TEXT,    -- JSON array of official solution content strings; NULL if none
+  official_solutions TEXT,    -- JSON array of accepted canonical solution content strings; NULL if none
 
   -- metadata (carried over from problems)
   topic              TEXT,   -- Algebra/Combinatorics/Geometry/NumberTheory class
@@ -176,6 +210,516 @@ CREATE TABLE IF NOT EXISTS production_problems (
   UNIQUE(test_id, n)
 );
 `;
+
+const SOLUTION_CLASSIFIER_VERSION = "solution-classifier-v1";
+const KNOWN_SOLUTION_USER_IDS = new Set((SOLUTIONS_USERS ?? []).map((u) => u.id));
+
+function hashText(text) {
+    return createHash("sha256").update(text ?? "").digest("hex");
+}
+
+function normalizeSolutionContent(content) {
+    return String(content ?? "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\[hide(?:=[^\]]*)?\]/gi, "")
+        .replace(/\[\/hide\]/gi, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function getSourceKey(input, contentHash) {
+    if (input.sourceKey != null) return String(input.sourceKey);
+    if (input.aops_post_id != null) return `post:${input.aops_post_id}`;
+    if (input.wiki_page) {
+        return `page:${input.wiki_page}#${input.wiki_section ?? ""}`;
+    }
+    return `${input.source ?? "manual"}:${contentHash}`;
+}
+
+function jsonOrNull(value) {
+    return value == null ? null : JSON.stringify(value);
+}
+
+function solutionSourcePriority(source) {
+    if (source === "manual") return 5;
+    if (source === "wiki") return 4;
+    if (source === "aops") return 3;
+    return 1;
+}
+
+function getSolutionSourceSummary(db, solutionId) {
+    const rows = db
+        .query(
+            `SELECT source, is_official_hint, reliability_hint, aops_user_id, posted_at
+             FROM solution_sources
+             WHERE solution_id = ?`,
+        )
+        .all(solutionId);
+    return {
+        rows,
+        hasWiki: rows.some((r) => r.source === "wiki"),
+        hasManual: rows.some((r) => r.source === "manual"),
+        hasOfficialHint: rows.some((r) => r.is_official_hint),
+        hasKnownSolutionUser: rows.some((r) =>
+            KNOWN_SOLUTION_USER_IDS.has(r.aops_user_id),
+        ),
+        maxReliability: rows.reduce(
+            (max, r) => Math.max(max, r.reliability_hint ?? 0),
+            0,
+        ),
+        bestSourcePriority: rows.reduce(
+            (max, r) => Math.max(max, solutionSourcePriority(r.source)),
+            0,
+        ),
+        earliestPostedAt:
+            rows
+                .map((r) => r.posted_at)
+                .filter(Boolean)
+                .sort()[0] ?? null,
+    };
+}
+
+function scoreSolutionContent(content, sourceSummary) {
+    const normalized = normalizeSolutionContent(content);
+    const flags = [];
+    const reasons = [];
+    let score = 20;
+    let solutionType = "unknown";
+
+    if (!normalized) {
+        flags.push("empty");
+        reasons.push("empty content");
+        return { score: 0, flags, reasons, solutionType: "unknown" };
+    }
+
+    const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+    const hasMath = /\\(?:frac|sqrt|sum|prod|angle|triangle|boxed|begin|end)|[=<>]/.test(content);
+    const hasProofMarker = /\b(proof|solution|therefore|hence|thus|since|suppose|claim|case)\b/i.test(content);
+    const hasAnswerOnly =
+        /^\\?boxed\s*\{[^}]+\}\.?$/i.test(normalized) ||
+        (wordCount <= 8 && /\\boxed\s*\{/.test(content));
+
+    if (sourceSummary.hasWiki || sourceSummary.hasOfficialHint) {
+        score += 35;
+        reasons.push("official or wiki source");
+    }
+    if (sourceSummary.hasKnownSolutionUser) {
+        score += 20;
+        reasons.push("known solution author");
+    }
+    if (sourceSummary.hasManual) {
+        score += 15;
+        reasons.push("manual source");
+    }
+    if (sourceSummary.maxReliability) {
+        score += Math.min(15, Math.round(sourceSummary.maxReliability / 10));
+    }
+    if (wordCount >= 40) score += 20;
+    else if (wordCount >= 18) score += 10;
+    else flags.push("short");
+    if (hasProofMarker) score += 10;
+    if (hasMath) score += 5;
+
+    if (hasAnswerOnly) {
+        solutionType = "answer_only";
+        score = Math.min(score, 35);
+        flags.push("answer_only");
+        reasons.push("looks like answer only");
+    } else if (wordCount >= 40 && hasProofMarker) {
+        solutionType = "full";
+    } else if (wordCount >= 18) {
+        solutionType = "sketch";
+    } else if (/thanks|bump|typo|where did|can someone/i.test(content)) {
+        solutionType = "discussion";
+        score = Math.min(score, 30);
+        flags.push("discussion");
+    }
+
+    return {
+        score: Math.max(0, Math.min(100, score)),
+        flags,
+        reasons,
+        solutionType,
+    };
+}
+
+function tokenSet(content) {
+    return new Set(
+        normalizeSolutionContent(content)
+            .split(/[^a-z0-9\\]+/i)
+            .filter((token) => token.length >= 3),
+    );
+}
+
+function tokenSimilarity(a, b) {
+    const left = tokenSet(a);
+    const right = tokenSet(b);
+    if (left.size === 0 || right.size === 0) return 0;
+    let intersection = 0;
+    for (const token of left) {
+        if (right.has(token)) intersection++;
+    }
+    return intersection / Math.max(left.size, right.size);
+}
+
+function compareCanonicalSolutions(a, b) {
+    const manualAcceptedA = a.status_source === "manual" && a.status === "accepted";
+    const manualAcceptedB = b.status_source === "manual" && b.status === "accepted";
+    if (manualAcceptedA !== manualAcceptedB) return manualAcceptedA ? -1 : 1;
+    if (a.is_official !== b.is_official) return a.is_official ? -1 : 1;
+    if (a.best_source_priority !== b.best_source_priority) {
+        return b.best_source_priority - a.best_source_priority;
+    }
+    if (a.has_known_solution_user !== b.has_known_solution_user) {
+        return a.has_known_solution_user ? -1 : 1;
+    }
+    if (a.quality_score !== b.quality_score) return b.quality_score - a.quality_score;
+    if ((a.earliest_posted_at ?? "") !== (b.earliest_posted_at ?? "")) {
+        if (!a.earliest_posted_at) return 1;
+        if (!b.earliest_posted_at) return -1;
+        return a.earliest_posted_at.localeCompare(b.earliest_posted_at);
+    }
+    return a.id - b.id;
+}
+
+function markOrphanedAutoSolutionSuperseded(db, solutionId) {
+    if (!solutionId) return;
+    const row = db
+        .query(
+            `SELECT s.id, s.status_source, COUNT(ss.id) AS source_count
+             FROM solutions s
+             LEFT JOIN solution_sources ss ON ss.solution_id = s.id
+             WHERE s.id = ?
+             GROUP BY s.id`,
+        )
+        .get(solutionId);
+    if (row && row.status_source !== "manual" && row.source_count === 0) {
+        db.run(
+            `UPDATE solutions
+             SET status = 'superseded', duplicate_of_solution_id = NULL, updated_at = datetime('now')
+             WHERE id = ?`,
+            [solutionId],
+        );
+    }
+}
+
+export function upsertSolutionCandidate(db, input) {
+    if (!input?.problemId || !input.content) return null;
+
+    const source = input.source ?? "manual";
+    const content = String(input.content).trim();
+    if (!content) return null;
+
+    const normalizedHash = hashText(normalizeSolutionContent(content));
+    const rawHash = hashText(content);
+    const sourceKey = getSourceKey(input, rawHash);
+    const isOfficialHint = input.is_official ?? input.isOfficial ?? source === "wiki";
+    const reliabilityHint =
+        input.reliability_hint ??
+        (source === "wiki" || isOfficialHint ? 90 : source === "manual" ? 80 : 0);
+
+    let solution = db
+        .query(
+            `SELECT * FROM solutions WHERE problem_id = ? AND normalized_hash = ?`,
+        )
+        .get(input.problemId, normalizedHash);
+
+    if (!solution) {
+        const status = input.status ?? (isOfficialHint ? "accepted" : "candidate");
+        const statusSource = input.status_source ?? "auto";
+        db.run(
+            `INSERT INTO solutions (
+                problem_id, content, content_format, normalized_hash,
+                status, status_source, is_official, quality_score,
+                quality_flags, classifier_version, classifier_reasons,
+                solution_type, selected_rank, reviewed_by, reviewed_at, review_notes
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                input.problemId,
+                content,
+                input.content_format ?? "latex_bbcode",
+                normalizedHash,
+                status,
+                statusSource,
+                isOfficialHint ? 1 : 0,
+                input.quality_score ?? 0,
+                jsonOrNull(input.quality_flags),
+                input.classifier_version ?? null,
+                jsonOrNull(input.classifier_reasons),
+                input.solution_type ?? "unknown",
+                input.selected_rank ?? null,
+                input.reviewed_by ?? null,
+                input.reviewed_at ?? null,
+                input.review_notes ?? null,
+            ],
+        );
+        solution = db
+            .query(`SELECT * FROM solutions WHERE rowid = last_insert_rowid()`)
+            .get();
+    } else {
+        db.run(
+            `UPDATE solutions SET
+                content = CASE WHEN status_source = 'manual' THEN content ELSE ? END,
+                status = CASE
+                    WHEN status_source = 'manual' THEN status
+                    WHEN status = 'superseded' THEN ?
+                    ELSE status
+                END,
+                is_official = MAX(is_official, ?),
+                quality_score = CASE
+                    WHEN status_source = 'manual' THEN quality_score
+                    ELSE MAX(quality_score, ?)
+                END,
+                updated_at = datetime('now')
+             WHERE id = ?`,
+            [
+                content,
+                isOfficialHint ? "accepted" : "candidate",
+                isOfficialHint ? 1 : 0,
+                input.quality_score ?? 0,
+                solution.id,
+            ],
+        );
+    }
+
+    const existingSource = db
+        .query(
+            `SELECT solution_id FROM solution_sources
+             WHERE problem_id = ? AND source = ? AND source_key = ?`,
+        )
+        .get(input.problemId, source, sourceKey);
+
+    db.run(
+        `INSERT INTO solution_sources (
+            solution_id, problem_id, source, source_key, source_url,
+            raw_content, source_content_hash,
+            aops_topic_id, aops_post_id, aops_user_id, aops_username,
+            wiki_page, wiki_section, posted_at,
+            is_official_hint, reliability_hint
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(problem_id, source, source_key) DO UPDATE SET
+            solution_id = excluded.solution_id,
+            source_url = excluded.source_url,
+            raw_content = excluded.raw_content,
+            source_content_hash = excluded.source_content_hash,
+            aops_topic_id = excluded.aops_topic_id,
+            aops_post_id = excluded.aops_post_id,
+            aops_user_id = excluded.aops_user_id,
+            aops_username = excluded.aops_username,
+            wiki_page = excluded.wiki_page,
+            wiki_section = excluded.wiki_section,
+            posted_at = excluded.posted_at,
+            last_seen_at = datetime('now'),
+            is_official_hint = MAX(solution_sources.is_official_hint, excluded.is_official_hint),
+            reliability_hint = MAX(solution_sources.reliability_hint, excluded.reliability_hint)`,
+        [
+            solution.id,
+            input.problemId,
+            source,
+            sourceKey,
+            input.source_url ?? null,
+            input.raw_content ?? content,
+            rawHash,
+            input.aops_topic_id ?? null,
+            input.aops_post_id ?? null,
+            input.aops_user_id ?? null,
+            input.aops_username ?? null,
+            input.wiki_page ?? null,
+            input.wiki_section ?? null,
+            input.posted_at ?? null,
+            isOfficialHint ? 1 : 0,
+            reliabilityHint,
+        ],
+    );
+
+    if (existingSource?.solution_id && existingSource.solution_id !== solution.id) {
+        markOrphanedAutoSolutionSuperseded(db, existingSource.solution_id);
+    }
+
+    return solution.id;
+}
+
+export function classifySolutions(
+    db,
+    { version = SOLUTION_CLASSIFIER_VERSION, nearDuplicateThreshold = 0.92 } = {},
+) {
+    let updated = 0;
+    let duplicates = 0;
+
+    db.transaction(() => {
+        const rows = db
+            .query(
+                `SELECT *
+                 FROM solutions
+                 WHERE status_source != 'manual'
+                   AND status != 'superseded'
+                 ORDER BY problem_id, id`,
+            )
+            .all();
+
+        const updateStmt = db.prepare(
+            `UPDATE solutions SET
+                status = ?,
+                solution_type = ?,
+                quality_score = ?,
+                quality_flags = ?,
+                classifier_version = ?,
+                classifier_reasons = ?,
+                is_official = MAX(is_official, ?),
+                duplicate_of_solution_id = NULL,
+                updated_at = datetime('now')
+             WHERE id = ? AND status_source != 'manual'`,
+        );
+
+        for (const row of rows) {
+            const summary = getSolutionSourceSummary(db, row.id);
+            const scored = scoreSolutionContent(row.content, summary);
+            const isOfficial = row.is_official || summary.hasWiki || summary.hasOfficialHint;
+            let status;
+            if (isOfficial || scored.score >= 70) {
+                status = "accepted";
+            } else if (
+                scored.score < 40 ||
+                scored.solutionType === "answer_only" ||
+                scored.solutionType === "discussion"
+            ) {
+                status = "rejected";
+            } else {
+                status = "needs_review";
+            }
+            updateStmt.run(
+                status,
+                scored.solutionType,
+                scored.score,
+                JSON.stringify(scored.flags),
+                version,
+                JSON.stringify(scored.reasons),
+                isOfficial ? 1 : 0,
+                row.id,
+            );
+            updated++;
+        }
+
+        const problemIds = db
+            .query(`SELECT DISTINCT problem_id FROM solutions ORDER BY problem_id`)
+            .all()
+            .map((r) => r.problem_id);
+
+        const markDuplicateStmt = db.prepare(
+            `UPDATE solutions SET
+                status = 'duplicate',
+                duplicate_of_solution_id = ?,
+                updated_at = datetime('now')
+             WHERE id = ? AND status_source != 'manual'`,
+        );
+
+        for (const problemId of problemIds) {
+            const candidates = db
+                .query(
+                    `SELECT s.*
+                     FROM solutions s
+                     WHERE s.problem_id = ?
+                       AND s.status IN ('accepted', 'needs_review', 'candidate')
+                       AND s.duplicate_of_solution_id IS NULL
+                     ORDER BY s.id`,
+                )
+                .all(problemId)
+                .map((row) => {
+                    const summary = getSolutionSourceSummary(db, row.id);
+                    return {
+                        ...row,
+                        best_source_priority: summary.bestSourcePriority,
+                        has_known_solution_user: summary.hasKnownSolutionUser,
+                        earliest_posted_at: summary.earliestPostedAt,
+                    };
+                });
+
+            const consumed = new Set();
+            for (let i = 0; i < candidates.length; i++) {
+                if (consumed.has(candidates[i].id)) continue;
+                const group = [candidates[i]];
+                for (let j = i + 1; j < candidates.length; j++) {
+                    if (consumed.has(candidates[j].id)) continue;
+                    if (
+                        tokenSimilarity(candidates[i].content, candidates[j].content) >=
+                        nearDuplicateThreshold
+                    ) {
+                        group.push(candidates[j]);
+                    }
+                }
+                if (group.length <= 1) continue;
+                group.sort(compareCanonicalSolutions);
+                const canonical = group[0];
+                for (const duplicate of group.slice(1)) {
+                    if (duplicate.status_source === "manual") continue;
+                    markDuplicateStmt.run(canonical.id, duplicate.id);
+                    consumed.add(duplicate.id);
+                    duplicates++;
+                }
+            }
+        }
+    })();
+
+    return { updated, duplicates };
+}
+
+function migrateSolutionsSchema(db) {
+    const solutionCols = db
+        .query("PRAGMA table_info(solutions)")
+        .all()
+        .map((r) => r.name);
+    if (solutionCols.includes("normalized_hash")) return;
+
+    const oldRows = db.query(`SELECT * FROM solutions ORDER BY id`).all();
+    db.transaction(() => {
+        db.exec(`PRAGMA foreign_keys = OFF;`);
+        db.exec(`ALTER TABLE solutions RENAME TO solutions_old;`);
+        db.exec(`DROP INDEX IF EXISTS idx_solutions_aops_post_id;`);
+        db.exec(SCHEMA);
+        for (const row of oldRows) {
+            const source = row.source ?? "aops";
+            const isOfficial = row.is_official ? 1 : 0;
+            const isVerified = row.verified ? 1 : 0;
+            upsertSolutionCandidate(db, {
+                problemId: row.problem_id,
+                source,
+                sourceKey:
+                    row.aops_post_id != null
+                        ? `post:${row.aops_post_id}`
+                        : `${source}:legacy:${row.id}`,
+                content: row.content,
+                raw_content: row.content,
+                aops_topic_id: row.aops_topic_id,
+                aops_post_id: row.aops_post_id,
+                aops_user_id: row.aops_user_id,
+                aops_username: row.aops_username,
+                posted_at: row.posted_at,
+                is_official: isOfficial,
+                reliability_hint: isOfficial ? 90 : 0,
+                quality_score: Math.max(0, Math.min(100, row.quality ?? 0)),
+                status: isVerified || isOfficial ? "accepted" : "candidate",
+                status_source: isVerified ? "manual" : "auto",
+            });
+        }
+        db.exec(`DROP TABLE solutions_old;`);
+        db.exec(`PRAGMA foreign_keys = ON;`);
+    })();
+}
+
+function ensureSolutionIndexes(db) {
+    const solutionCols = db
+        .query("PRAGMA table_info(solutions)")
+        .all()
+        .map((r) => r.name);
+    if (!solutionCols.includes("status")) return;
+    db.exec(`
+CREATE INDEX IF NOT EXISTS idx_solutions_problem_status
+  ON solutions (problem_id, status, duplicate_of_solution_id);
+CREATE INDEX IF NOT EXISTS idx_solutions_duplicate_of
+  ON solutions (duplicate_of_solution_id);
+    `);
+}
 
 export function initDB(dbPath) {
     const db = new Database(dbPath, { create: true });
@@ -469,6 +1013,9 @@ FROM tests_old;
         }
     }
 
+    migrateSolutionsSchema(db);
+    ensureSolutionIndexes(db);
+
     return db;
 }
 
@@ -581,24 +1128,20 @@ export function upsertTest(
 
 function upsertSolutions(db, problemId, solutions, allPosts, isOly) {
     for (const sol of solutions ?? []) {
-        db.run(
-            `
-            INSERT INTO solutions (problem_id, source, aops_topic_id, aops_post_id, aops_user_id, aops_username, content, posted_at)
-            VALUES (?, 'aops', ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (aops_post_id) WHERE aops_post_id >= 0 DO UPDATE SET
-                is_official = MAX(solutions.is_official, excluded.is_official),
-                content = excluded.content
-        `,
-            [
-                problemId,
-                sol.topic_id ?? null,
-                sol.post_id ?? null,
-                sol.user_id ?? null,
-                sol.username ?? null,
-                sol.content,
-                sol.posted_at ?? null,
-            ],
-        );
+        upsertSolutionCandidate(db, {
+            problemId,
+            source: "aops",
+            sourceKey:
+                sol.post_id != null ? `post:${sol.post_id}` : undefined,
+            content: sol.content,
+            raw_content: sol.content,
+            aops_topic_id: sol.topic_id ?? null,
+            aops_post_id: sol.post_id ?? null,
+            aops_user_id: sol.user_id ?? null,
+            aops_username: sol.username ?? null,
+            posted_at: sol.posted_at ?? null,
+            is_official: false,
+        });
     }
 
     if (isOly && allPosts && allPosts.length > 0) {
@@ -873,31 +1416,44 @@ export function upsertWikiProblem(db, problem, testId) {
     }
 }
 
-// Wiki solutions carry no stable post id (the aops dedup index keys on
-// aops_post_id), so we can't upsert them individually. Instead replace this
-// problem's wiki solutions wholesale: delete the source='wiki' rows and
-// re-insert. aops_post_id = NULL is excluded from idx_solutions_aops_post_id,
-// so wiki rows coexist with aops rows. Marked is_official so they flow into
-// production_problems.official_solutions.
+// Wiki solutions carry no stable post id, so refresh this problem's wiki
+// provenance wholesale. Canonical solution rows are reused by content hash, and
+// old auto-only wiki rows with no remaining source are marked superseded.
 function upsertWikiSolutions(db, problemId, solutions) {
-    db.run(`DELETE FROM solutions WHERE problem_id = ? AND source = 'wiki'`, [
+    const oldWikiSolutionIds = db
+        .query(
+            `SELECT DISTINCT solution_id
+             FROM solution_sources
+             WHERE problem_id = ? AND source = 'wiki'`,
+        )
+        .all(problemId)
+        .map((r) => r.solution_id);
+    db.run(`DELETE FROM solution_sources WHERE problem_id = ? AND source = 'wiki'`, [
         problemId,
     ]);
+    for (const solutionId of oldWikiSolutionIds) {
+        markOrphanedAutoSolutionSuperseded(db, solutionId);
+    }
     for (const sol of solutions ?? []) {
         if (!sol?.content) continue;
-        db.run(
-            `INSERT INTO solutions (problem_id, source, aops_post_id, content, is_official)
-             VALUES (?, 'wiki', NULL, ?, ?)`,
-            [problemId, sol.content, sol.is_official === false ? 0 : 1],
-        );
+        upsertSolutionCandidate(db, {
+            problemId,
+            source: "wiki",
+            content: sol.content,
+            raw_content: sol.content,
+            wiki_page: sol.page ?? null,
+            wiki_section: sol.section ?? null,
+            is_official: sol.is_official === false ? 0 : 1,
+            reliability_hint: sol.is_official === false ? 70 : 95,
+        });
     }
 }
 
 // Removes a test's stale problem rows after a re-scrape: any row whose
 // (n, section) is no longer produced by the scrape (e.g. the test's section
 // structure changed). Manually-curated rows (pdf_statement set, or verified)
-// are always kept. Child rows in solutions / oly_potential_solutions /
-// problem_history are deleted alongside their problems.
+// are always kept. Child rows in solution_sources / solutions /
+// oly_potential_solutions / problem_history are deleted alongside their problems.
 function cleanupOrphanProblems(db, testId, keepPairs) {
     if (keepPairs.length === 0) return; // never wipe a test on an empty scrape
     const keys = keepPairs.map((p) => `${p.n}|${p.section}`);
@@ -912,6 +1468,7 @@ function cleanupOrphanProblems(db, testId, keepPairs) {
         .all(testId, ...keys);
 
     for (const { id } of orphans) {
+        db.run(`DELETE FROM solution_sources WHERE problem_id = ?`, [id]);
         db.run(`DELETE FROM solutions WHERE problem_id = ?`, [id]);
         db.run(`DELETE FROM oly_potential_solutions WHERE problem_id = ?`, [id]);
         db.run(`DELETE FROM problem_history WHERE problem_id = ?`, [id]);
@@ -1125,7 +1682,14 @@ export function buildProductionProblems(db) {
 
         const solStmt = db.query(
             `SELECT content FROM solutions
-             WHERE problem_id = ? AND is_official = 1 ORDER BY id`,
+             WHERE problem_id = ?
+               AND status = 'accepted'
+               AND duplicate_of_solution_id IS NULL
+             ORDER BY selected_rank IS NULL,
+                      selected_rank,
+                      is_official DESC,
+                      quality_score DESC,
+                      id`,
         );
         const insert = db.query(`
             INSERT INTO production_problems (

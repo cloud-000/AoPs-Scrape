@@ -1,6 +1,7 @@
 import { CleanupText } from './CleanupText.js';
 import { getAutoTags } from './autoTags.js';
 import { SOLUTIONS_USERS } from '../contest_id.js';
+import { classifySolutions } from './db.js';
 
 /**
  * Pre-processing pipeline. Operates on all problems in the DB (idempotent).
@@ -11,8 +12,8 @@ import { SOLUTIONS_USERS } from '../contest_id.js';
  * 1. Re-extract MCQ choices / clean statements on the source of truth
  * 2. Re-run inferACGN on every problem (can update acgn)
  * 3. Apply AUTO_TAGS and union into existing tags
- * 4. Re-apply solution classification rules to existing solutions
- * 5. is_official detection for solutions based on known organizers
+ * 4. is_official detection for solution sources based on known organizers
+ * 5. Re-apply solution classification rules to existing solutions
  * 6. Answer cross-check: log warnings where aops_answer != pdf_answer
  */
 export async function runPreprocess(db) {
@@ -21,8 +22,8 @@ export async function runPreprocess(db) {
     await refreshChoices(db);
     await reclassifyAcgn(db);
     await retagProblems(db);
-    await reclassifySolutions(db);
     await detectOfficialSolutions(db);
+    await reclassifySolutions(db);
     await crossCheckAnswers(db);
 
     console.log("\nPre-processing complete.");
@@ -111,14 +112,15 @@ function retagProblems(db) {
 }
 
 function reclassifySolutions(db) {
-    console.log("Step 4: Re-classifying solutions (no-op for existing classification)...");
-    // Solutions are already classified at scrape time. This step is a placeholder
-    // for future re-classification when rules change.
-    console.log("  Skipped (solutions classified at scrape time).");
+    console.log("Step 5: Re-classifying solution candidates...");
+    const result = classifySolutions(db);
+    console.log(
+        `  Classified ${result.updated} solution(s); marked ${result.duplicates} near-duplicate(s).`,
+    );
 }
 
 function detectOfficialSolutions(db) {
-    console.log("Step 5: Detecting official solutions by known organizers...");
+    console.log("Step 4: Detecting official solution sources by known organizers...");
 
     if (!SOLUTIONS_USERS || SOLUTIONS_USERS.length === 0) {
         console.log("  No SOLUTIONS_USERS defined, skipping.");
@@ -128,12 +130,32 @@ function detectOfficialSolutions(db) {
     const userIds = SOLUTIONS_USERS.map(u => u.id);
     const placeholders = userIds.map(() => '?').join(',');
 
-    const result = db.run(
-        `UPDATE solutions SET is_official = 1 WHERE aops_user_id IN (${placeholders}) AND is_official = 0`,
+    const sourceResult = db.run(
+        `UPDATE solution_sources
+         SET is_official_hint = 1,
+             reliability_hint = MAX(reliability_hint, 90),
+             last_seen_at = datetime('now')
+         WHERE aops_user_id IN (${placeholders})
+           AND is_official_hint = 0`,
         userIds
     );
 
-    console.log(`  Marked ${result.changes} solutions as official.`);
+    const solutionResult = db.run(`
+        UPDATE solutions
+        SET is_official = 1,
+            updated_at = datetime('now')
+        WHERE status_source != 'manual'
+          AND EXISTS (
+              SELECT 1
+              FROM solution_sources ss
+              WHERE ss.solution_id = solutions.id
+                AND ss.is_official_hint = 1
+          )
+    `);
+
+    console.log(
+        `  Marked ${sourceResult.changes} source(s) and ${solutionResult.changes} solution(s) as official hints.`,
+    );
 }
 
 function crossCheckAnswers(db) {
