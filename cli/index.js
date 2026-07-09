@@ -16,6 +16,7 @@ import {
     exportProductionCSV,
     exportProductionSQL,
     exportStagingSQL,
+    exportRatingSeedsSQL,
 } from "../src/export.js";
 import { unlinkSync, existsSync } from "node:fs";
 
@@ -343,6 +344,27 @@ async function main() {
             break;
         }
 
+        case "seed-ratings-export": {
+            const rest = process.argv.slice(3);
+            const overwrite = rest.includes("--overwrite-seeds");
+            const outFile =
+                rest.find((a) => !a.startsWith("--")) ??
+                "scrape_data/seed_ratings.sql";
+            const db = initDB(DB_PATH);
+            const result = await exportRatingSeedsSQL(db, outFile, {
+                overwrite,
+            });
+            db.close();
+            console.log(
+                `Wrote rating seeds to ${result.file} (${result.matched} problems seeded, ` +
+                    `${result.unmatchedTests} tests unmatched; mode=${overwrite ? "overwrite" : "seed-then-lock"}).`,
+            );
+            console.log(
+                `Next: run it against the cloud:  psql "$DB_URL" -f ${result.file}`,
+            );
+            break;
+        }
+
         case "init-db": {
             const db = initDB(DB_PATH);
             db.close();
@@ -393,7 +415,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], sync-export [file], init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], sync-export [file], seed-ratings-export [file] [--overwrite-seeds], init-db, clear-db",
             );
             break;
     }
