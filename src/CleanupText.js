@@ -169,39 +169,58 @@ export class CleanupText {
         });
     }
 
+    // Decodes the small set of HTML entities MediaWiki uses when escaping
+    // Asymptote source into an <img alt="…"> attribute (quotes from label()
+    // strings, angle brackets from for-loop comparisons).
+    static _decodeHtmlEntities(str) {
+        return str
+            .replace(/&quot;/g, '"')
+            .replace(/&#0?39;|&apos;/g, "'")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&amp;/g, "&");
+    }
+
     // MediaWiki analog of toAsyLinks: pairs each <asy>…</asy> block in the raw
-    // wikitext with the rendered Asymptote <img> src from the page's rendered
-    // HTML, rewriting to the same [asy=URL]…[/asy] BBCode form the forum path
-    // produces (so downstream — inferACGN stripping, production — treats both
-    // sources uniformly). If the img/asy counts don't line up we can't trust the
-    // pairing, so we fall back to plain [asy]…[/asy] with no URL.
-    // NOTE: the wiki's asy <img> class differs from the forum's "asy-image"; the
-    // default regex below is best-effort and should be confirmed against a live
-    // rendered wiki page (see plan risk R6). Pass a custom `imgRegex` to override.
-    static toWikiAsyLinks(
-        wikitext,
-        rendered,
-        imgRegex = /<img\b[^>]*\b(?:class\s*=\s*["'][^"']*asy[^"']*["']|src\s*=\s*["'][^"']*[Aa]sy[^"']*["'])[^>]*>/gi,
-    ) {
+    // wikitext with its rendered image from the page's rendered HTML, rewriting
+    // to the same [asy=URL]…[/asy] BBCode form the forum path produces (so
+    // downstream — inferACGN stripping, production — treats both sources
+    // uniformly). The wiki has no native Asymptote renderer: it typesets the
+    // diagram as a LaTeX image whose `alt` is the raw "[asy] … [/asy]" source
+    // (whitespace-collapsed, HTML-entity-escaped) — there is no "asy" class/src
+    // marker on the <img> itself (that was tried and never matched in practice;
+    // the rendered class is just the ordinary block-LaTeX "latexcenter"). So we
+    // match each <asy> block to its image by comparing normalized content
+    // rather than by position/count, which also survives unrelated images
+    // (logos, inline LaTeX) interleaved in the rendered HTML.
+    static toWikiAsyLinks(wikitext, rendered) {
         const asyRegex = /<asy\b[^>]*>([\s\S]*?)<\/asy>/gi;
-        const asyCount = (wikitext.match(asyRegex) || []).length;
-        if (asyCount === 0) return wikitext;
+        if (!asyRegex.test(wikitext)) return wikitext;
 
-        const urls =
-            (rendered || "")
-                .match(imgRegex)
-                ?.map((e) => {
-                    const src = e.match(/src=["']([^"']*)["']/i)?.[1];
-                    if (!src) return null;
-                    return src.startsWith("http") ? src : "https:" + src;
-                })
-                .filter(Boolean) ?? [];
+        const byContent = new Map();
+        for (const tag of rendered?.match(/<img\b[^>]*>/gi) ?? []) {
+            const alt = tag.match(
+                /\balt\s*=\s*["'](\[asy\][\s\S]*?\[\/asy\])["']/i,
+            )?.[1];
+            if (!alt) continue;
+            const src = tag.match(/\bsrc\s*=\s*["']([^"']*)["']/i)?.[1];
+            if (!src) continue;
+            const content = CleanupText._decodeHtmlEntities(alt)
+                .replace(/^\[asy\]\s*/i, "")
+                .replace(/\s*\[\/asy\]$/i, "")
+                .replace(/\s+/g, " ")
+                .trim();
+            if (!byContent.has(content)) {
+                byContent.set(
+                    content,
+                    src.startsWith("http") ? src : "https:" + src,
+                );
+            }
+        }
 
-        let count = 0;
-        const usable = urls.length >= asyCount;
         return wikitext.replace(asyRegex, (_, content) => {
-            const url = usable ? urls[count] : null;
-            count++;
+            const normalized = content.replace(/\s+/g, " ").trim();
+            const url = byContent.get(normalized);
             return url
                 ? `[asy=${url}]${content}[/asy]`
                 : `[asy]${content}[/asy]`;
@@ -390,6 +409,10 @@ export class CleanupText {
         for (const [re, rep] of this.CONTEST_NAME_RENAMES) {
             out = out.replace(re, rep);
         }
+        // AoPS sometimes leaves a dangling "-" at the end of a category name
+        // (e.g. "2022 AMC 8 -"), likely a truncated leftover from a category
+        // rename. It carries no identifying info, so drop it.
+        out = out.replace(/\s+-+\s*$/, "");
         return out.replace(/\s{2,}/g, " ").trim();
     }
 
