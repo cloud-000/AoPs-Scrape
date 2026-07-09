@@ -2,10 +2,18 @@
 // SQLite DB, merging onto existing AoPS rows where a test matches.
 //
 // OCR layout:  out/<series>/<test>/
-//   problems.json         { "<num>": "<statement>" }   (1-based string keys)
-//   problem_answer.json   { "<num>": "<answer>" }       (optional)
-// Everything else (problem_solution.json, *.png, ocr_cache*.json, the
-// mathcounts/_answers_ocr/ staging folder) is intentionally skipped.
+//   problems.json         { "<num>": "<statement>" }          (1-based string keys)
+//   problem_answer.json   { "<num>": "<answer>" }             (optional)
+//   problem_solution.json { "<num>": ["<solution>", ...] }    (optional)
+// Everything else (*.png figures, ocr_cache*.json, the mathcounts/_answers_ocr/
+// staging folder) is intentionally skipped.
+//
+// Solutions are ingested through upsertSolutionCandidate as source='import', so
+// they reuse the existing dedup pipeline: exact dedup by normalized content hash
+// on insert, and near-dedup in preprocess (classifySolutions). Solutions from
+// official contests (SERIES_CONFIG[*].isOfficial) are marked is_official and
+// auto-accept into production; non-official ones enter as candidates the
+// classifier score-gates.
 //
 // Problem numbers are 1-based in the OCR but 0-based in the DB (ForumSession
 // assigns problem 1 -> n=0), so keys are stored as `int(key) - 1` to line up
@@ -14,7 +22,12 @@
 
 import { readdirSync, existsSync, statSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
-import { upsertSeries, upsertTest, upsertPdfProblem } from "./db.js";
+import {
+    upsertSeries,
+    upsertTest,
+    upsertPdfProblem,
+    upsertSolutionCandidate,
+} from "./db.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 
@@ -141,7 +154,7 @@ export function importPdfProblems(db, outDir, options = {}) {
     const testFilter =
         options.tests?.length > 0 ? new Set(options.tests) : null;
 
-    const summary = { series: 0, tests: 0, problems: 0 };
+    const summary = { series: 0, tests: 0, problems: 0, solutions: 0 };
 
     db.transaction(() => {
         for (const seriesFolder of readdirSync(outDir)) {
@@ -175,6 +188,8 @@ export function importPdfProblems(db, outDir, options = {}) {
                     continue;
                 }
                 const answers = readJson(join(testPath, "problem_answer.json")) ?? {};
+                const solutions =
+                    readJson(join(testPath, "problem_solution.json")) ?? {};
 
                 if (seriesId == null) {
                     seriesId = upsertSeries(db, cfg.seriesName, -1, cfg.isOfficial);
@@ -201,6 +216,7 @@ export function importPdfProblems(db, outDir, options = {}) {
                 summary.tests++;
 
                 let count = 0;
+                const problemIdByN = new Map(); // n -> problem id, for attaching solutions
                 for (const key of Object.keys(problems)) {
                     const n = Number(key) - 1; // 1-based OCR -> 0-based DB
                     if (!Number.isInteger(n) || n < 0) {
@@ -209,7 +225,7 @@ export function importPdfProblems(db, outDir, options = {}) {
                         );
                         continue;
                     }
-                    upsertPdfProblem(
+                    const problemId = upsertPdfProblem(
                         db,
                         {
                             n,
@@ -220,10 +236,50 @@ export function importPdfProblems(db, outDir, options = {}) {
                         },
                         testId,
                     );
+                    problemIdByN.set(n, problemId);
                     count++;
                 }
+
+                // Attach OCR'd solutions to the problems just upserted. Keys are
+                // 1-based like problems; each value is an array of solution
+                // strings. Dedup (exact + near) is handled downstream by
+                // upsertSolutionCandidate / classifySolutions.
+                let solCount = 0;
+                for (const key of Object.keys(solutions)) {
+                    const n = Number(key) - 1;
+                    if (!Number.isInteger(n) || n < 0) {
+                        console.warn(
+                            `  skip non-numeric solution key "${key}" in ${seriesFolder}/${testFolder}`,
+                        );
+                        continue;
+                    }
+                    const problemId = problemIdByN.get(n);
+                    if (problemId == null) continue; // solution with no matching problem
+                    const list = solutions[key];
+                    if (!Array.isArray(list)) continue;
+                    for (const solStr of list) {
+                        if (typeof solStr !== "string" || !solStr.trim()) continue;
+                        upsertSolutionCandidate(db, {
+                            problemId,
+                            source: "import",
+                            content: solStr,
+                            content_format: "markdown_latex",
+                            // Official contests auto-accept; others enter as
+                            // candidates for the classifier to score-gate.
+                            is_official: cfg.isOfficial,
+                            // sourceKey omitted -> getSourceKey falls back to
+                            // `import:<contentHash>`, deduping identical source
+                            // rows and making re-import idempotent.
+                        });
+                        solCount++;
+                    }
+                }
+
                 summary.problems += count;
-                console.log(`  ${meta.name}: ${count} problems`);
+                summary.solutions += solCount;
+                console.log(
+                    `  ${meta.name}: ${count} problems, ${solCount} solutions`,
+                );
             }
         }
     })();

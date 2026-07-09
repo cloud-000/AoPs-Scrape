@@ -44,7 +44,7 @@ async function main() {
                 user["session-id"],
                 user["headers"] || null,
                 () => {
-                    loader.bars[0].count++;
+                    if (loader.bars[0]) loader.bars[0].count++;
                 },
             );
             session.debug = false;
@@ -78,18 +78,24 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
-            loader.add(new CLICount("Problems Collected:"));
-            loader.start();
-            let loaderInterval = setInterval(() => {
-                loader.calculate();
-                loader.render();
-            }, 300);
+            const showCounter = !process.argv.includes("--no-counter");
+            let loaderInterval;
+            if (showCounter) {
+                loader.add(new CLICount("Problems Collected:"));
+                loader.start();
+                loaderInterval = setInterval(() => {
+                    loader.calculate();
+                    loader.render();
+                }, 300);
+            }
             let startTime = Date.now();
             data = await method.run(session, id, methodArgs);
             let elapsedTime = Date.now() - startTime;
-            clearInterval(loaderInterval);
-            await sleep(100);
-            loader.clear();
+            if (loaderInterval) {
+                clearInterval(loaderInterval);
+                await sleep(100);
+                loader.clear();
+            }
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );
@@ -127,7 +133,7 @@ async function main() {
                 user["session-id"],
                 user["headers"] || null,
                 () => {
-                    loader.bars[0].count++;
+                    if (loader.bars[0]) loader.bars[0].count++;
                 },
             );
             session.debug = false;
@@ -159,18 +165,24 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
-            loader.add(new CLICount("Problems Collected:"));
-            loader.start();
-            let loaderInterval = setInterval(() => {
-                loader.calculate();
-                loader.render();
-            }, 300);
+            const showCounter = !process.argv.includes("--no-counter");
+            let loaderInterval;
+            if (showCounter) {
+                loader.add(new CLICount("Problems Collected:"));
+                loader.start();
+                loaderInterval = setInterval(() => {
+                    loader.calculate();
+                    loader.render();
+                }, 300);
+            }
             let startTime = Date.now();
             const tests = await method.run(session, contest, methodArgs);
             let elapsedTime = Date.now() - startTime;
-            clearInterval(loaderInterval);
-            await sleep(100);
-            loader.clear();
+            if (loaderInterval) {
+                clearInterval(loaderInterval);
+                await sleep(100);
+                loader.clear();
+            }
             if (tests === null) break; // debug method already handled output/exit
 
             data = {
@@ -271,7 +283,7 @@ async function main() {
             const { c } = db.query("SELECT count(*) as c FROM problems").get();
             db.close();
             console.log(
-                `Imported PDF problems from ${outDir}: ${s.problems} problems across ${s.tests} tests in ${s.series} series (${c} total problems in DB).`,
+                `Imported PDF problems from ${outDir}: ${s.problems} problems, ${s.solutions} solutions across ${s.tests} tests in ${s.series} series (${c} total problems in DB).`,
             );
             break;
         }

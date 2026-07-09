@@ -1338,6 +1338,15 @@ export function upsertPdfProblem(db, problem, testId) {
             problem.is_computational ? 1 : 0,
         ],
     );
+
+    // Resolve the (possibly pre-existing) row via the natural key rather than
+    // last_insert_rowid(), which is unreliable through ON CONFLICT DO UPDATE.
+    // Callers use this id to attach imported solutions.
+    return db
+        .query(
+            `SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = ?`,
+        )
+        .get(testId, problem.n, section).id;
 }
 
 // Upserts a problem from the AoPS Wiki. Writes the wiki_* tier (statement,
