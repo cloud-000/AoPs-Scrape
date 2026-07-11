@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { CleanupText } from "./CleanupText.js";
 import { getAutoTags } from "./autoTags.js";
+import { sectionTestMetadata } from "./testMetadata.js";
 import { SOLUTIONS_USERS } from "../contest_id.js";
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,10 @@ CREATE TABLE IF NOT EXISTS tests (
   section          INTEGER NOT NULL DEFAULT -1,
   section_name     TEXT,
   year             INTEGER,
+  division         TEXT,
+  division_order   INTEGER,
+  format           TEXT,
+  format_order     INTEGER,
   -- Not standalone-unique: sibling section tests share the AoPS category id and
   -- are disambiguated by section.
   aops_category_id TEXT,
@@ -959,6 +964,24 @@ FROM tests_old;
         })();
     }
 
+    // Presentation-only series review metadata. These fields are deliberately
+    // absent from every natural/unique key and are populated on a later
+    // structured re-import rather than parsed from existing display names.
+    const testsMetadataCols = db
+        .query("PRAGMA table_info(tests)")
+        .all()
+        .map((r) => r.name);
+    for (const [col, type] of [
+        ["division", "TEXT"],
+        ["division_order", "INTEGER"],
+        ["format", "TEXT"],
+        ["format_order", "INTEGER"],
+    ]) {
+        if (!testsMetadataCols.includes(col)) {
+            db.exec(`ALTER TABLE tests ADD COLUMN ${col} ${type}`);
+        }
+    }
+
     // Migration: production_problems was redesigned/extended or schema changed. It holds only
     // derived data, so drop the stale shape and let SCHEMA recreate the new one.
     const prodTableInfo = db.query("PRAGMA table_info(production_problems)").all();
@@ -1053,6 +1076,23 @@ export function resolveTestId(db, { aopsCategoryId, section = -1, seriesId, year
     return byNatural ? byNatural.id : null;
 }
 
+const TEST_METADATA_KEYS = [
+    "division",
+    "divisionOrder",
+    "format",
+    "formatOrder",
+];
+
+function testMetadataFields(test) {
+    const metadata = {};
+    for (const key of TEST_METADATA_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(test, key)) {
+            metadata[key] = test[key];
+        }
+    }
+    return metadata;
+}
+
 // `updateSection` controls whether an UPDATE (merge onto an existing row) may
 // rewrite section/section_name. The scraper owns a test's section structure, so
 // it passes true; non-scrape sources (PDF import) pass false so they never
@@ -1060,11 +1100,32 @@ export function resolveTestId(db, { aopsCategoryId, section = -1, seriesId, year
 // "High School" test merging by name onto a genuinely two-section AoPS year must
 // not flatten a sibling section to -1 and collide on UNIQUE(aops_category_id,
 // section). A brand-new row still takes the caller's section on INSERT.
-export function upsertTest(
-    db,
-    { aopsCategoryId, name, section = -1, sectionName = null, year, type, isComputational, updateSection = true },
-    seriesId,
-) {
+// Review metadata uses property presence as ownership: omitted fields preserve
+// the stored value, while explicitly supplied null clears stale classification.
+export function upsertTest(db, test, seriesId) {
+    const {
+        aopsCategoryId,
+        name,
+        section = -1,
+        sectionName = null,
+        year,
+        type,
+        isComputational,
+        updateSection = true,
+        division,
+        divisionOrder,
+        format,
+        formatOrder,
+    } = test;
+    const has = (key) => Object.prototype.hasOwnProperty.call(test, key);
+    const updateDivisionOrder =
+        has("divisionOrder") || (has("division") && division == null);
+    const updateFormatOrder =
+        has("formatOrder") || (has("format") && format == null);
+    const normalizedDivisionOrder =
+        division == null && has("division") ? null : divisionOrder;
+    const normalizedFormatOrder =
+        format == null && has("format") ? null : formatOrder;
     const existingId = resolveTestId(db, {
         aopsCategoryId,
         section,
@@ -1081,6 +1142,10 @@ export function upsertTest(
                 section          = CASE WHEN ? THEN ? ELSE section END,
                 section_name     = CASE WHEN ? THEN ? ELSE section_name END,
                 year             = ?,
+                division         = CASE WHEN ? THEN ? ELSE division END,
+                division_order   = CASE WHEN ? THEN ? ELSE division_order END,
+                format           = CASE WHEN ? THEN ? ELSE format END,
+                format_order     = CASE WHEN ? THEN ? ELSE format_order END,
                 type             = ?,
                 is_computational = ?,
                 series_id        = ?,
@@ -1095,6 +1160,14 @@ export function upsertTest(
                 updateSection ? 1 : 0,
                 sectionName ?? null,
                 year ?? null,
+                has("division") ? 1 : 0,
+                division ?? null,
+                updateDivisionOrder ? 1 : 0,
+                normalizedDivisionOrder ?? null,
+                has("format") ? 1 : 0,
+                format ?? null,
+                updateFormatOrder ? 1 : 0,
+                normalizedFormatOrder ?? null,
                 type ?? null,
                 isComputational ? 1 : 0,
                 seriesId,
@@ -1107,8 +1180,12 @@ export function upsertTest(
 
     db.run(
         `
-        INSERT INTO tests (series_id, name, section, section_name, year, aops_category_id, type, is_computational)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tests (
+            series_id, name, section, section_name, year,
+            division, division_order, format, format_order,
+            aops_category_id, type, is_computational
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
         [
             seriesId,
@@ -1116,6 +1193,10 @@ export function upsertTest(
             section,
             sectionName ?? null,
             year ?? null,
+            division ?? null,
+            division == null ? null : (divisionOrder ?? null),
+            format ?? null,
+            format == null ? null : (formatOrder ?? null),
             aopsCategoryId ?? null,
             type ?? null,
             isComputational ? 1 : 0,
@@ -1534,19 +1615,28 @@ export function upsertScrapeResults(db, raw) {
             // "<test name> <section name>". A flat test is a single row with
             // section = -1. `units` normalizes both into the same shape.
             const sectioned = (test.sections?.length ?? 0) > 0;
+            const inheritedMetadata = testMetadataFields(test);
             const units = sectioned
-                ? test.sections.map((sectionName, i) => ({
-                      name: `${test.name} ${sectionName}`,
-                      section: i,
-                      sectionName,
-                      problems: test.problems[i] ?? [],
-                  }))
+                ? test.sections.map((sectionName, i) => {
+                      const sectionMetadata = sectionTestMetadata(
+                          test.type,
+                          sectionName,
+                      );
+                      return {
+                          name: `${test.name} ${sectionName}`,
+                          section: i,
+                          sectionName,
+                          problems: test.problems[i] ?? [],
+                          metadata: sectionMetadata ?? inheritedMetadata,
+                      };
+                  })
                 : [
                       {
                           name: test.name,
                           section: -1,
                           sectionName: null,
                           problems: test.problems,
+                          metadata: inheritedMetadata,
                       },
                   ];
 
@@ -1559,6 +1649,7 @@ export function upsertScrapeResults(db, raw) {
                         section: unit.section,
                         sectionName: unit.sectionName,
                         year: test.year ?? null,
+                        ...unit.metadata,
                         type: test.type ?? null,
                         isComputational,
                     },
@@ -1616,6 +1707,7 @@ export function upsertWikiResults(db, raw) {
                     section: -1,
                     sectionName: null,
                     year: test.year ?? null,
+                    ...testMetadataFields(test),
                     type: test.type ?? null,
                     isComputational,
                     updateSection: false,

@@ -28,6 +28,11 @@ import {
     upsertPdfProblem,
     upsertSolutionCandidate,
 } from "./db.js";
+import {
+    mathcountsTestMetadata,
+    numberedFormatMetadata,
+    schoolDivisionMetadata,
+} from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 
@@ -51,6 +56,7 @@ export const SERIES_CONFIG = {
                 year: Number(year),
                 section: -1,
                 sectionName: null,
+                ...schoolDivisionMetadata(level),
             };
         },
     },
@@ -60,13 +66,16 @@ export const SERIES_CONFIG = {
         isComputational: true,
         // "2015_national_sprint" -> "2015 MATHCOUNTS National Sprint"
         parseTest(folder) {
-            const [year, ...rest] = folder.split("_");
+            const [year, division, format, ...extra] = folder.split("_");
+            if (format?.toLowerCase() === "countdown") return null;
+            const rest = [division, format, ...extra].filter(Boolean);
             const label = rest.map(titleCase).join(" ");
             return {
                 name: `${year} MATHCOUNTS ${label}`.trim(),
                 year: Number(year),
                 section: -1,
                 sectionName: null,
+                ...mathcountsTestMetadata(division, format),
             };
         },
     },
@@ -86,6 +95,7 @@ export const SERIES_CONFIG = {
                 year: Number(schoolYear.split("-")[0]) || null,
                 section: -1,
                 sectionName: null,
+                ...numberedFormatMetadata("Round", round),
             };
         },
     },
@@ -101,6 +111,7 @@ export const SERIES_CONFIG = {
                 year: null,
                 section: -1,
                 sectionName: null,
+                ...numberedFormatMetadata("Round", round),
             };
         },
     },
@@ -130,12 +141,17 @@ export function listPdfSeries(outDir) {
 export function listPdfTests(outDir, seriesFolder) {
     const seriesPath = join(outDir, seriesFolder);
     if (!isDir(seriesPath)) return [];
-    return readdirSync(seriesPath).filter(
-        (f) =>
-            !f.startsWith("_") &&
-            isDir(join(seriesPath, f)) &&
-            existsSync(join(seriesPath, f, "problems.json")),
-    );
+    const cfg = SERIES_CONFIG[seriesFolder];
+    return readdirSync(seriesPath).filter((f) => {
+        if (
+            f.startsWith("_") ||
+            !isDir(join(seriesPath, f)) ||
+            !existsSync(join(seriesPath, f, "problems.json"))
+        ) {
+            return false;
+        }
+        return !cfg || cfg.parseTest(f) != null;
+    });
 }
 
 // Walks `outDir` and merges every recognized series/test into the DB in a single
@@ -180,6 +196,14 @@ export function importPdfProblems(db, outDir, options = {}) {
                 const testPath = join(seriesPath, testFolder);
                 if (!isDir(testPath)) continue;
 
+                const meta = cfg.parseTest(testFolder);
+                if (meta == null) {
+                    console.warn(
+                        `  skip unsupported test: ${seriesFolder}/${testFolder}`,
+                    );
+                    continue;
+                }
+
                 const problems = readJson(join(testPath, "problems.json"));
                 if (!problems || Object.keys(problems).length === 0) {
                     console.warn(
@@ -196,7 +220,6 @@ export function importPdfProblems(db, outDir, options = {}) {
                     summary.series++;
                 }
 
-                const meta = cfg.parseTest(testFolder);
                 const testId = upsertTest(
                     db,
                     {
@@ -205,6 +228,10 @@ export function importPdfProblems(db, outDir, options = {}) {
                         section: meta.section ?? -1,
                         sectionName: meta.sectionName ?? null,
                         year: meta.year ?? null,
+                        division: meta.division,
+                        divisionOrder: meta.divisionOrder,
+                        format: meta.format,
+                        formatOrder: meta.formatOrder,
                         type: null,
                         isComputational: cfg.isComputational,
                         // Section structure is scraper-owned; PDF import must

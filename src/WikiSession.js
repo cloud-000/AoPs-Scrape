@@ -1,6 +1,7 @@
 import { CleanupText } from "./CleanupText.js";
 import { ForumSession, makeProblem } from "./ForumSession.js";
 import { TYPES } from "../contest_id.js";
+import { wikiTestMetadata } from "./testMetadata.js";
 
 const WIKI_API = "https://artofproblemsolving.com/wiki/api.php";
 const MCQ_LETTERS = ["A", "B", "C", "D", "E"];
@@ -246,6 +247,7 @@ export class WikiSession {
     // natural key (series, name, year) merges wiki rows onto forum rows.
     async getContest(titleBase, year) {
         const name = `${year} ${titleBase}`;
+        const metadata = wikiTestMetadata(titleBase);
         const type = ForumSession.inferType(name, true) ?? TYPES.UNKNOWN;
         const computational = type.computational ?? false;
         const hasChoices = type.choices ?? false;
@@ -320,6 +322,7 @@ export class WikiSession {
             id: null,
             name,
             year: Number(year),
+            ...(metadata ?? {}),
             type: type.name,
             computational,
             sections: [],

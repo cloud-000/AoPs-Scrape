@@ -288,6 +288,10 @@ Fetches and parses a single test category into a structured test object.
   id: number,
   name: string,
   year: number | null,
+  division?: string | null,       // structured audience/level when known
+  divisionOrder?: number | null,  // stable sibling division order
+  format?: string | null,         // structured variant when known
+  formatOrder?: number | null,    // stable sibling format order
   type: string,             // e.g. "AMC 10", "AIME", "AMO"
   computational: boolean,
   sections: string[],       // empty array if no sections
@@ -315,7 +319,9 @@ Fetches and parses a single test category into a structured test object.
 
 Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter.
 
-Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat. When collapsing, `_normalizeSections` checks the lone header via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`); noise headers (problem counts, time limits) are dropped.
+Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat. When collapsing, `_normalizeSections` checks the lone header via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`) and retained as normalized `division` or `format` metadata; noise headers (problem counts, time limits, …) are dropped. Multi-section AIME I/II and `Day N` labels are normalized when their separate test rows are stored.
+
+Review metadata is nullable presentation data only. It is populated from structured section information at ingestion, never inferred by a generic pass over finished display names, and does not participate in test identity. An omitted property means the source has no classification to contribute; an explicit `null` clears a stale classification during upsert.
 
 Name normalization: the category name is passed through `CleanupText.normalizeContestName` before it becomes the test/series name (currently rewrites `"Purple Comet Problems"` → `"Purple Comet"`).
 

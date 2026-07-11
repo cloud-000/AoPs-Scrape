@@ -48,6 +48,10 @@
  * @property {number|string} id            AoPS category id.
  * @property {string}  name
  * @property {number|null} year
+ * @property {string|null} [division]          Structured audience/level label when known.
+ * @property {number|null} [divisionOrder]     Stable sibling division display order.
+ * @property {string|null} [format]            Structured test variant label when known.
+ * @property {number|null} [formatOrder]       Stable sibling format display order.
  * @property {string}  type                Type name (e.g. "AMC 10", "AIME").
  * @property {boolean} computational       Has numeric/MCQ answers (vs. proof-based).
  * @property {string[]} sections           Section names; empty for flat tests.

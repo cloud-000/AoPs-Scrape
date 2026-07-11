@@ -338,7 +338,7 @@ Problems are built with the shared `makeProblem()` factory (exported from
 | `_get(params)` | Low-level cached GET; `params` doubles as the `ResponseCache` key. Retries on the Cloudflare interstitial / bare 403 (linear backoff) and JSON-parse failures (exponential). |
 | `parse(page, { section, wikitext })` | `action=parse`; returns `json.parse.wikitext["*"]` (raw) or `json.parse.text["*"]` (HTML). Throws an `Error` with `.code` (e.g. `missingtitle`) on API errors. |
 | `getProblemPage(page, { computational, choices })` | Fetches one `…/Problem k` subpage and returns a `makeProblem`-shaped object: cleaned statement, MCQ `choices`, `answerIndex`/`answerValue` (from the first `\boxed{…}` in a solution), and `solutions[]` from every `==Solution N==` section. |
-| `getContest(titleBase, year)` | Assembles a flat `ScrapedTest` for one variant+year (`name = "${year} ${titleBase}"`, matching the forum category name so it merges by natural key). Discovers N from the aggregate `… Problems` page and applies the `… Answer Key` page as a fallback for problems whose solutions lack a boxed answer. |
+| `getContest(titleBase, year)` | Assembles a flat `ScrapedTest` for one variant+year (`name = "${year} ${titleBase}"`, matching the forum category name so it merges by natural key). Structured registry variants populate nullable review metadata (AMC 10/12 A/B and AIME I/II; AMC 8 remains unclassified). Discovers N from the aggregate `… Problems` page and applies the `… Answer Key` page as a fallback for problems whose solutions lack a boxed answer. |
 
 **Parsing pipeline (per page):**
 
@@ -356,6 +356,8 @@ Problems are built with the shared `makeProblem()` factory (exported from
 Contest → wiki page-title mapping lives in `contest_id.js` as a `wiki: { variants, years }`
 descriptor on the relevant entries (AMC 8/10/12, AIME). Ingest is via
 `db.upsertWikiResults` (additive; natural-key merge; trust order **pdf > wiki > forum**).
+Variant metadata comes from that configured `titleBase`, not from a later parser
+over the completed display name.
 
 ---
 

@@ -101,6 +101,10 @@ CREATE TABLE tests (
   name TEXT NOT NULL,
   section INTEGER NOT NULL DEFAULT -1,
   year INTEGER,
+  division TEXT,
+  division_order INTEGER,
+  format TEXT,
+  format_order INTEGER,
   aops_category_id TEXT,
   type TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (FALSE, TRUE)),
@@ -149,6 +153,10 @@ const SQL_EXPORT_TABLES = [
             "name",
             "section",
             "year",
+            "division",
+            "division_order",
+            "format",
+            "format_order",
             "aops_category_id",
             "type",
             "is_computational",
@@ -156,7 +164,8 @@ const SQL_EXPORT_TABLES = [
             "quality",
         ],
         select: `
-            SELECT id, series_id, name, section, year, aops_category_id,
+            SELECT id, series_id, name, section, year, division,
+                   division_order, format, format_order, aops_category_id,
                    type, is_computational, difficulty, quality
             FROM tests
             ORDER BY id
@@ -312,6 +321,10 @@ const STAGING_TABLES = {
             "series_name",
             "name",
             "year",
+            "division",
+            "division_order",
+            "format",
+            "format_order",
             "aops_category_id",
             "section",
             "type",
@@ -375,7 +388,8 @@ export async function exportStagingSQL(
     const tests = db
         .query(
             `
-        SELECT t.id, s.name AS series_name, t.name, t.year, t.aops_category_id,
+        SELECT t.id, s.name AS series_name, t.name, t.year, t.division,
+               t.division_order, t.format, t.format_order, t.aops_category_id,
                t.section, t.type, t.is_computational, t.difficulty, t.quality
         FROM tests t JOIN series s ON t.series_id = s.id
         ORDER BY t.id

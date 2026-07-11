@@ -1,5 +1,6 @@
 import { CleanupText } from "./CleanupText.js";
 import { CONTEST_IDS, TYPES, SOLUTIONS_USERS } from "../contest_id.js";
+import { foldedSectionMetadata } from "./testMetadata.js";
 
 export const ApiMethod = {
    TOPIC: 0,
@@ -682,7 +683,11 @@ export class ForumSession {
          // to the test name; otherwise the header is noise (problem count,
          // time limit, …) and is dropped.
          const label = CleanupText.extractSectionLabel(test.sections[0]);
-         if (label) test.name = `${test.name} ${label}`;
+         if (label) {
+            test.name = `${test.name} ${label}`;
+            const metadata = foldedSectionMetadata(label);
+            if (metadata) Object.assign(test, metadata);
+         }
          test.sections.pop();
          test.problems = test.problems.flat();
       }
