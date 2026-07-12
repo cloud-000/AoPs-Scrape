@@ -36,6 +36,38 @@ import {
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 
+const HMMT_MONTHS = { feb: "February", nov: "November" };
+const HMMT_ROUNDS = {
+    adv: "Advanced",
+    alg: "Algebra",
+    calc: "Calculus",
+    comb: "Combinatorics",
+    geo: "Geometry",
+    gen: "General",
+    gen1: "General 1",
+    gen2: "General 2",
+    guts: "Guts",
+    oral: "Oral",
+    pow: "Power",
+    team: "Team",
+    team1: "Team 1",
+    team2: "Team 2",
+    algcalc: "Algebra/Calculus",
+    algcomb: "Algebra/Combinatorics",
+    alggeo: "Algebra/Geometry",
+    calccomb: "Calculus/Combinatorics",
+    calcgeo: "Calculus/Geometry",
+    combgeo: "Combinatorics/Geometry",
+    thm: "Theme",
+};
+const PUMAC_SUBJECTS = {
+    algebra: "Algebra",
+    combinatorics: "Combinatorics",
+    geometry: "Geometry",
+    number_theory: "Number Theory",
+    individual_finals: "Individual Finals",
+};
+
 // Per OCR-series-folder config. `seriesName` is the canonical DB series name
 // (must match an existing row exactly to reuse it). `parseTest` turns an OCR
 // test folder name into the DB test's { name, year, section, sectionName }.
@@ -115,6 +147,111 @@ export const SERIES_CONFIG = {
             };
         },
     },
+    hmmt: {
+        seriesName: "HMMT",
+        isOfficial: true,
+        isComputational: true,
+        // "2026_feb_guts" -> "2026 HMMT February Guts" (series "HMMT")
+        // "2026_nov_gen1" -> "2026 HMMT November General 1" (series "HMMT November")
+        // "2026_hmic"     -> "2026 HMMT Invitational"    (series "HMMT")
+        // The series name varies per test so PDF rows merge onto the split AoPS
+        // series rows (HMMT vs HMMT November) rather than one combined series.
+        parseTest(folder) {
+            const [yearStr, monthOrKind, round, ...extra] = folder.split("_");
+            const year = Number(yearStr);
+            if (!Number.isInteger(year) || extra.length > 0) return null;
+            if (monthOrKind?.toLowerCase() === "hmic") {
+                return {
+                    name: `${year} HMMT Invitational`,
+                    year,
+                    section: -1,
+                    sectionName: null,
+                    seriesName: "HMMT",
+                };
+            }
+            const month = HMMT_MONTHS[monthOrKind?.toLowerCase()];
+            const roundLabel = HMMT_ROUNDS[round?.toLowerCase()];
+            if (!month || !roundLabel) return null;
+            const seriesName = month === "November" ? "HMMT November" : "HMMT";
+            return {
+                name: `${year} HMMT ${month} ${roundLabel}`,
+                year,
+                section: -1,
+                sectionName: null,
+                seriesName,
+            };
+        },
+    },
+    mpfg: {
+        seriesName: "MPFG",
+        isOfficial: true,
+        isComputational: false,
+        // "2025_mathprize" -> "2025 Math Prize"   (series "MPFG")
+        // "2025_olympiad"  -> "2025 Olympiad"     (series "MPFG Olympiad")
+        // Both are proof-based; the series split mirrors the AoPS registry.
+        parseTest(folder) {
+            const [yearStr, kind, ...extra] = folder.split("_");
+            const year = Number(yearStr);
+            if (!Number.isInteger(year) || extra.length > 0) return null;
+            const k = kind?.toLowerCase();
+            if (k === "mathprize") {
+                return {
+                    name: `${year} Math Prize`,
+                    year,
+                    section: -1,
+                    sectionName: null,
+                    seriesName: "MPFG",
+                };
+            }
+            if (k === "olympiad") {
+                return {
+                    name: `${year} Olympiad`,
+                    year,
+                    section: -1,
+                    sectionName: null,
+                    seriesName: "MPFG Olympiad",
+                };
+            }
+            return null;
+        },
+    },
+    pumac: {
+        seriesName: "PUMAC",
+        isOfficial: true,
+        isComputational: true,
+        // "2025_A_algebra"          -> "2025 PUMaC A Algebra"
+        // "2025_B_individual_finals" -> "2025 PUMaC B Individual Finals"
+        // "2025_team"               -> "2025 PUMaC Team"
+        parseTest(folder) {
+            const parts = folder.split("_");
+            const yearStr = parts[0];
+            const letter = parts[1];
+            // Subject may itself contain an underscore (e.g. individual_finals).
+            const subject = parts.slice(2).join("_");
+            const year = Number(yearStr);
+            if (!Number.isInteger(year) || !letter) return null;
+            const L = letter.toUpperCase();
+            if (L === "TEAM") {
+                return {
+                    name: `${year} PUMaC Team`,
+                    year,
+                    section: -1,
+                    sectionName: null,
+                    seriesName: "PUMAC",
+                };
+            }
+            if (L !== "A" && L !== "B") return null;
+            const subj = PUMAC_SUBJECTS[subject?.toLowerCase()];
+            if (!subj) return null;
+            return {
+                name: `${year} PUMaC ${L} ${subj}`,
+                year,
+                section: -1,
+                sectionName: null,
+                seriesName: "PUMAC",
+            };
+        },
+    },
 };
 
 function titleCase(word) {
@@ -181,14 +318,20 @@ export function importPdfProblems(db, outDir, options = {}) {
             const seriesPath = join(outDir, seriesFolder);
             if (!cfg || !isDir(seriesPath)) {
                 if (isDir(seriesPath)) {
-                    console.warn(`  skip unknown series folder: ${seriesFolder}`);
+                    console.warn(
+                        `  skip unknown series folder: ${seriesFolder}`,
+                    );
                 }
                 continue;
             }
 
-            // Created lazily on the first importable test so a test-only filter
-            // (e.g. --test=2026_HS) doesn't leave empty series rows behind.
-            let seriesId = null;
+            // A single OCR folder can map to multiple DB series (e.g. HMMT Feb ->
+            // "HMMT", HMMT Nov -> "HMMT November"), so the series is resolved
+            // per test from `meta.seriesName ?? cfg.seriesName`. Track which
+            // series rows we've already created so a test-only filter (e.g.
+            // --test=2026_feb_guts) doesn't leave empty series rows behind, and
+            // so summary.series counts each series once.
+            const seriesIds = new Map(); // seriesName -> id
 
             for (const testFolder of readdirSync(seriesPath)) {
                 if (testFolder.startsWith("_")) continue;
@@ -211,12 +354,16 @@ export function importPdfProblems(db, outDir, options = {}) {
                     );
                     continue;
                 }
-                const answers = readJson(join(testPath, "problem_answer.json")) ?? {};
+                const answers =
+                    readJson(join(testPath, "problem_answer.json")) ?? {};
                 const solutions =
                     readJson(join(testPath, "problem_solution.json")) ?? {};
 
+                const seriesName = meta.seriesName ?? cfg.seriesName;
+                let seriesId = seriesIds.get(seriesName);
                 if (seriesId == null) {
-                    seriesId = upsertSeries(db, cfg.seriesName, -1, cfg.isOfficial);
+                    seriesId = upsertSeries(db, seriesName, -1, cfg.isOfficial);
+                    seriesIds.set(seriesName, seriesId);
                     summary.series++;
                 }
 
@@ -285,7 +432,8 @@ export function importPdfProblems(db, outDir, options = {}) {
                     const list = solutions[key];
                     if (!Array.isArray(list)) continue;
                     for (const solStr of list) {
-                        if (typeof solStr !== "string" || !solStr.trim()) continue;
+                        if (typeof solStr !== "string" || !solStr.trim())
+                            continue;
                         upsertSolutionCandidate(db, {
                             problemId,
                             source: "import",
