@@ -14,6 +14,11 @@ function nameMatches(pattern, name) {
 function ruleMatches(rule, test) {
     if (rule.series != null && rule.series !== test.series_name) return false;
     if (rule.test_type != null && rule.test_type !== test.type) return false;
+    // Structured taxonomy: exact match on the tests.division / tests.format
+    // columns the importers populate (testMetadata.js). Prefer these over
+    // test_name_pattern, which scans the free-text name.
+    if (rule.division != null && rule.division !== test.division) return false;
+    if (rule.format != null && rule.format !== test.format) return false;
     if (
         rule.test_name_pattern != null &&
         !nameMatches(rule.test_name_pattern, test.name)
@@ -23,7 +28,8 @@ function ruleMatches(rule, test) {
     return true;
 }
 
-// Returns the winning rule for a test, or null. test = { series_name, type, name }.
+// Returns the winning rule for a test, or null.
+// test = { series_name, type, name, division, format }.
 // Among matches, highest `priority` (default 0) wins; ties break by array order
 // (first declared wins). Falls back to policy.fallback (as a synthetic rule) if
 // no explicit rule matches and a fallback is configured, else null.

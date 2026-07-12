@@ -402,6 +402,18 @@ export class CleanupText {
     static CONTEST_NAME_RENAMES = [
         [/Purple Comet Problems/gi, "Purple Comet"],
         [/(AIME(?:\s+I{1,3})?)\s+Problems/gi, "$1"],
+        // Math Prize for Girls: AoPS spells "For" inconsistently and appends
+        // "Problems", and the two categories scrape as descriptive folder names.
+        // Fold both onto the registry spelling so PDF-imported rows (series
+        // "MPFG"/"MPFG Olympiad"; tests "YYYY Math Prize for Girls[ Olympiad]")
+        // merge on the (series, name, year) key. Order matters: the casing +
+        // suffix fixes run first so the anchored folder rules below see "for"
+        // and no "Problems". The ^…$ folder rules only fire on the bare category
+        // name — the year-prefixed per-test names never match them.
+        [/Math Prize For Girls/g, "Math Prize for Girls"],
+        [/(Math Prize for Girls)\s+Problems\b/gi, "$1"],
+        [/^\s*Math Prize for Girls Olympiad\s*$/i, "MPFG Olympiad"],
+        [/^\s*Math Prize for Girls\s*$/i, "MPFG"],
     ];
     static normalizeContestName(name) {
         if (!name) return name;

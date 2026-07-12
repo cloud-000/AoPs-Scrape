@@ -9,9 +9,14 @@
 // Rule fields (a rule matches a test when EVERY field it specifies matches):
 //   series             exact tests' series.name
 //   test_type          exact tests.type
+//   division           exact tests.division (structural label the importers set,
+//                      e.g. "State", "High School" — see testMetadata.js).
+//   format             exact tests.format (e.g. "Sprint", "Target", "Team").
+//                      division + format together distinguish a level+round.
 //   test_name_pattern  case-insensitive substring of tests.name; an ARRAY means
-//                      every token must be present (AND) — this is how a level +
-//                      round like ["State", "Sprint"] is distinguished.
+//                      every token must be present (AND). Prefer division/format
+//                      over this — it scans the free-text name and is a fallback
+//                      for series that carry no structured taxonomy.
 //   range              [lower, upper] rating band spread across the test by n.
 //   curve              "linear" (default) or "exp" (geometric interpolation).
 //   priority           higher wins when multiple rules match (default 0); ties
@@ -27,14 +32,16 @@ export const RATING_POLICY = {
       { id: "amc-8", series: "AMC 8", range: [700, 1600], curve: "linear" },
       { id: "aime", series: "AIME", range: [1300, 2300], curve: "linear" },
 
-      // MATHCOUNTS — detect level (Chapter/State/National) + round
-      // (Sprint/Target). Specific (level+round) rules carry higher priority
-      // than the bare-round fallbacks so a named level wins; unrecognized
-      // levels fall through to mc-sprint / mc-target.
+      // MATHCOUNTS — keyed off the structured division (School/Chapter/State/
+      // National) + format (Sprint/Target/Team) columns. Specific (division +
+      // format) rules carry higher priority than the bare-format fallbacks so a
+      // named level wins; tests whose division didn't resolve fall through to
+      // mc-sprint / mc-target / mc-team on format alone.
       {
          id: "mc-chapter-sprint",
          series: "MATHCOUNTS",
-         test_name_pattern: ["Chapter", "Sprint"],
+         division: "Chapter",
+         format: "Sprint",
          range: [650, 1500],
          curve: "linear",
          priority: 200,
@@ -42,7 +49,8 @@ export const RATING_POLICY = {
       {
          id: "mc-state-sprint",
          series: "MATHCOUNTS",
-         test_name_pattern: ["State", "Sprint"],
+         division: "State",
+         format: "Sprint",
          range: [850, 1850],
          curve: "linear",
          priority: 200,
@@ -50,7 +58,8 @@ export const RATING_POLICY = {
       {
          id: "mc-national-sprint",
          series: "MATHCOUNTS",
-         test_name_pattern: ["National", "Sprint"],
+         division: "National",
+         format: "Sprint",
          range: [1050, 2050],
          curve: "linear",
          priority: 200,
@@ -58,7 +67,8 @@ export const RATING_POLICY = {
       {
          id: "mc-chapter-target",
          series: "MATHCOUNTS",
-         test_name_pattern: ["Chapter", "Target"],
+         division: "Chapter",
+         format: "Target",
          range: [800, 1700],
          curve: "linear",
          priority: 200,
@@ -66,7 +76,8 @@ export const RATING_POLICY = {
       {
          id: "mc-state-target",
          series: "MATHCOUNTS",
-         test_name_pattern: ["State", "Target"],
+         division: "State",
+         format: "Target",
          range: [1000, 2000],
          curve: "linear",
          priority: 200,
@@ -74,7 +85,8 @@ export const RATING_POLICY = {
       {
          id: "mc-national-target",
          series: "MATHCOUNTS",
-         test_name_pattern: ["National", "Target"],
+         division: "National",
+         format: "Target",
          range: [1200, 2200],
          curve: "linear",
          priority: 200,
@@ -82,7 +94,8 @@ export const RATING_POLICY = {
       {
          id: "mc-school-sprint",
          series: "MATHCOUNTS",
-         test_name_pattern: ["School", "Sprint"],
+         division: "School",
+         format: "Sprint",
          range: [500, 1350],
          curve: "linear",
          priority: 200,
@@ -90,7 +103,8 @@ export const RATING_POLICY = {
       {
          id: "mc-school-target",
          series: "MATHCOUNTS",
-         test_name_pattern: ["School", "Target"],
+         division: "School",
+         format: "Target",
          range: [650, 1550],
          curve: "linear",
          priority: 200,
@@ -98,7 +112,7 @@ export const RATING_POLICY = {
       {
          id: "mc-sprint",
          series: "MATHCOUNTS",
-         test_name_pattern: "Sprint",
+         format: "Sprint",
          range: [750, 1750],
          curve: "linear",
          priority: 100,
@@ -106,7 +120,7 @@ export const RATING_POLICY = {
       {
          id: "mc-target",
          series: "MATHCOUNTS",
-         test_name_pattern: "Target",
+         format: "Target",
          range: [900, 1900],
          curve: "linear",
          priority: 100,
@@ -114,7 +128,7 @@ export const RATING_POLICY = {
       {
          id: "mc-team",
          series: "MATHCOUNTS",
-         test_name_pattern: "Team",
+         format: "Team",
          range: [750, 1750],
          curve: "linear",
          priority: 100,
@@ -123,7 +137,7 @@ export const RATING_POLICY = {
       {
          id: "purple-comet-hs",
          series: "Purple Comet",
-         test_name_pattern: "High School",
+         division: "High School",
          range: [1000, 2100],
          curve: "linear",
          priority: 200,
@@ -131,7 +145,7 @@ export const RATING_POLICY = {
       {
          id: "purple-comet-ms",
          series: "Purple Comet",
-         test_name_pattern: "Middle School",
+         division: "Middle School",
          range: [800, 1800],
          curve: "linear",
          priority: 200,

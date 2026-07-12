@@ -79,24 +79,11 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
-            const showCounter = !process.argv.includes("--no-counter");
-            let loaderInterval;
-            if (showCounter) {
-                loader.add(new CLICount("Problems Collected:"));
-                loader.start();
-                loaderInterval = setInterval(() => {
-                    loader.calculate();
-                    loader.render();
-                }, 300);
-            }
+            const loaderInterval = startCounter();
             let startTime = Date.now();
             data = await method.run(session, id, methodArgs);
             let elapsedTime = Date.now() - startTime;
-            if (loaderInterval) {
-                clearInterval(loaderInterval);
-                await sleep(100);
-                loader.clear();
-            }
+            await stopCounter(loaderInterval);
             console.log(
                 `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
             );
@@ -166,24 +153,11 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
-            const showCounter = !process.argv.includes("--no-counter");
-            let loaderInterval;
-            if (showCounter) {
-                loader.add(new CLICount("Problems Collected:"));
-                loader.start();
-                loaderInterval = setInterval(() => {
-                    loader.calculate();
-                    loader.render();
-                }, 300);
-            }
+            const loaderInterval = startCounter();
             let startTime = Date.now();
             const tests = await method.run(session, contest, methodArgs);
             let elapsedTime = Date.now() - startTime;
-            if (loaderInterval) {
-                clearInterval(loaderInterval);
-                await sleep(100);
-                loader.clear();
-            }
+            await stopCounter(loaderInterval);
             if (tests === null) break; // debug method already handled output/exit
 
             data = {
@@ -458,6 +432,25 @@ function parseDumpFlag() {
 
 async function sleep(ms) {
     await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Starts the live "Problems Collected" counter unless --no-counter was passed.
+// Returns the interval handle (or null) to pass back to stopCounter().
+function startCounter() {
+    if (process.argv.includes("--no-counter")) return null;
+    loader.add(new CLICount("Problems Collected:"));
+    loader.start();
+    return setInterval(() => {
+        loader.calculate();
+        loader.render();
+    }, 300);
+}
+
+async function stopCounter(interval) {
+    if (!interval) return;
+    clearInterval(interval);
+    await sleep(100);
+    loader.clear();
 }
 
 async function getUser(message = "Select user") {

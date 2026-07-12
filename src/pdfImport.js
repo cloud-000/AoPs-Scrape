@@ -32,40 +32,46 @@ import {
     mathcountsTestMetadata,
     numberedFormatMetadata,
     schoolDivisionMetadata,
+    hmmtSeasonMetadata,
+    hmmtRoundMetadata,
+    mpfgContestMetadata,
+    pumacDivisionMetadata,
+    pumacSubjectMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 
 const HMMT_MONTHS = { feb: "February", nov: "November" };
+// HMMT round/theme -> format label + order (the "which format" axis).
 const HMMT_ROUNDS = {
-    adv: "Advanced",
-    alg: "Algebra",
-    calc: "Calculus",
-    comb: "Combinatorics",
-    geo: "Geometry",
-    gen: "General",
-    gen1: "General 1",
-    gen2: "General 2",
-    guts: "Guts",
-    oral: "Oral",
-    pow: "Power",
-    team: "Team",
-    team1: "Team 1",
-    team2: "Team 2",
-    algcalc: "Algebra/Calculus",
-    algcomb: "Algebra/Combinatorics",
-    alggeo: "Algebra/Geometry",
-    calccomb: "Calculus/Combinatorics",
-    calcgeo: "Calculus/Geometry",
-    combgeo: "Combinatorics/Geometry",
-    thm: "Theme",
+    adv: { label: "Advanced", order: 10 },
+    alg: { label: "Algebra", order: 20 },
+    calc: { label: "Calculus", order: 30 },
+    comb: { label: "Combinatorics", order: 40 },
+    geo: { label: "Geometry", order: 50 },
+    gen: { label: "General", order: 60 },
+    gen1: { label: "General 1", order: 61 },
+    gen2: { label: "General 2", order: 62 },
+    guts: { label: "Guts", order: 70 },
+    oral: { label: "Oral", order: 80 },
+    pow: { label: "Power", order: 90 },
+    team: { label: "Team", order: 100 },
+    team1: { label: "Team 1", order: 101 },
+    team2: { label: "Team 2", order: 102 },
+    algcalc: { label: "Algebra/Calculus", order: 110 },
+    algcomb: { label: "Algebra/Combinatorics", order: 120 },
+    alggeo: { label: "Algebra/Geometry", order: 130 },
+    calccomb: { label: "Calculus/Combinatorics", order: 140 },
+    calcgeo: { label: "Calculus/Geometry", order: 150 },
+    combgeo: { label: "Combinatorics/Geometry", order: 160 },
+    thm: { label: "Theme", order: 170 },
 };
 const PUMAC_SUBJECTS = {
-    algebra: "Algebra",
-    combinatorics: "Combinatorics",
-    geometry: "Geometry",
-    number_theory: "Number Theory",
-    individual_finals: "Individual Finals",
+    algebra: { label: "Algebra", order: 10 },
+    combinatorics: { label: "Combinatorics", order: 20 },
+    geometry: { label: "Geometry", order: 30 },
+    number_theory: { label: "Number Theory", order: 40 },
+    individual_finals: { label: "Individual Finals", order: 50 },
 };
 
 // Per OCR-series-folder config. `seriesName` is the canonical DB series name
@@ -167,18 +173,23 @@ export const SERIES_CONFIG = {
                     section: -1,
                     sectionName: null,
                     seriesName: "HMMT",
+                    ...hmmtSeasonMetadata("hmic"),
+                    ...hmmtRoundMetadata(null, null),
                 };
             }
             const month = HMMT_MONTHS[monthOrKind?.toLowerCase()];
-            const roundLabel = HMMT_ROUNDS[round?.toLowerCase()];
-            if (!month || !roundLabel) return null;
+            const roundKey = round?.toLowerCase();
+            const roundMeta = HMMT_ROUNDS[roundKey];
+            if (!month || !roundMeta) return null;
             const seriesName = month === "November" ? "HMMT November" : "HMMT";
             return {
-                name: `${year} HMMT ${month} ${roundLabel}`,
+                name: `${year} HMMT ${month} ${roundMeta.label}`,
                 year,
                 section: -1,
                 sectionName: null,
                 seriesName,
+                ...hmmtSeasonMetadata(monthOrKind),
+                ...hmmtRoundMetadata(roundMeta.label, roundMeta.order),
             };
         },
     },
@@ -186,8 +197,10 @@ export const SERIES_CONFIG = {
         seriesName: "MPFG",
         isOfficial: true,
         isComputational: false,
-        // "2025_mathprize" -> "2025 Math Prize"   (series "MPFG")
-        // "2025_olympiad"  -> "2025 Olympiad"     (series "MPFG Olympiad")
+        // "2025_mathprize" -> "2025 Math Prize for Girls"          (series "MPFG")
+        // "2025_olympiad"  -> "2025 Math Prize for Girls Olympiad" (series "MPFG Olympiad")
+        // Names match the canonical form CleanupText.normalizeContestName folds
+        // the AoPS scrape onto, so PDF rows merge on the (series, name, year) key.
         // Both are proof-based; the series split mirrors the AoPS registry.
         parseTest(folder) {
             const [yearStr, kind, ...extra] = folder.split("_");
@@ -196,20 +209,22 @@ export const SERIES_CONFIG = {
             const k = kind?.toLowerCase();
             if (k === "mathprize") {
                 return {
-                    name: `${year} Math Prize`,
+                    name: `${year} Math Prize for Girls`,
                     year,
                     section: -1,
                     sectionName: null,
                     seriesName: "MPFG",
+                    ...mpfgContestMetadata("mathprize"),
                 };
             }
             if (k === "olympiad") {
                 return {
-                    name: `${year} Olympiad`,
+                    name: `${year} Math Prize for Girls Olympiad`,
                     year,
                     section: -1,
                     sectionName: null,
                     seriesName: "MPFG Olympiad",
+                    ...mpfgContestMetadata("olympiad"),
                 };
             }
             return null;
@@ -238,17 +253,21 @@ export const SERIES_CONFIG = {
                     section: -1,
                     sectionName: null,
                     seriesName: "PUMAC",
+                    ...pumacDivisionMetadata("TEAM"),
+                    ...pumacSubjectMetadata(null, null),
                 };
             }
             if (L !== "A" && L !== "B") return null;
             const subj = PUMAC_SUBJECTS[subject?.toLowerCase()];
             if (!subj) return null;
             return {
-                name: `${year} PUMaC ${L} ${subj}`,
+                name: `${year} PUMaC ${L} ${subj.label}`,
                 year,
                 section: -1,
                 sectionName: null,
                 seriesName: "PUMAC",
+                ...pumacDivisionMetadata(L),
+                ...pumacSubjectMetadata(subj.label, subj.order),
             };
         },
     },
@@ -264,6 +283,17 @@ function isDir(p) {
 
 function readJson(path) {
     return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+}
+
+// OCR problem/solution keys are 1-based; DB `n` is 0-based. Returns the 0-based
+// n, or null (with a warning) for a non-numeric key.
+function ocrKeyToN(key, kind, where) {
+    const n = Number(key) - 1;
+    if (!Number.isInteger(n) || n < 0) {
+        console.warn(`  skip non-numeric ${kind} key "${key}" in ${where}`);
+        return null;
+    }
+    return n;
 }
 
 // Returns the OCR series folders present in `outDir` that we know how to import.
@@ -392,13 +422,12 @@ export function importPdfProblems(db, outDir, options = {}) {
                 let count = 0;
                 const problemIdByN = new Map(); // n -> problem id, for attaching solutions
                 for (const key of Object.keys(problems)) {
-                    const n = Number(key) - 1; // 1-based OCR -> 0-based DB
-                    if (!Number.isInteger(n) || n < 0) {
-                        console.warn(
-                            `  skip non-numeric problem key "${key}" in ${seriesFolder}/${testFolder}`,
-                        );
-                        continue;
-                    }
+                    const n = ocrKeyToN(
+                        key,
+                        "problem",
+                        `${seriesFolder}/${testFolder}`,
+                    );
+                    if (n === null) continue;
                     const problemId = upsertPdfProblem(
                         db,
                         {
@@ -420,13 +449,12 @@ export function importPdfProblems(db, outDir, options = {}) {
                 // upsertSolutionCandidate / classifySolutions.
                 let solCount = 0;
                 for (const key of Object.keys(solutions)) {
-                    const n = Number(key) - 1;
-                    if (!Number.isInteger(n) || n < 0) {
-                        console.warn(
-                            `  skip non-numeric solution key "${key}" in ${seriesFolder}/${testFolder}`,
-                        );
-                        continue;
-                    }
+                    const n = ocrKeyToN(
+                        key,
+                        "solution",
+                        `${seriesFolder}/${testFolder}`,
+                    );
+                    if (n === null) continue;
                     const problemId = problemIdByN.get(n);
                     if (problemId == null) continue; // solution with no matching problem
                     const list = solutions[key];

@@ -248,21 +248,15 @@ export class ForumSession {
 
       const name = response.category.category_name;
       const items = [...response.category.items];
-      let responseParent;
       while (!response.no_more_items) {
-         responseParent = await this.sendRequest(
+         const responseParent = await this.sendRequest(
             ForumSession.payload(ApiMethod.ITEMS_CATEGORIES, {
                id,
                start_num: items.length,
             }),
          );
          response = responseParent.response;
-         if (responseParent.error_msg || response.no_more_items) {
-            if (responseParent.error_msg) {
-               console.log("Error msg");
-            }
-            break;
-         }
+         if (responseParent.error_msg || response.no_more_items) break;
 
          items.push(...response.new_items);
       }

@@ -1375,8 +1375,13 @@ export function upsertPdfProblem(db, problem, testId) {
     const tagsJson =
         autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
 
-    db.run(
-        `
+    // RETURNING fires on both the INSERT and the DO UPDATE path, so it recovers
+    // the (possibly pre-existing) row id in one statement — no separate SELECT,
+    // and no reliance on last_insert_rowid() (unreliable through ON CONFLICT).
+    // Callers use this id to attach imported solutions.
+    return db
+        .query(
+            `
         INSERT INTO problems (
             test_id, n, section,
             pdf_statement, pdf_answer, pdf_source,
@@ -1403,8 +1408,10 @@ export function upsertPdfProblem(db, problem, testId) {
                 ELSE problems.aops_answer_index
             END,
             updated_at = datetime('now')
+        RETURNING id
     `,
-        [
+        )
+        .get(
             testId,
             problem.n,
             section,
@@ -1417,17 +1424,7 @@ export function upsertPdfProblem(db, problem, testId) {
             acgn,
             tagsJson,
             problem.is_computational ? 1 : 0,
-        ],
-    );
-
-    // Resolve the (possibly pre-existing) row via the natural key rather than
-    // last_insert_rowid(), which is unreliable through ON CONFLICT DO UPDATE.
-    // Callers use this id to attach imported solutions.
-    return db
-        .query(
-            `SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = ?`,
-        )
-        .get(testId, problem.n, section).id;
+        ).id;
 }
 
 // Upserts a problem from the AoPS Wiki. Writes the wiki_* tier (statement,

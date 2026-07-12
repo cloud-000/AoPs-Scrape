@@ -1,3 +1,10 @@
+// ---------------------------------------------------------------------------
+// Token -> [label, order] maps. Every structural taxonomy the importers key off
+// lives here so the axes are visible in one place; the exported helpers below
+// just look tokens up in these.
+// ---------------------------------------------------------------------------
+
+// MATHCOUNTS levels (the "which division" axis).
 const MATHCOUNTS_DIVISIONS = new Map([
     ["school", ["School", 10]],
     ["chapter", ["Chapter", 20]],
@@ -5,10 +12,12 @@ const MATHCOUNTS_DIVISIONS = new Map([
     ["national", ["National", 40]],
 ]);
 
+// MATHCOUNTS rounds (the "which format" axis). "cdr" is the Countdown round.
 const MATHCOUNTS_FORMATS = new Map([
     ["sprint", ["Sprint", 10]],
     ["target", ["Target", 20]],
     ["team", ["Team", 30]],
+    ["cdr", ["Countdown", 40]],
 ]);
 
 const SCHOOL_DIVISIONS = new Map([
@@ -24,6 +33,23 @@ const LETTER_FORMATS = new Map([
 const AIME_FORMATS = new Map([
     ["I", ["I", 10]],
     ["II", ["II", 20]],
+]);
+
+// HMMT's structural token is the season/administration: February, November, or
+// the invitational (HMIC). This is the "which division" axis, so it maps to
+// `division`. HMMT has no format of its own at the season level (the round/theme
+// like Guts/Algebra is captured separately as the format by the importer).
+const HMMT_SEASONS = new Map([
+    ["feb", ["February", 10]],
+    ["nov", ["November", 20]],
+    ["hmic", ["Invitational", 30]],
+]);
+
+// MPFG splits into two distinct contest types under one umbrella series family.
+// The type is the "which division" axis, so it maps to `division`. No format.
+const MPFG_CONTESTS = new Map([
+    ["mathprize", ["Math Prize", 10]],
+    ["olympiad", ["Olympiad", 20]],
 ]);
 
 export function emptyTestMetadata() {
@@ -133,4 +159,58 @@ export function numberedFormatMetadata(prefix, value) {
         format: `${prefix} ${n}`,
         formatOrder: n * 10,
     };
+}
+
+// HMMT's structural token is the season/administration (February/November/HMIC),
+// the "which division" axis (map: HMMT_SEASONS). HMMT has no format of its own at
+// the season level — the round/theme (Guts/Algebra) rides on the format instead.
+export function hmmtSeasonMetadata(monthOrKindToken) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry(
+            "division",
+            HMMT_SEASONS.get(monthOrKindToken?.toLowerCase()),
+        ) ?? {}),
+    };
+}
+
+export function mpfgContestMetadata(kindToken) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry(
+            "division",
+            MPFG_CONTESTS.get(kindToken?.toLowerCase()),
+        ) ?? {}),
+    };
+}
+
+// PUMaC's A/B letter is its "which division" axis (mirrors AMC A/B via
+// LETTER_FORMATS); Team is a distinct division. No format at the letter level
+// (the subject like Algebra/Geometry is captured separately as the format).
+export function pumacDivisionMetadata(letterToken) {
+    const L = letterToken?.toUpperCase();
+    if (L === "TEAM") {
+        return { ...emptyTestMetadata(), division: "Team", divisionOrder: 30 };
+    }
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry("division", LETTER_FORMATS.get(L)) ?? {}),
+    };
+}
+
+// HMMT round/theme (Guts, Algebra, General, Team, ...) is the "which format"
+// axis. The label/order are supplied by the importer's HMMT_ROUNDS map. Returns
+// only format fields (no division) so it can be spread alongside the season
+// division metadata without clobbering it.
+export function hmmtRoundMetadata(label, order) {
+    if (!label) return {};
+    return { format: label, formatOrder: order };
+}
+
+// PUMaC subject (Algebra, Geometry, Combinatorics, Number Theory, Individual
+// Finals) is the "which format" axis. The label/order are supplied by the
+// importer's PUMAC_SUBJECTS map. Returns only format fields.
+export function pumacSubjectMetadata(label, order) {
+    if (!label) return {};
+    return { format: label, formatOrder: order };
 }

@@ -496,7 +496,7 @@ export async function exportRatingSeedsSQL(
         .query(
             `
         SELECT t.id, s.name AS series_name, t.name, t.year, t.aops_category_id,
-               t.section, t.type
+               t.section, t.type, t.division, t.format
         FROM tests t JOIN series s ON t.series_id = s.id
         ORDER BY t.id
     `,
