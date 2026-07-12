@@ -196,12 +196,14 @@ export const SERIES_CONFIG = {
     mpfg: {
         seriesName: "MPFG",
         isOfficial: true,
+        // Series default; each parseTest branch overrides it (Math Prize is
+        // computational, the Olympiad is proof-based).
         isComputational: false,
         // "2025_mathprize" -> "2025 Math Prize for Girls"          (series "MPFG")
         // "2025_olympiad"  -> "2025 Math Prize for Girls Olympiad" (series "MPFG Olympiad")
         // Names match the canonical form CleanupText.normalizeContestName folds
         // the AoPS scrape onto, so PDF rows merge on the (series, name, year) key.
-        // Both are proof-based; the series split mirrors the AoPS registry.
+        // The two contests differ on the computational axis (see isComputational).
         parseTest(folder) {
             const [yearStr, kind, ...extra] = folder.split("_");
             const year = Number(yearStr);
@@ -214,6 +216,7 @@ export const SERIES_CONFIG = {
                     section: -1,
                     sectionName: null,
                     seriesName: "MPFG",
+                    isComputational: true,
                     ...mpfgContestMetadata("mathprize"),
                 };
             }
@@ -224,6 +227,7 @@ export const SERIES_CONFIG = {
                     section: -1,
                     sectionName: null,
                     seriesName: "MPFG Olympiad",
+                    isComputational: false,
                     ...mpfgContestMetadata("olympiad"),
                 };
             }
@@ -390,6 +394,11 @@ export function importPdfProblems(db, outDir, options = {}) {
                     readJson(join(testPath, "problem_solution.json")) ?? {};
 
                 const seriesName = meta.seriesName ?? cfg.seriesName;
+                // Series default, overridable per test where a single series
+                // mixes formats (e.g. MPFG: computational Math Prize vs.
+                // proof-based Olympiad). Mirrors the seriesName override above.
+                const isComputational =
+                    meta.isComputational ?? cfg.isComputational;
                 let seriesId = seriesIds.get(seriesName);
                 if (seriesId == null) {
                     seriesId = upsertSeries(db, seriesName, -1, cfg.isOfficial);
@@ -410,7 +419,7 @@ export function importPdfProblems(db, outDir, options = {}) {
                         format: meta.format,
                         formatOrder: meta.formatOrder,
                         type: null,
-                        isComputational: cfg.isComputational,
+                        isComputational,
                         // Section structure is scraper-owned; PDF import must
                         // not rewrite section/section_name on an existing row.
                         updateSection: false,
@@ -435,7 +444,7 @@ export function importPdfProblems(db, outDir, options = {}) {
                             statement: problems[key],
                             answer: answers[key] ?? null,
                             source: `${seriesFolder}/${testFolder}`,
-                            is_computational: cfg.isComputational,
+                            is_computational: isComputational,
                         },
                         testId,
                     );

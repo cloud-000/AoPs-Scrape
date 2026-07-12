@@ -1407,6 +1407,10 @@ export function upsertPdfProblem(db, problem, testId) {
                 WHEN problems.wiki_choices IS NOT NULL THEN problems.wiki_answer_index
                 ELSE problems.aops_answer_index
             END,
+            -- Structural fact about the contest, refreshed like tests.is_computational
+            -- (upsertTest) so a corrected config propagates to existing rows and a
+            -- test never disagrees with its problems.
+            is_computational = excluded.is_computational,
             updated_at = datetime('now')
         RETURNING id
     `,
