@@ -37,6 +37,11 @@ import {
     mpfgContestMetadata,
     pumacDivisionMetadata,
     pumacSubjectMetadata,
+    mandelbrotDivisionMetadata,
+    bmtDivisionMetadata,
+    bmtFormatMetadata,
+    smtDivisionMetadata,
+    smtFormatMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
@@ -121,19 +126,36 @@ export const SERIES_CONFIG = {
         seriesName: "Mandelbrot Competition",
         isOfficial: true,
         isComputational: true,
-        // "2017-18_tmctest1N" -> "2017-18 Mandelbrot Round 1"
+        // "2017-18_tmctest1N" -> "2017-18 Mandelbrot National Round 1" (National division)
+        // "2017-18_tmctest1R" -> "2017-18 Mandelbrot Regional Round 1" (Regional division)
+        // "2009-10_mtptest1"  -> "2009-10 Mandelbrot Team Play Round 1" (Team Play)
+        // The `tmc` individual test is split into National (N) / Regional (R)
+        // divisions; the `mtp` Team Play round carries no N/R suffix. Without the
+        // division in the name the N/R (and tmc/mtp) folders would collide on one
+        // test name, so it must distinguish them.
         parseTest(folder) {
             const [schoolYear, testId = ""] = folder.split("_");
-            const round = testId.match(/(\d+)/)?.[1];
-            const name = round
-                ? `${schoolYear} Mandelbrot Round ${round}`
-                : `${schoolYear} Mandelbrot ${testId}`.trim();
+            const m = testId.match(/^(tmc|mtp)test(\d+)([NR])?$/i);
+            if (!m) return null;
+            const kind = m[1].toLowerCase();
+            const round = m[2];
+            const divToken = kind === "mtp" ? "team" : m[3]?.toUpperCase();
+            const div = mandelbrotDivisionMetadata(divToken);
+            if (!div.division) return null;
+            // Reuse numberedFormatMetadata for the round but keep only its format
+            // fields so the division above isn't clobbered by its empty base.
+            const { format, formatOrder } = numberedFormatMetadata(
+                "Round",
+                round,
+            );
             return {
-                name,
+                name: `${schoolYear} Mandelbrot ${div.division} Round ${round}`,
                 year: Number(schoolYear.split("-")[0]) || null,
                 section: -1,
                 sectionName: null,
-                ...numberedFormatMetadata("Round", round),
+                ...div,
+                format,
+                formatOrder,
             };
         },
     },
@@ -272,6 +294,60 @@ export const SERIES_CONFIG = {
                 seriesName: "PUMAC",
                 ...pumacDivisionMetadata(L),
                 ...pumacSubjectMetadata(subj.label, subj.order),
+            };
+        },
+    },
+    bmt: {
+        seriesName: "BMT",
+        isOfficial: true,
+        isComputational: true,
+        // Folder is "<division>_<year>_<format>" (division may hyphenate, e.g.
+        // "bmmt-online"). The division (BMT/BMMT/BMMT Online) rides on the
+        // `division` axis; the round/subject rides on `format`.
+        // "bmt_2024_algebra"      -> "2024 BMT Algebra"
+        // "bmmt_2012_individual"  -> "2012 BMMT Individual"
+        parseTest(folder) {
+            const [divToken, yearStr, ...rest] = folder.split("_");
+            const year = Number(yearStr);
+            const fmtToken = rest.join("_");
+            if (!Number.isInteger(year) || !fmtToken) return null;
+            const div = bmtDivisionMetadata(divToken);
+            const fmt = bmtFormatMetadata(fmtToken);
+            if (!div.division || !fmt.format) return null;
+            return {
+                name: `${year} ${div.division} ${fmt.format}`,
+                year,
+                section: -1,
+                sectionName: null,
+                ...div,
+                ...fmt,
+            };
+        },
+    },
+    smt: {
+        seriesName: "SMT",
+        isOfficial: true,
+        isComputational: true,
+        // Folder is "<DIVISION>_<year>_<format>". The division (ASMT/SM3/SMT)
+        // rides on the `division` axis; the subject rides on `format`, and a
+        // "<subject>-tiebreaker" folder becomes a "<Subject> Tiebreaker" format.
+        // "SMT_2024_algebra"          -> "2024 SMT Algebra"
+        // "ASMT_2015_algebra-tiebreaker" -> "2015 ASMT Algebra Tiebreaker"
+        parseTest(folder) {
+            const [divToken, yearStr, ...rest] = folder.split("_");
+            const year = Number(yearStr);
+            const fmtToken = rest.join("_");
+            if (!Number.isInteger(year) || !fmtToken) return null;
+            const div = smtDivisionMetadata(divToken);
+            const fmt = smtFormatMetadata(fmtToken);
+            if (!div.division || !fmt.format) return null;
+            return {
+                name: `${year} ${div.division} ${fmt.format}`,
+                year,
+                section: -1,
+                sectionName: null,
+                ...div,
+                ...fmt,
             };
         },
     },

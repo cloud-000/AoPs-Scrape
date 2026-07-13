@@ -52,6 +52,59 @@ const MPFG_CONTESTS = new Map([
     ["olympiad", ["Olympiad", 20]],
 ]);
 
+// Mandelbrot Competition divisions (the "which division" axis). The individual
+// test (`tmc` folders) ran in a harder National and an easier Regional division;
+// Team Play (`mtp` folders) is the separate team component with no N/R split. The
+// round number rides on the format instead (numberedFormatMetadata).
+const MANDELBROT_DIVISIONS = new Map([
+    ["N", ["National", 10]],
+    ["R", ["Regional", 20]],
+    ["team", ["Team Play", 30]],
+]);
+
+// Berkeley Math Tournament divisions (the "which division" axis): the main BMT,
+// the middle-school BMMT, and its online variant. The subject/round rides on the
+// format instead (BMT_FORMATS).
+const BMT_DIVISIONS = new Map([
+    ["bmt", ["BMT", 10]],
+    ["bmmt", ["BMMT", 20]],
+    ["bmmt-online", ["BMMT Online", 30]],
+]);
+
+// BMT rounds/subjects (the "which format" axis).
+const BMT_FORMATS = new Map([
+    ["algebra", ["Algebra", 10]],
+    ["ciphering", ["Ciphering", 20]],
+    ["individual", ["Individual", 30]],
+    ["partner", ["Partner", 40]],
+    ["speed", ["Speed", 50]],
+    ["team", ["Team", 60]],
+]);
+
+// Stanford Math Tournament divisions (the "which division" axis): the flagship
+// SMT plus the ASMT and SM3 sub-tournaments under the same umbrella series. The
+// subject/round rides on the format instead (SMT_FORMATS).
+const SMT_DIVISIONS = new Map([
+    ["asmt", ["ASMT", 10]],
+    ["sm3", ["SM3", 20]],
+    ["smt", ["SMT", 30]],
+]);
+
+// SMT rounds/subjects (the "which format" axis). A "<subject>-tiebreaker" folder
+// reuses its base subject's label/order plus a +5 bump so the tiebreaker sorts
+// immediately after its subject (see smtFormatMetadata).
+const SMT_FORMATS = new Map([
+    ["advanced", ["Advanced", 10]],
+    ["algebra", ["Algebra", 20]],
+    ["calculus", ["Calculus", 30]],
+    ["discrete", ["Discrete", 40]],
+    ["general", ["General", 50]],
+    ["geometry", ["Geometry", 60]],
+    ["guts", ["Guts", 70]],
+    ["power", ["Power", 80]],
+    ["team", ["Team", 90]],
+]);
+
 export function emptyTestMetadata() {
     return {
         division: null,
@@ -213,4 +266,53 @@ export function hmmtRoundMetadata(label, order) {
 export function pumacSubjectMetadata(label, order) {
     if (!label) return {};
     return { format: label, formatOrder: order };
+}
+
+// Mandelbrot division: "N"/"R" (individual National/Regional) or "team" (Team
+// Play). Returns the full base + division fields; the round is a separate format.
+export function mandelbrotDivisionMetadata(token) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry("division", MANDELBROT_DIVISIONS.get(token)) ?? {}),
+    };
+}
+
+// BMT division (main/BMMT/BMMT Online) is the "which division" axis. Returns the
+// full base + division fields.
+export function bmtDivisionMetadata(token) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry("division", BMT_DIVISIONS.get(token?.toLowerCase())) ?? {}),
+    };
+}
+
+// BMT round/subject is the "which format" axis. Returns only format fields so it
+// can be spread alongside the division metadata.
+export function bmtFormatMetadata(token) {
+    return fromEntry("format", BMT_FORMATS.get(token?.toLowerCase())) ?? {};
+}
+
+// SMT division (ASMT/SM3/SMT) is the "which division" axis. Returns the full base
+// + division fields.
+export function smtDivisionMetadata(token) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry("division", SMT_DIVISIONS.get(token?.toLowerCase())) ?? {}),
+    };
+}
+
+// SMT round/subject is the "which format" axis. A "<subject>-tiebreaker" token
+// reuses its base subject's label/order with a " Tiebreaker" suffix and a +5
+// order bump. Returns only format fields.
+export function smtFormatMetadata(token) {
+    if (!token) return {};
+    const t = token.toLowerCase();
+    const isTiebreaker = t.endsWith("-tiebreaker");
+    const base = isTiebreaker ? t.slice(0, -"-tiebreaker".length) : t;
+    const entry = SMT_FORMATS.get(base);
+    if (!entry) return {};
+    const [label, order] = entry;
+    return isTiebreaker
+        ? { format: `${label} Tiebreaker`, formatOrder: order + 5 }
+        : { format: label, formatOrder: order };
 }
