@@ -1,7 +1,11 @@
 import { CleanupText } from './CleanupText.js';
 import { getAutoTags } from './autoTags.js';
 import { SOLUTIONS_USERS } from '../contest_id.js';
-import { classifySolutions } from './db.js';
+import {
+    classifySolutions,
+    resolveWikiRedirectLinks,
+    normalizeProblemLinks,
+} from './db.js';
 
 /**
  * Pre-processing pipeline. Operates on all problems in the DB (idempotent).
@@ -25,8 +29,23 @@ export async function runPreprocess(db) {
     await detectOfficialSolutions(db);
     await reclassifySolutions(db);
     await crossCheckAnswers(db);
+    await normalizeDuplicateLinks(db);
 
     console.log("\nPre-processing complete.");
+}
+
+// Resolves any pending wiki redirects whose target is now imported and collapses
+// duplicate-link chains so every alias points directly at its ultimate canonical.
+// Both are idempotent and require no network.
+function normalizeDuplicateLinks(db) {
+    console.log(
+        "Step 7: Resolving wiki redirects + normalizing duplicate links...",
+    );
+    const r = resolveWikiRedirectLinks(db);
+    const n = normalizeProblemLinks(db);
+    console.log(
+        `  Resolved ${r.linked} redirect link(s) (${r.unresolved} unresolved); repointed ${n.repointed} link(s) to their ultimate canonical.`,
+    );
 }
 
 // Re-derives MCQ choices from the statement when missing, and re-cleans the

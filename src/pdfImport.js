@@ -27,6 +27,9 @@ import {
     upsertTest,
     upsertPdfProblem,
     upsertSolutionCandidate,
+    resolveTestId,
+    resolveProblemId,
+    upsertProblemLink,
 } from "./db.js";
 import {
     mathcountsTestMetadata,
@@ -357,6 +360,33 @@ function titleCase(word) {
     return word ? word[0].toUpperCase() + word.slice(1) : word;
 }
 
+// Confidence policy for auto-linking duplicate groups (matches the plan):
+//   similarity >= 1.0            -> auto-accept
+//   0.85 <= similarity < 1.0     -> needs_review (a human accepts/rejects)
+//   similarity < 0.85            -> ignored (no link)
+const DUP_ACCEPT_THRESHOLD = 1.0;
+const DUP_REVIEW_THRESHOLD = 0.85;
+
+function linkStatusForSimilarity(similarity) {
+    const sim = Number(similarity);
+    if (!Number.isFinite(sim)) return "needs_review"; // unknown score -> be safe
+    if (sim >= DUP_ACCEPT_THRESHOLD) return "accepted";
+    if (sim >= DUP_REVIEW_THRESHOLD) return "needs_review";
+    return null; // below review threshold: skip
+}
+
+// Trust rank of a problem row's resolved statement source (verified > pdf > wiki
+// > aops), used to pick the canonical member of a duplicate group — the one whose
+// content becomes the shared source of truth.
+function statementSourceRank(row) {
+    if (!row) return -1;
+    if (row.verified) return 4;
+    if (row.pdf_statement != null) return 3;
+    if (row.wiki_statement != null) return 2;
+    if (row.aops_statement != null) return 1;
+    return 0;
+}
+
 function isDir(p) {
     return existsSync(p) && statSync(p).isDirectory();
 }
@@ -568,6 +598,139 @@ export function importPdfProblems(db, outDir, options = {}) {
                 console.log(
                     `  ${meta.name}: ${count} problems, ${solCount} solutions`,
                 );
+            }
+        }
+    })();
+
+    return summary;
+}
+
+// Resolve a comp-OCR duplicates.json member { test, problem } to an existing
+// problems.id. Returns null (no error) when the member's series/test/problem row
+// hasn't been imported yet — dup linking is additive and can run after imports.
+function resolveDuplicateMember(db, cfg, seriesIdCache, member) {
+    const meta = cfg.parseTest(member.test);
+    if (meta == null) return null;
+    const seriesName = meta.seriesName ?? cfg.seriesName;
+    let seriesId = seriesIdCache.get(seriesName);
+    if (seriesId === undefined) {
+        const row = db
+            .query(`SELECT id FROM series WHERE name = ?`)
+            .get(seriesName);
+        seriesId = row ? row.id : null;
+        seriesIdCache.set(seriesName, seriesId);
+    }
+    if (seriesId == null) return null;
+    const testId = resolveTestId(db, {
+        aopsCategoryId: null,
+        section: meta.section ?? -1,
+        seriesId,
+        year: meta.year ?? null,
+        name: meta.name,
+    });
+    if (testId == null) return null;
+    const n = ocrKeyToN(member.problem, "duplicate", member.test);
+    if (n === null) return null;
+    return resolveProblemId(db, { testId, n });
+}
+
+// Ingests comp-OCR `duplicates.json` files (out/<series>/duplicates.json) into
+// problem_links. Each group's members are the same real-world problem appearing
+// under different tests (e.g. Mandelbrot N/R versions, PUMAC A/B rounds). One
+// member is chosen canonical (best statement source, then lowest test_id/n) and
+// every other resolved member is linked to it. The group `similarity` drives the
+// confidence policy (exact -> accepted, near -> needs_review, low -> skipped).
+//
+// Additive and idempotent: reuses upsertProblemLink, which preserves any manual
+// curation. `options.series` narrows which OCR series folders are processed.
+export function importDuplicates(db, outDir, options = {}) {
+    if (!isDir(outDir)) {
+        throw new Error(`OCR output dir not found: ${outDir}`);
+    }
+    const seriesFilter =
+        options.series?.length > 0 ? new Set(options.series) : null;
+
+    const summary = {
+        files: 0,
+        groups: 0,
+        linked: 0,
+        needsReview: 0,
+        skipped: 0,
+        unresolved: 0,
+    };
+
+    db.transaction(() => {
+        for (const seriesFolder of readdirSync(outDir)) {
+            if (seriesFolder.startsWith("_")) continue;
+            if (seriesFilter && !seriesFilter.has(seriesFolder)) continue;
+            const cfg = SERIES_CONFIG[seriesFolder];
+            const seriesPath = join(outDir, seriesFolder);
+            if (!cfg || !isDir(seriesPath)) continue;
+
+            const dupPath = join(seriesPath, "duplicates.json");
+            const doc = readJson(dupPath);
+            if (!doc || !Array.isArray(doc.groups)) continue;
+            summary.files++;
+
+            const seriesIdCache = new Map(); // seriesName -> id | null
+            const rankStmt = db.query(
+                `SELECT id, test_id, n, verified, pdf_statement, wiki_statement, aops_statement
+                 FROM problems WHERE id = ?`,
+            );
+
+            for (const group of doc.groups) {
+                summary.groups++;
+                const status = linkStatusForSimilarity(group.similarity);
+                if (status === null) {
+                    summary.skipped++;
+                    continue;
+                }
+
+                // Resolve every member to a problem row (skipping the unresolved).
+                const resolved = [];
+                for (const member of group.members ?? []) {
+                    const pid = resolveDuplicateMember(
+                        db,
+                        cfg,
+                        seriesIdCache,
+                        member,
+                    );
+                    if (pid == null) {
+                        summary.unresolved++;
+                        continue;
+                    }
+                    resolved.push(rankStmt.get(pid));
+                }
+                if (resolved.length < 2) {
+                    // Nothing to link (0/1 members present in the DB).
+                    if (resolved.length <= 1 && (group.members?.length ?? 0) >= 2)
+                        summary.skipped++;
+                    continue;
+                }
+
+                // Canonical = best statement source, then lowest (test_id, n).
+                const canonical = resolved.slice().sort((a, b) => {
+                    const dr = statementSourceRank(b) - statementSourceRank(a);
+                    if (dr !== 0) return dr;
+                    if (a.test_id !== b.test_id) return a.test_id - b.test_id;
+                    return a.n - b.n;
+                })[0];
+
+                for (const row of resolved) {
+                    if (row.id === canonical.id) continue;
+                    const outcome = upsertProblemLink(db, {
+                        problemId: row.id,
+                        canonicalProblemId: canonical.id,
+                        source: "pdf_duplicates",
+                        similarity: group.similarity ?? null,
+                        scope: group.scope ?? null,
+                        status,
+                    });
+                    if (outcome === "inserted" || outcome === "updated") {
+                        if (status === "accepted") summary.linked++;
+                        else summary.needsReview++;
+                    }
+                }
             }
         }
     })();

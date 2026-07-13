@@ -25,6 +25,11 @@ import { SOLUTIONS_USERS } from "../contest_id.js";
 //   whose (n, section) no longer appears in the scrape (e.g. when a test's
 //   section structure changes). Rows with pdf_statement or verified are kept.
 //
+//   problem_links   Duplicate-problem links (alias -> canonical). Additive:
+//                   'auto' rows are refreshed by importers, but rows with
+//                   status_source='manual' (a human's accept/reject/override)
+//                   are never touched. Links are never orphan-deleted.
+//
 //   Sectioned tests: a scraped category with N sections ("Day 1"/"Day 2", …)
 //   is materialized as N separate test rows, one per section, each named
 //   "<test name> <section name>" with tests.section = the section index and
@@ -183,6 +188,47 @@ CREATE TABLE IF NOT EXISTS problem_history (
   changed_at    TEXT DEFAULT (datetime('now'))
 );
 
+-- Duplicate-problem links: the same real-world problem appearing under two tests
+-- (e.g. AMC 10A #18 == AMC 12A #12, Mandelbrot N/R versions, PUMAC A/B rounds).
+-- Each ALIAS problem gets one row pointing at its CANONICAL representative; a
+-- canonical/standalone problem has no row here. Mirrors the solutions dedup idiom
+-- (self-reference + provenance + review status). Only 'accepted' links merge into
+-- production / the cloud; 'needs_review' waits for a human. Manual review state
+-- (status_source='manual') is preserved across re-imports; 'auto' rows refresh.
+CREATE TABLE IF NOT EXISTS problem_links (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  problem_id           INTEGER NOT NULL UNIQUE REFERENCES problems(id),  -- the alias member
+  canonical_problem_id INTEGER NOT NULL REFERENCES problems(id),         -- its representative
+  source        TEXT NOT NULL CHECK (source IN ('pdf_duplicates', 'wiki_redirect', 'manual')),
+  similarity    REAL,
+  scope         TEXT,                                                    -- e.g. year "2021"
+  status        TEXT NOT NULL DEFAULT 'candidate'
+                  CHECK (status IN ('candidate', 'accepted', 'needs_review', 'rejected')),
+  status_source TEXT NOT NULL DEFAULT 'auto'
+                  CHECK (status_source IN ('auto', 'manual')),
+  notes         TEXT,
+  created_at    TEXT DEFAULT (datetime('now')),
+  updated_at    TEXT DEFAULT (datetime('now')),
+  CHECK (problem_id <> canonical_problem_id)
+);
+CREATE INDEX IF NOT EXISTS idx_problem_links_canonical
+  ON problem_links (canonical_problem_id);
+
+-- Captured AoPS-wiki redirects (a variant problem page that #REDIRECTs to the
+-- canonical problem page, e.g. "2021 AMC 12A Problems/Problem 12" ->
+-- "2021 AMC 10A Problems/Problem 18"). Capture is decoupled from resolution: the
+-- redirecting problem is recorded here with the raw target page title, and
+-- resolveWikiRedirectLinks() later turns it into an accepted problem_links row by
+-- matching problems.wiki_page = target_page. This lets a redirect resolve even
+-- when its target contest is imported in a separate run (re-run resolution in
+-- preprocess, no network needed).
+CREATE TABLE IF NOT EXISTS wiki_redirects (
+  problem_id  INTEGER NOT NULL UNIQUE REFERENCES problems(id),  -- the redirecting (alias) problem
+  target_page TEXT NOT NULL,                                    -- canonical wiki page title
+  scope       TEXT,
+  updated_at  TEXT DEFAULT (datetime('now'))
+);
+
 -- Clean, standalone export table. Purely derived from problems + solutions via
 -- buildProductionProblems(); rebuilt on demand, holds no manual state of its own.
 -- No aops_*/pdf_* source columns. Array-typed columns (Postgres text[]) are
@@ -193,6 +239,14 @@ CREATE TABLE IF NOT EXISTS production_problems (
   -- relational link back to the source test
   test_id            INTEGER REFERENCES tests(id) ON DELETE CASCADE,
   n                  INTEGER NOT NULL,        -- problem number within the test
+
+  -- Duplicate pointer: when this row is an ALIAS of another problem (same
+  -- real-world problem under a different test), these hold the canonical's
+  -- (test_id, n); NULL when this row is its own canonical. Export turns them into
+  -- the cloud's canonical_sync_key so rating/progress are shared. Content columns
+  -- below are already the canonical's (propagated in buildProductionProblems).
+  canonical_test_id  INTEGER REFERENCES tests(id) ON DELETE CASCADE,
+  canonical_n        INTEGER,
   aops_id            INTEGER,
 
   -- content
@@ -991,6 +1045,7 @@ FROM tests_old;
 
     const needsRecreate = prodCols.length > 0 && (
         !prodCols.includes("test_id") ||
+        !prodCols.includes("canonical_test_id") ||
         !prodCols.includes("aops_id") ||
         prodCols.includes("answer_value") ||
         prodCols.includes("acgn") ||
@@ -1074,6 +1129,113 @@ export function resolveTestId(db, { aopsCategoryId, section = -1, seriesId, year
         )
         .get(seriesId, name, year ?? null);
     return byNatural ? byNatural.id : null;
+}
+
+// Resolve a problem row id by its natural key (test_id, n, section). Returns null
+// if no such problem exists yet (e.g. a duplicates.json member whose test hasn't
+// been imported). Problems always store section = -1 (sections live on the test
+// row), so callers normally pass the default.
+export function resolveProblemId(db, { testId, n, section = -1 }) {
+    const row = db
+        .query(`SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = ?`)
+        .get(testId, n, section);
+    return row ? row.id : null;
+}
+
+// Upsert a duplicate-problem link (alias problem_id -> canonical_problem_id).
+// Additive and merge-contract-aware: a link a human has curated
+// (status_source='manual') is never overwritten by an automatic importer; a
+// manual caller (statusSource='manual') always wins. Self-links are ignored.
+// Returns 'inserted' | 'updated' | 'skipped' | 'preserved'.
+export function upsertProblemLink(
+    db,
+    {
+        problemId,
+        canonicalProblemId,
+        source,
+        similarity = null,
+        scope = null,
+        status = "candidate",
+        statusSource = "auto",
+        notes = null,
+    },
+) {
+    if (problemId == null || canonicalProblemId == null) return "skipped";
+    if (problemId === canonicalProblemId) return "skipped";
+
+    const existing = db
+        .query(
+            `SELECT id, status_source FROM problem_links WHERE problem_id = ?`,
+        )
+        .get(problemId);
+
+    // Never let an automatic importer clobber a human's curated link.
+    if (existing && existing.status_source === "manual" && statusSource !== "manual") {
+        return "preserved";
+    }
+
+    if (existing) {
+        db.run(
+            `UPDATE problem_links SET
+                canonical_problem_id = ?,
+                source        = ?,
+                similarity    = ?,
+                scope         = ?,
+                status        = ?,
+                status_source = ?,
+                notes         = COALESCE(?, notes),
+                updated_at    = datetime('now')
+             WHERE id = ?`,
+            [
+                canonicalProblemId,
+                source,
+                similarity,
+                scope,
+                status,
+                statusSource,
+                notes,
+                existing.id,
+            ],
+        );
+        return "updated";
+    }
+
+    db.run(
+        `INSERT INTO problem_links (
+            problem_id, canonical_problem_id, source, similarity, scope,
+            status, status_source, notes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            problemId,
+            canonicalProblemId,
+            source,
+            similarity,
+            scope,
+            status,
+            statusSource,
+            notes,
+        ],
+    );
+    return "inserted";
+}
+
+// Resolve a problem's canonical id by following ACCEPTED links to the ultimate
+// representative (transitive; guarded against cycles). A problem with no accepted
+// alias link is its own canonical, so this returns the input id. Used by build.
+export function resolveCanonicalId(db, problemId) {
+    const stmt = db.query(
+        `SELECT canonical_problem_id FROM problem_links
+         WHERE problem_id = ? AND status = 'accepted'`,
+    );
+    const seen = new Set();
+    let current = problemId;
+    while (!seen.has(current)) {
+        seen.add(current);
+        const row = stmt.get(current);
+        if (!row || row.canonical_problem_id == null) break;
+        current = row.canonical_problem_id;
+    }
+    return current;
 }
 
 const TEST_METADATA_KEYS = [
@@ -1722,9 +1884,97 @@ export function upsertWikiResults(db, raw) {
                     { ...problem, section: -1, is_computational: isComputational },
                     testId,
                 );
+                // Capture a redirect placement (a variant page that redirects to
+                // the canonical problem page) for later link resolution.
+                if (problem.redirectTarget) {
+                    const row = db
+                        .query(
+                            `SELECT id FROM problems WHERE test_id = ? AND n = ? AND section = -1`,
+                        )
+                        .get(testId, problem.n);
+                    if (row) {
+                        db.run(
+                            `INSERT INTO wiki_redirects (problem_id, target_page, scope)
+                             VALUES (?, ?, ?)
+                             ON CONFLICT (problem_id) DO UPDATE SET
+                                target_page = excluded.target_page,
+                                scope       = excluded.scope,
+                                updated_at  = datetime('now')`,
+                            [row.id, problem.redirectTarget, test.year ?? null],
+                        );
+                    }
+                }
+            }
+        }
+
+        // Resolve any redirects whose target is now present (this run or a prior
+        // one). Unresolved ones wait for their target contest to be imported.
+        resolveWikiRedirectLinks(db);
+    })();
+}
+
+// Turns captured wiki_redirects rows into accepted problem_links by matching the
+// target wiki page title to an imported problem (problems.wiki_page). Idempotent
+// and re-runnable with no network (also invoked from preprocess), so a redirect
+// resolves once its target contest exists. Returns { linked, unresolved }.
+export function resolveWikiRedirectLinks(db) {
+    const rows = db
+        .query(`SELECT problem_id, target_page, scope FROM wiki_redirects`)
+        .all();
+    let linked = 0;
+    let unresolved = 0;
+    for (const r of rows) {
+        const target = db
+            .query(`SELECT id FROM problems WHERE wiki_page = ? LIMIT 1`)
+            .get(r.target_page);
+        if (!target || target.id === r.problem_id) {
+            if (!target) unresolved++;
+            continue;
+        }
+        const outcome = upsertProblemLink(db, {
+            problemId: r.problem_id,
+            canonicalProblemId: target.id,
+            source: "wiki_redirect",
+            similarity: 1.0,
+            scope: r.scope != null ? String(r.scope) : null,
+            status: "accepted",
+        });
+        if (outcome === "inserted" || outcome === "updated") linked++;
+    }
+    return { linked, unresolved };
+}
+
+// Collapses transitive accepted-link chains so every alias points DIRECTLY at the
+// ultimate canonical (e.g. A->B and B->C becomes A->C). Keeps a canonical from
+// also being someone's alias, which keeps build/export a single hop. Human
+// (status_source='manual') links are left as authored. Returns { repointed }.
+export function normalizeProblemLinks(db) {
+    const links = db
+        .query(
+            `SELECT problem_id, canonical_problem_id, status_source
+             FROM problem_links WHERE status = 'accepted'`,
+        )
+        .all();
+    let repointed = 0;
+    db.transaction(() => {
+        for (const l of links) {
+            if (l.status_source === "manual") continue;
+            const ultimate = resolveCanonicalId(db, l.canonical_problem_id);
+            if (
+                ultimate !== l.canonical_problem_id &&
+                ultimate !== l.problem_id
+            ) {
+                db.run(
+                    `UPDATE problem_links
+                     SET canonical_problem_id = ?, updated_at = datetime('now')
+                     WHERE problem_id = ?`,
+                    [ultimate, l.problem_id],
+                );
+                repointed++;
             }
         }
     })();
+    return { repointed };
 }
 
 /**
@@ -1762,7 +2012,12 @@ export function toPostgresTextArray(value) {
 
 // Rebuilds the denormalized production_problems table from the curated problems
 // + solutions data. The table is purely derived, so we wipe and rebuild it in a
-// single transaction (no stale rows, no dedup logic). Returns the row count.
+// single transaction. Duplicate problems (accepted problem_links) are handled
+// here: an ALIAS row keeps its own placement identity (test_id, n) but its
+// content is PROPAGATED from its canonical, and canonical_test_id/canonical_n
+// point at the canonical placement (so export can emit the canonical_sync_key
+// that shares rating/progress in the cloud). A canonical/standalone row uses its
+// own content and leaves canonical_test_id/canonical_n NULL. Returns the count.
 export function buildProductionProblems(db) {
     let count = 0;
     db.transaction(() => {
@@ -1793,17 +2048,13 @@ export function buildProductionProblems(db) {
                       quality_score DESC,
                       id`,
         );
-        const insert = db.query(`
-            INSERT INTO production_problems (
-                test_id, n, aops_id,
-                statement, choices, answer_index, official_solutions,
-                topic, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
-        `);
 
+        // Pass 1: compute each problem's derived content bundle + placement, keyed
+        // by problem id, so an alias can borrow its canonical's bundle in pass 2.
+        const contentById = new Map();
+        const placeById = new Map();
         for (const r of rows) {
             const sols = solStmt.all(r.id).map((x) => x.content);
-            const officialSolutions = sols.length ? JSON.stringify(sols) : null;
             const hasSourceChoices = r.choices != null;
             const hasAnswerValue = r.answer_value != null;
             const productionChoices = hasSourceChoices
@@ -1816,21 +2067,56 @@ export function buildProductionProblems(db) {
                 : hasAnswerValue
                   ? 0
                   : -1;
+            contentById.set(r.id, {
+                statement: r.statement,
+                choices: toPostgresTextArray(productionChoices),
+                answer_index: productionAnswerIndex,
+                official_solutions: sols.length ? JSON.stringify(sols) : null,
+                topic: r.acgn,
+                tags: toPostgresTextArray(r.tags),
+                is_computational: r.is_computational,
+                difficulty: r.difficulty,
+                quality: r.quality,
+                verified: r.verified,
+                notes: r.notes,
+            });
+            placeById.set(r.id, { test_id: r.test_id, n: r.n });
+        }
+
+        const insert = db.query(`
+            INSERT INTO production_problems (
+                test_id, n, canonical_test_id, canonical_n, aops_id,
+                statement, choices, answer_index, official_solutions,
+                topic, tags, is_computational, difficulty, quality, verified, notes
+            ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+        `);
+
+        // Pass 2: resolve canonical, propagate its content to aliases, insert.
+        for (const r of rows) {
+            const canonicalId = resolveCanonicalId(db, r.id);
+            const isAlias =
+                canonicalId !== r.id && contentById.has(canonicalId);
+            const bundle = isAlias
+                ? contentById.get(canonicalId)
+                : contentById.get(r.id);
+            const canonicalPlace = isAlias ? placeById.get(canonicalId) : null;
             insert.run(
                 r.test_id,
                 r.n,
+                canonicalPlace ? canonicalPlace.test_id : null,
+                canonicalPlace ? canonicalPlace.n : null,
                 r.aops_id,
-                r.statement,
-                toPostgresTextArray(productionChoices),
-                productionAnswerIndex,
-                officialSolutions,
-                r.acgn,
-                toPostgresTextArray(r.tags),
-                r.is_computational,
-                r.difficulty,
-                r.quality,
-                r.verified,
-                r.notes,
+                bundle.statement,
+                bundle.choices,
+                bundle.answer_index,
+                bundle.official_solutions,
+                bundle.topic,
+                bundle.tags,
+                bundle.is_computational,
+                bundle.difficulty,
+                bundle.quality,
+                bundle.verified,
+                bundle.notes,
             );
             count++;
         }

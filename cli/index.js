@@ -263,6 +263,34 @@ async function main() {
             break;
         }
 
+        case "link-duplicates": {
+            const args = process.argv.slice(3);
+            const flag = (name) => {
+                const hit = args.find((a) => a.startsWith(`--${name}=`));
+                return hit
+                    ? hit
+                          .slice(name.length + 3)
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean)
+                    : null;
+            };
+            const outDir =
+                args.find((a) => !a.startsWith("--")) ??
+                process.env.OCR_OUT_DIR ??
+                PDF_DATA_DIR;
+            const series = flag("series");
+
+            const { importDuplicates } = await import("../src/pdfImport.js");
+            const db = initDB(DB_PATH);
+            const s = importDuplicates(db, outDir, { series });
+            db.close();
+            console.log(
+                `Linked duplicates from ${outDir}: ${s.linked} accepted, ${s.needsReview} need review, ${s.skipped} skipped, ${s.unresolved} members unresolved (across ${s.groups} groups in ${s.files} duplicates.json files).`,
+            );
+            break;
+        }
+
         case "preprocess": {
             const db = initDB(DB_PATH);
             const { runPreprocess } = await import("../src/preprocess.js");
@@ -389,7 +417,7 @@ async function main() {
 
         default:
             console.log(
-                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], sync-export [file], seed-ratings-export [file] [--overwrite-seeds], init-db, clear-db",
+                "Available commands: scrape [--dump[=file]], wiki [--dump[=file]], import [file], import-pdf [dir] [--series=a,b] [--test=x,y] [--all], link-duplicates [dir] [--series=a,b], preprocess, build, export, export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts], sync-export [file], seed-ratings-export [file] [--overwrite-seeds], init-db, clear-db",
             );
             break;
     }

@@ -151,12 +151,32 @@ export class WikiSession {
         return { lead, sections };
     }
 
+    // Parses a `#REDIRECT [[Target]]` wikitext page, returning the normalized
+    // target page title (spaces not underscores, no |display or #anchor), or null
+    // if the wikitext is not a redirect. AoPS marks a shared problem (e.g. an
+    // AMC 12 problem that repeats an AMC 10 problem) with such a redirect.
+    static _parseRedirect(wikitext) {
+        const m = /^\s*#REDIRECT\s*\[\[\s*([^\]]+?)\s*\]\]/i.exec(wikitext ?? "");
+        if (!m) return null;
+        return m[1].split("|")[0].split("#")[0].replace(/_/g, " ").trim() || null;
+    }
+
     // Fetches and parses a single problem page into a makeProblem-shaped object.
     // `computational`/`choices` come from the contest type: `choices` true =>
     // MCQ (AMC), extract \textbf{(A)} options + a letter answer; false => numeric
     // (AIME), take the boxed value literally.
+    //
+    // Redirect handling: if `page` is a `#REDIRECT` to another problem page, we
+    // follow it to the canonical content (so this placement row is still
+    // populated) but keep this page's own number, and stamp `redirectTarget` on
+    // the returned problem so db.upsertWikiResults can record the duplicate link.
     async getProblemPage(page, { computational = true, choices = true } = {}) {
-        const full = await this.parse(page, { wikitext: true });
+        let full = await this.parse(page, { wikitext: true });
+        let redirectTarget = WikiSession._parseRedirect(full);
+        if (redirectTarget) {
+            // Follow one hop to the canonical page for the actual content.
+            full = await this.parse(redirectTarget, { wikitext: true });
+        }
         const { lead, sections } = WikiSession._splitSections(full);
 
         // Statement: an explicit "Problem" section if present, else the lead.
@@ -167,11 +187,13 @@ export class WikiSession {
             (problemSection ? problemSection.body : lead).trim(),
         );
 
-        // Fetch rendered HTML only when we need asy image URLs.
+        // Fetch rendered HTML only when we need asy image URLs. Render the
+        // content page (the redirect target when this page is a redirect).
+        const contentPage = redirectTarget ?? page;
         let rendered = null;
         if (/<asy\b/i.test(statementSrc)) {
             try {
-                rendered = await this.parse(page);
+                rendered = await this.parse(contentPage);
             } catch {
                 rendered = null;
             }
@@ -224,7 +246,7 @@ export class WikiSession {
         const numMatch = page.match(/Problem\s+(\d+)/i);
         const n = numMatch ? Number(numMatch[1]) - 1 : 0;
 
-        return makeProblem({
+        const problem = makeProblem({
             statement,
             n,
             choices: choiceList,
@@ -233,6 +255,9 @@ export class WikiSession {
             solutions,
             page,
         });
+        // Non-null only for a redirect placement; consumed by upsertWikiResults.
+        problem.redirectTarget = redirectTarget;
+        return problem;
     }
 
     // Converts a MediaWiki "# item" numbered list into "1. item\n2. item…" so the

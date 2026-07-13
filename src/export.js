@@ -338,6 +338,7 @@ const STAGING_TABLES = {
         columns: [
             "sync_key",
             "test_sync_key",
+            "canonical_sync_key",
             "n",
             "aops_id",
             "statement",
@@ -406,7 +407,8 @@ export async function exportStagingSQL(
     const allProblems = db
         .query(
             `
-        SELECT pp.test_id, pp.n, pp.aops_id, pp.statement, pp.choices,
+        SELECT pp.test_id, pp.n, pp.canonical_test_id, pp.canonical_n,
+               pp.aops_id, pp.statement, pp.choices,
                pp.answer_index, pp.official_solutions, pp.topic, pp.tags,
                pp.is_computational, pp.difficulty, pp.quality, pp.verified,
                pp.notes
@@ -427,6 +429,20 @@ export async function exportStagingSQL(
         }
         p.test_sync_key = testKey;
         p.sync_key = problemSyncKey(testKey, p.n);
+        // Duplicate pointer -> the canonical problem's sync_key. NULL when this
+        // row is its own canonical, or when the canonical's test was dropped (no
+        // series) so the cloud can't resolve it — the cloud treats a NULL/self
+        // canonical_sync_key as "not an alias". Byte-identical formula.
+        p.canonical_sync_key = null;
+        if (p.canonical_test_id != null) {
+            const canonicalTestKey = testKeyById.get(p.canonical_test_id);
+            if (canonicalTestKey != null) {
+                p.canonical_sync_key = problemSyncKey(
+                    canonicalTestKey,
+                    p.canonical_n,
+                );
+            }
+        }
         problems.push(p);
     }
 
@@ -511,10 +527,15 @@ export async function exportRatingSeedsSQL(
     }
 
     const problems = db
-        .query(`SELECT test_id, n FROM production_problems ORDER BY test_id, n`)
+        .query(
+            `SELECT test_id, n, canonical_test_id FROM production_problems ORDER BY test_id, n`,
+        )
         .all();
 
-    // Group problems by test to get each test's own min_n/max_n.
+    // Group problems by test to get each test's own min_n/max_n. Alias rows
+    // (canonical_test_id set) still count toward the test's span so the
+    // difficulty band spreads correctly, but they are NOT seeded — their rating
+    // is shared from the canonical (via problems.canonical_id in the cloud).
     const byTest = new Map();
     for (const p of problems) {
         let g = byTest.get(p.test_id);
@@ -522,7 +543,7 @@ export async function exportRatingSeedsSQL(
             g = { ns: [], minN: Infinity, maxN: -Infinity };
             byTest.set(p.test_id, g);
         }
-        g.ns.push(p.n);
+        if (p.canonical_test_id == null) g.ns.push(p.n);
         if (p.n < g.minN) g.minN = p.n;
         if (p.n > g.maxN) g.maxN = p.n;
     }
