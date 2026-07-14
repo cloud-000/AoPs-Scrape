@@ -231,7 +231,7 @@ Heuristically maps a category/test name to a contest type from `TYPES`.
 | `name` | string | The category name (e.g. `"2023 AMC 10A"`) |
 | `returnNull` | boolean | If true, returns `null` instead of `TYPES.UNKNOWN` when no match is found |
 
-**Output:** A `TYPES` entry object `{ name, computational, choices }`, or `null` if `returnNull` is true and nothing matched.
+**Output:** A `TYPES` entry object `{ name, computational, choices, answerKind }`, or `null` if `returnNull` is true and nothing matched. `answerKind` (`"mcq" | "numeric" | "proof" | null`) is the format prior a test seeds its resolve pass from (see `_finalizeComputationalAnswers`).
 
 ---
 
@@ -294,6 +294,7 @@ Fetches and parses a single test category into a structured test object.
   formatOrder?: number | null,    // stable sibling format order
   type: string,             // e.g. "AMC 10", "AIME", "AMO"
   computational: boolean,
+  answerKind: string | null, // "mcq" | "numeric" | "proof" | "mixed" | null — decided from the problems' own evidence
   sections: string[],       // empty array if no sections
   problems: Problem[] | Problem[][],  // flat if no sections; nested array if sectioned
   count: number,            // total number of problems scraped
@@ -317,7 +318,7 @@ Fetches and parses a single test category into a structured test object.
 }
 ```
 
-Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter.
+Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`) and may be any string (LaTeX, fraction, word). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter. Whether a given problem is treated as MCQ vs. numeric is decided per-test by the resolve pass (`_finalizeComputationalAnswers`), not by the contest name alone — see the answer-resolution note under `searchTopicForAnswer`. A tie/off-by-one MCQ-vs-numeric split leaves the test `answerKind: "mixed"` with each problem keeping its own kind.
 
 Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat. When collapsing, `_normalizeSections` checks the lone header via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`) and retained as normalized `division` or `format` metadata; noise headers (problem counts, time limits, …) are dropped. Multi-section AIME I/II and `Day N` labels are normalized when their separate test rows are stored.
 
@@ -327,7 +328,7 @@ Name normalization: the category name is passed through `CleanupText.normalizeCo
 
 Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topicId === 0`.
 
-Answer keys: after the problem list is built (and only for computational tests), `getTest` always calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). If found, it is parsed with `CleanupText.parseAnswerKey(post_canonical, name)` and applied via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`); when a post packs multiple `[hide=label]` keys (e.g. one per subtest), the block whose label best matches `name` is chosen. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
+Answer keys: after the problem list is built **and the resolve pass has run** (and only for computational tests), `getTest` always calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). If found, it is parsed with `CleanupText.parseAnswerKey(post_canonical, name)` and applied via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`); when a post packs multiple `[hide=label]` keys (e.g. one per subtest), the block whose label best matches `name` is chosen. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
 
 ---
 
@@ -430,14 +431,16 @@ Fetches a problem topic's discussion thread and extracts the answer from reply p
 | `searchManyProblems` | boolean | If true, scans `[hide=S N]…[/hide]` tags for multiple numbered answers (used when a single post contains multiple problems) |
 
 **Output:**
-- If `searchManyProblems` is false: `string | null` — the raw `\boxed{…}` content of the first matching reply, or `null` if none found.
-- If `searchManyProblems` is true: `Record<string, string>` — map of problem number string → boxed answer string (e.g., `{ "1": "42", "2": "7" }`).
+- If `searchManyProblems` is false: `string | null` — the selected `\boxed{…}` content (resolved with a `numeric` validator, i.e. any box accepted), or `null` if none found.
+- If `searchManyProblems` is true: `Record<string, string>` — map of problem number string → selected boxed answer.
 - Returns `null` (and sets `_permissionDenied = true`) if the API returns `E_NO_PERMISSION`; subsequent calls within the same `getTest` are short-circuited.
 - Returns empty results immediately for a falsy `id` (e.g. `0`), since packed-post problems have no backing discussion topic.
 
 **Side effect:** caches `topic.category_id` from the response into `this._currentForumCategoryId` (used by `_fetchStickyAnswerKey`).
 
-`searchTopicForAnswer` is a thin wrapper over `searchTopicForSolutions(id, searchManyProblems, isOly=false)`, which returns `{ answer, answers, solutions, posts }` — `answer` (single boxed string), `answers` (number→string map for packed posts), `solutions` (classified solution posts), and `posts` (all discussion posts, populated only when `isOly` is true). `searchTopicForAnswer` returns just `answer` or `answers`.
+`searchTopicForAnswer` is a thin wrapper over `searchTopicForSolutions(id, searchManyProblems, isOly=false)`, which returns **raw candidate material**, not a resolved answer: `{ answerPosts, answerPostsByProblem, solutions, posts }` — `answerPosts` (reply post contents in order, for single-problem selection), `answerPostsByProblem` (number → array of `[hide=S N]` block contents, for packed multi-problem posts), `solutions` (classified solution posts), and `posts` (all discussion posts, populated only when `isOly` is true). The actual `\boxed{}` pick is deferred to the caller: `getTest`'s resolve pass (`_finalizeComputationalAnswers` → `_resolveProblemAnswer`) runs `CleanupText.selectBoxedAnswer` with the test's decided answer kind and each problem's choices, so a post that boxes intermediate steps can't force the first box to win. `searchTopicForAnswer` itself resolves with a `numeric` validator since it has no test context.
+
+**Answer resolution (`_finalizeComputationalAnswers` / `_resolveProblemAnswer`):** after all problems in a computational test are built (each carries stashed raw `_answerPosts`), `getTest` decides the test's `answerKind` from the problems' own evidence: it counts how many have extractable MCQ choices (`extractChoices(statement).length >= 3`) versus not, and `CleanupText.decideTestKind` forces every problem to the majority kind when the counts differ by ≥2, or leaves the test **mixed** (each problem keeps its own detected kind) on a tie/off-by-one. Then each problem is resolved: MCQ extracts choices, strips them from the statement, and picks a choice-valid box (`selectBoxedAnswer` + `choiceIndexOfAnswer`, so `answerValue` is a letter and `answerIndex` the option); numeric takes the selected box verbatim (any string). The contest-name type (`inferType`) is only a prior — it decides proof-vs-computational and seeds the non-MCQ kind, but the problems vote on MCQ-vs-not.
 
 ---
 
@@ -474,8 +477,10 @@ Applies a parsed answer map (from `_extractInCategoryAnswerKey` or `_fetchSticky
 | `answerMap` | `Record<string, string>` | Map from 1-based problem number to raw answer |
 | `type` | `TYPES` entry | Used to determine MCQ vs. numeric behavior |
 
+Runs **after** the resolve pass, so it overrides the `\boxed{}`-derived answers where appropriate.
+
 **Behavior:**
-- **MCQ** (`type.choices`): answer key is authoritative — sets `answerValue` and re-resolves the `answerIndex`, overriding any `\boxed{}` result from the discussion thread.
+- **MCQ** (branches per-problem on `problem.choices`, so a mixed test is handled correctly): answer key is authoritative — re-resolves the `answerIndex` via `CleanupText.choiceIndexOfAnswer` (normalized letter/value match) and sets `answerValue` to the option letter, overriding any `\boxed{}` result.
 - **Numeric** (AIME, COMP, etc.): only fills in the answer when `answerValue` is currently `null` (never overrides a `\boxed{}` answer); when it does, it sets `answerValue` via `_setNumericAnswer`.
 - Problems with no entry in `answerMap` are untouched.
 - Works on both flat and section-nested `problems` arrays; uses a running counter (not `problem.n`) for 1-based numbering across sections.
@@ -484,7 +489,7 @@ Applies a parsed answer map (from `_extractInCategoryAnswerKey` or `_fetchSticky
 
 ### `_setNumericAnswer(problem, rawAnswer)`
 
-Writes a numeric (non-MCQ computational) answer onto a problem: sets `answerValue = rawAnswer ?? null`, leaving `choices = null` and `answerIndex = -1`. Used by `_buildProblem`, `_handleMultiProblem`, and `_applyForumAnswerKey` so every numeric path produces an identical representation.
+Writes a numeric (non-MCQ computational) answer onto a problem: sets `answerValue = rawAnswer ?? null`, leaving `choices = null` and `answerIndex = -1`. Used by `_resolveProblemAnswer` and `_applyForumAnswerKey` so every numeric path produces an identical representation.
 
 ---
 

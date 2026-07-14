@@ -221,25 +221,33 @@ export class WikiSession {
             }))
             .filter((s) => s.content.length > 0);
 
-        // Answer: scan solutions for the first \boxed{...}.
+        // Answer: pick the most-trustworthy \boxed{...} across all solution
+        // sections. For MCQ, only a box matching a choice survives; otherwise a
+        // solution that boxes intermediate steps (or an early wrong box) could
+        // win over the real answer. Non-MCQ takes the value verbatim.
         let answerValue = null;
         let answerIndex = -1;
-        for (const sol of solutions) {
-            const boxed = CleanupText.getBoxed(sol.content);
-            if (!boxed) continue;
-            if (choiceList) {
-                const parsed = CleanupText.parseMCQAns(boxed);
-                if (parsed?.type === "letter") {
-                    answerValue = parsed.value;
-                    answerIndex = MCQ_LETTERS.indexOf(parsed.value);
-                } else if (parsed) {
-                    answerValue = parsed.value;
-                    answerIndex = choiceList.indexOf(parsed.value);
+        if (computational) {
+            const raw = CleanupText.selectBoxedAnswer(
+                solutions.map((s) => s.content),
+                {
+                    answerKind: choiceList ? "mcq" : "numeric",
+                    choices: choiceList,
+                },
+            );
+            if (raw != null) {
+                if (choiceList) {
+                    const idx = CleanupText.choiceIndexOfAnswer(raw, choiceList);
+                    if (idx >= 0) {
+                        answerIndex = idx;
+                        answerValue = MCQ_LETTERS[idx]; // MCQ answer is a letter
+                    }
+                } else {
+                    answerValue = raw
+                        .replace(/\\textbf\{([^}]*)\}/g, "$1")
+                        .trim();
                 }
-            } else {
-                answerValue = boxed.replace(/\\textbf\{([^}]*)\}/g, "$1").trim();
             }
-            if (answerValue != null) break;
         }
 
         // Problem number from the page title ("…/Problem 23" -> n = 22).

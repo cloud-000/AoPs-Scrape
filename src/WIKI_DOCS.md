@@ -337,7 +337,7 @@ Problems are built with the shared `makeProblem()` factory (exported from
 | ------ | ------- |
 | `_get(params)` | Low-level cached GET; `params` doubles as the `ResponseCache` key. Retries on the Cloudflare interstitial / bare 403 (linear backoff) and JSON-parse failures (exponential). |
 | `parse(page, { section, wikitext })` | `action=parse`; returns `json.parse.wikitext["*"]` (raw) or `json.parse.text["*"]` (HTML). Throws an `Error` with `.code` (e.g. `missingtitle`) on API errors. |
-| `getProblemPage(page, { computational, choices })` | Fetches one `…/Problem k` subpage and returns a `makeProblem`-shaped object: cleaned statement, MCQ `choices`, `answerIndex`/`answerValue` (from the first `\boxed{…}` in a solution), and `solutions[]` from every `==Solution N==` section. **Redirects:** if `page` is a `#REDIRECT` to another problem page (AoPS marks a shared problem this way, e.g. an AMC 12 problem repeating an AMC 10 one), it follows one hop to the canonical page for the content but keeps this page's own number, and sets `redirectTarget` on the returned problem. `WikiSession._parseRedirect(wikitext)` extracts the normalized target title. |
+| `getProblemPage(page, { computational, choices })` | Fetches one `…/Problem k` subpage and returns a `makeProblem`-shaped object: cleaned statement, MCQ `choices`, `answerIndex`/`answerValue` (the best `\boxed{…}` across solutions, via `CleanupText.selectBoxedAnswer`), and `solutions[]` from every `==Solution N==` section. **Redirects:** if `page` is a `#REDIRECT` to another problem page (AoPS marks a shared problem this way, e.g. an AMC 12 problem repeating an AMC 10 one), it follows one hop to the canonical page for the content but keeps this page's own number, and sets `redirectTarget` on the returned problem. `WikiSession._parseRedirect(wikitext)` extracts the normalized target title. |
 | `getContest(titleBase, year)` | Assembles a flat `ScrapedTest` for one variant+year (`name = "${year} ${titleBase}"`, matching the forum category name so it merges by natural key). Structured registry variants populate nullable review metadata (AMC 10/12 A/B and AIME I/II; AMC 8 remains unclassified). Discovers N from the aggregate `… Problems` page and cross-checks every problem against the official `… Answer Key` page: the key is authoritative, so it fills in a missing boxed answer silently and **overwrites** a boxed answer that disagrees with it (logging a `⚠️` mismatch warning). Comparison is normalized via `WikiSession._normalizeAnswer` (upcase MCQ letters, collapse integer/whitespace formatting) so equal answers aren't flagged. |
 
 **Parsing pipeline (per page):**
@@ -348,8 +348,11 @@ Problems are built with the shared `makeProblem()` factory (exported from
    converts `<math>…</math>`/`<cmath>…</cmath>` to `$…$`/`$$…$$` so the forum-oriented
    `extractChoices` / `cleanChoices` / `getBoxed` apply unchanged.
 3. MCQ (`choices` true): `extractChoices` pulls `\textbf{(A)}…` options, `cleanChoices`
-   removes them from the statement; the answer is the first `\boxed{…}` across solutions,
-   run through `parseMCQAns`. Numeric (AIME): the boxed value is taken literally.
+   removes them from the statement; the answer is picked by `CleanupText.selectBoxedAnswer`
+   across **all** solution sections (not just the first box), which for MCQ keeps only a box
+   that is a valid choice and prefers a sole/last box over an intermediate one, then mapped to
+   an option via `choiceIndexOfAnswer`. Numeric (AIME): the selected boxed value is taken
+   literally (any string).
 4. `CleanupText.cleanWikiProblem` strips `{{templates}}`, `[[Category:…]]`, wikilinks,
    stray headers, and converts `<asy>` diagrams via `toWikiAsyLinks`.
 

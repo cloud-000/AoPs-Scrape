@@ -494,8 +494,17 @@ export class ForumSession {
          }
       }
 
-      test.computational = type.computational;
       test.type = type.name;
+      if (type.computational) {
+         // Computational test: decide MCQ vs numeric from the problems' own
+         // evidence (a majority vote), then resolve every \boxed{} answer.
+         this._finalizeComputationalAnswers(test, type);
+         test.computational = true;
+      } else {
+         // Proof (or unknown) test: no boxed-answer resolution.
+         test.computational = type.computational;
+         test.answerKind = type.computational === false ? "proof" : null;
+      }
 
       // Prefer an answer key embedded directly in the test category — it
       // ships with the data we already fetched, no extra request. Fall back
@@ -616,7 +625,7 @@ export class ForumSession {
 
    async _handleMultiProblem(isMulti, item, type, ctx, test, seenTopicIds) {
       ctx.isPrevMulti = true;
-      let answers = null;
+      let answerPostsByProblem = {};
       let topicSolutions = [];
       if (type.computational) {
          const topicData = await this.searchTopicForSolutions(
@@ -624,26 +633,24 @@ export class ForumSession {
             true,
             false,
          );
-         answers = topicData.answers; // for multi-problem, returns a map
+         // Each problem's answers live in [hide=S<n>] blocks; keep them raw so
+         // _finalizeComputationalAnswers can pick the right \boxed{} per problem.
+         answerPostsByProblem = topicData.answerPostsByProblem;
          topicSolutions = topicData.solutions;
       }
       for (let j = 0; j < isMulti.length; j++) {
          const problem = makeProblem({
-            statement: CleanupText.cleanChoices(isMulti[j]),
+            // Keep the raw statement (choices still attached); the resolve pass
+            // extracts/strips choices once the test's kind is known.
+            statement: isMulti[j].trim(),
             postId: item.post_data.post_id,
             topicId: item.post_data.topic_id,
             n: j + ctx.problemIndex,
             solutions: j === 0 ? topicSolutions : [],
          });
          if (type.computational) {
-            const answer = answers?.[(j + 1).toString()] ?? null;
-            if (type.choices) {
-               problem.answerValue = answer;
-               problem.choices = CleanupText.extractChoices(isMulti[j]);
-               problem.answerIndex = problem.choices.indexOf(answer);
-            } else {
-               this._setNumericAnswer(problem, answer);
-            }
+            problem._answerPosts =
+               answerPostsByProblem[(j + 1).toString()] ?? [];
          }
          addProblemToTest(problem, ctx, test, this.onProblemAdd);
          seenTopicIds.push(item.post_data.topic_id);
@@ -781,16 +788,22 @@ export class ForumSession {
          counter++;
          const ans = answerMap[String(counter)];
          if (ans == null) return;
-         if (type.choices) {
+         // Branch on the problem's own resolved kind (a mixed test has both),
+         // not the contest-level prior.
+         const isMcq =
+            Array.isArray(problem.choices) && problem.choices.length > 0;
+         if (isMcq) {
             // MCQ: answer key is authoritative — override \boxed{} result
-            problem.answerValue = ans;
-            const parsed = CleanupText.parseMCQAns(ans);
-            if (parsed?.type === "letter") {
-               problem.answerIndex = MCQ_LETTERS.indexOf(parsed.value);
-            } else if (parsed) {
-               problem.answerIndex = (problem.choices ?? []).indexOf(
-                  parsed.value,
-               );
+            const idx = CleanupText.choiceIndexOfAnswer(
+               ans,
+               problem.choices ?? [],
+            );
+            if (idx >= 0) {
+               problem.answerIndex = idx;
+               problem.answerValue = MCQ_LETTERS[idx];
+            } else {
+               problem.answerValue = ans;
+               problem.answerIndex = -1;
             }
          } else if (problem.answerValue == null) {
             // Numeric: only fill when \boxed{} found nothing
@@ -832,36 +845,89 @@ export class ForumSession {
          return problem;
       }
 
+      // Computational: fetch the discussion and stash the raw reply contents.
+      // Choice extraction and \boxed{} selection are deferred to the resolve
+      // pass (_finalizeComputationalAnswers), which runs once the whole test's
+      // answer kind is known.
       const topicData = await this.searchTopicForSolutions(
          topicId,
          false,
          false,
       );
-      const rawAnswer = topicData.answer;
       problem.solutions = topicData.solutions;
-      problem.answerValue = rawAnswer;
+      problem._answerPosts = topicData.answerPosts;
+      return problem;
+   }
 
-      if (type.choices) {
-         // MCQ (e.g. AMC)
-         problem.choices = CleanupText.extractChoices(problem.statement);
-         problem.statement = CleanupText.cleanChoices(problem.statement).trim();
-         if (rawAnswer != null) {
-            const parsed = CleanupText.parseMCQAns(rawAnswer);
-            if (parsed == null) {
-               problem.answerIndex = -1;
-            } else if (parsed.type === "letter") {
-               problem.answerValue = parsed.value; // normalize to just the letter
-               problem.answerIndex = MCQ_LETTERS.indexOf(parsed.value);
-            } else {
-               problem.answerIndex = problem.choices.indexOf(parsed.value);
-            }
-         }
-      } else {
-         // Numeric (AIME, COMP, COLLEGE, etc.)
-         this._setNumericAnswer(problem, rawAnswer);
+   // Resolve pass: with all problems fetched, decide the test's answer kind from
+   // its own problems (MCQ-vs-other majority; a tie/off-by-one stays mixed and
+   // each problem keeps its detected kind), then resolve every \boxed{} answer.
+   _finalizeComputationalAnswers(test, type) {
+      const nested =
+         test.problems.length > 0 && Array.isArray(test.problems[0]);
+      const all = nested ? test.problems.flat() : test.problems;
+      if (all.length === 0) {
+         test.answerKind = type.answerKind ?? "numeric";
+         return;
       }
 
-      return problem;
+      // Detect MCQ-ness structurally, independent of the (possibly wrong) prior.
+      for (const p of all) {
+         p._hasChoices = CleanupText.extractChoices(p.statement).length >= 3;
+      }
+      const mcqCount = all.filter((p) => p._hasChoices).length;
+      const otherCount = all.length - mcqCount;
+      // The non-MCQ kind for a computational test is always numeric here (proof
+      // contests never reach this pass).
+      const otherKind = "numeric";
+      const decision = CleanupText.decideTestKind(
+         mcqCount,
+         otherCount,
+         otherKind,
+      );
+
+      for (const p of all) {
+         const kind = decision.mixed
+            ? p._hasChoices
+               ? "mcq"
+               : otherKind
+            : decision.kind;
+         this._resolveProblemAnswer(p, kind);
+         delete p._hasChoices;
+         delete p._answerPosts;
+      }
+      test.answerKind = decision.mixed ? "mixed" : decision.kind;
+   }
+
+   _resolveProblemAnswer(problem, kind) {
+      const posts = problem._answerPosts ?? [];
+      if (kind === "mcq") {
+         problem.choices = CleanupText.extractChoices(problem.statement);
+         problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+         const raw = CleanupText.selectBoxedAnswer(posts, {
+            answerKind: "mcq",
+            choices: problem.choices,
+         });
+         problem.answerValue = null;
+         problem.answerIndex = -1;
+         if (raw != null) {
+            const idx = CleanupText.choiceIndexOfAnswer(raw, problem.choices);
+            if (idx >= 0) {
+               problem.answerIndex = idx;
+               problem.answerValue = MCQ_LETTERS[idx]; // MCQ answer is a letter
+            }
+         } else if (posts.some((c) => /\\boxed\s*\{/.test(c ?? ""))) {
+            this.log(
+               `  ⚠️  Problem ${problem.n + 1}: boxed answer(s) present but none matched a choice`,
+            );
+         }
+      } else {
+         // Numeric: any string is a valid answer (LaTeX, fractions, words).
+         const raw = CleanupText.selectBoxedAnswer(posts, {
+            answerKind: "numeric",
+         });
+         this._setNumericAnswer(problem, raw);
+      }
    }
 
    _isSolutionPost(post, content) {
@@ -891,7 +957,12 @@ export class ForumSession {
       // id 0 means the problems came from a packed view_posts_text post that
       // has no backing discussion topic — nothing to fetch.
       if (!id || this._permissionDenied) {
-         return { answer: null, answers: {}, solutions: [], posts: [] };
+         return {
+            answerPosts: [],
+            answerPostsByProblem: {},
+            solutions: [],
+            posts: [],
+         };
       }
 
       const response = await this.sendRequest(
@@ -900,7 +971,12 @@ export class ForumSession {
 
       if (response.error_code === "E_NO_PERMISSION") {
          this._permissionDenied = true;
-         return { answer: null, answers: {}, solutions: [], posts: [] };
+         return {
+            answerPosts: [],
+            answerPostsByProblem: {},
+            solutions: [],
+            posts: [],
+         };
       }
 
       const topic = response.response.topic;
@@ -910,21 +986,23 @@ export class ForumSession {
       const rawPosts = topic.posts_data ?? [];
       const solutions = [];
       const posts = [];
-      let answer = null;
-      const answers = {};
+      // Raw candidate material for answer selection (done later by the caller):
+      // single-problem => the reply contents in order; multi-problem => each
+      // problem's [hide=S<n>] blocks, keyed by problem number.
+      const answerPosts = [];
+      const answerPostsByProblem = {};
 
       for (const post of rawPosts) {
          const content = post.post_canonical;
 
-         // Extract answers
+         // Collect answer candidates
          if (searchManyProblems) {
             const hideTag = /\[hide\s*=\s*(?:S|s)\s*(\d+)]([\s\S]*?)\[\/hide]/g;
             for (const match of content.matchAll(hideTag)) {
-               const boxed = CleanupText.getBoxed(match[2]);
-               if (boxed) answers[match[1]] = boxed;
+               (answerPostsByProblem[match[1]] ??= []).push(match[2]);
             }
-         } else if (answer == null) {
-            answer = CleanupText.getBoxed(content);
+         } else {
+            answerPosts.push(content);
          }
 
          // Collect all posts for OLY
@@ -956,7 +1034,7 @@ export class ForumSession {
          }
       }
 
-      return { answer, answers, solutions, posts };
+      return { answerPosts, answerPostsByProblem, solutions, posts };
    }
 
    async searchTopicForAnswer(id, searchManyProblems = false) {
@@ -965,7 +1043,20 @@ export class ForumSession {
          searchManyProblems,
          false,
       );
-      if (searchManyProblems) return result.answers;
-      return result.answer;
+      // No test context here, so resolve as numeric (accept any boxed value).
+      if (searchManyProblems) {
+         const out = {};
+         for (const [num, contents] of Object.entries(
+            result.answerPostsByProblem,
+         )) {
+            out[num] = CleanupText.selectBoxedAnswer(contents, {
+               answerKind: "numeric",
+            });
+         }
+         return out;
+      }
+      return CleanupText.selectBoxedAnswer(result.answerPosts, {
+         answerKind: "numeric",
+      });
    }
 }

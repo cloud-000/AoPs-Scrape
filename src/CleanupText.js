@@ -185,6 +185,145 @@ export class CleanupText {
         return match ? match[1] : null;
     }
 
+    // Every \boxed{…} value in a string, in document order. Unlike getBoxed
+    // (which returns only the first), this feeds selectBoxedAnswer so a post
+    // that boxes intermediate steps doesn't force the first box to win.
+    static getAllBoxed(str, depth = 3) {
+        const regex = new RegExp(CleanupText.buildNestedPattern(depth), "g");
+        const out = [];
+        for (const m of String(str).matchAll(regex)) out.push(m[1]);
+        return out;
+    }
+
+    // Canonical form for comparing two answer literals (for MCQ-choice matching
+    // and cross-post voting): drops $…$ delimiters and \textbf wrappers, upcases
+    // MCQ letters, collapses integers ("008" == "8"), and strips inner whitespace.
+    static normalizeAnswer(v) {
+        if (v == null) return "";
+        let s = String(v).trim();
+        // Drop $…$ math delimiters and \$ currency markers so a boxed "17"
+        // matches a choice written "\$17", and strip \textbf wrappers.
+        s = s.replace(/\\?\$/g, "");
+        s = s.replace(/\\textbf\{([^}]*)\}/g, "$1").trim();
+        s = s.replace(/,(?=\d)/g, ""); // thousands separators: 11,400 -> 11400
+        if (/^[A-Ea-e]$/.test(s)) return s.toUpperCase();
+        if (/^-?\d+$/.test(s)) return String(parseInt(s, 10));
+        return s.replace(/\s+/g, "");
+    }
+
+    // Is `value` a legitimate MCQ answer for the given choice list? A letter is
+    // valid only if it indexes into the choices (or, when choices couldn't be
+    // extracted, any A–J letter as a fallback); a text answer must equal one of
+    // the choices. This is what discards a boxed intermediate result that isn't
+    // one of the options.
+    static isValidMCQAnswer(value, choices) {
+        const parsed = CleanupText.parseMCQAns(value);
+        if (!parsed) return false;
+        const hasChoices = Array.isArray(choices) && choices.length > 0;
+        if (parsed.type === "letter") {
+            const idx = "ABCDEFGHIJ".indexOf(parsed.value);
+            if (idx < 0) return false;
+            return hasChoices ? idx < choices.length : true;
+        }
+        if (!hasChoices) return false;
+        const norm = CleanupText.normalizeAnswer(parsed.value);
+        return choices.some((c) => CleanupText.normalizeAnswer(c) === norm);
+    }
+
+    // Maps a boxed MCQ answer (a letter like "\textbf{(C)}" or a value like
+    // "17") to its index in the choice list. Letters index directly; values are
+    // matched by normalizeAnswer so "17" finds a choice written "\$17". Returns
+    // -1 when it doesn't correspond to a listed choice.
+    static choiceIndexOfAnswer(raw, choices) {
+        if (raw == null || !Array.isArray(choices)) return -1;
+        const parsed = CleanupText.parseMCQAns(raw);
+        if (!parsed) return -1;
+        if (parsed.type === "letter") {
+            const idx = "ABCDEFGHIJ".indexOf(parsed.value);
+            return idx >= 0 && idx < choices.length ? idx : -1;
+        }
+        const norm = CleanupText.normalizeAnswer(parsed.value);
+        return choices.findIndex((c) => CleanupText.normalizeAnswer(c) === norm);
+    }
+
+    // Picks the single most-trustworthy \boxed{} answer out of a list of post
+    // contents (a topic's replies, or a wiki page's solution sections).
+    //
+    // - answerKind "mcq": only boxes that are valid choices survive (see
+    //   isValidMCQAnswer); "numeric"/"proof": any box is accepted verbatim
+    //   (LaTeX/fractions/words are all fine).
+    // - Ranking encodes the two rules for the multi-\boxed case: a post whose
+    //   sole content is one box (a clean answer post) beats the last box of a
+    //   multi-box post (an intermediate-steps post), which beats earlier boxes;
+    //   ties break toward the value that recurs across the most posts (a vote),
+    //   then the earliest post.
+    //
+    // Returns the raw boxed string of the winner, or null.
+    static selectBoxedAnswer(
+        postContents,
+        { answerKind = "numeric", choices = null } = {},
+    ) {
+        if (!Array.isArray(postContents)) return null;
+        const candidates = [];
+        postContents.forEach((content, postIndex) => {
+            if (content == null) return;
+            const boxes = CleanupText.getAllBoxed(content);
+            boxes.forEach((value, boxIndex) => {
+                candidates.push({
+                    value,
+                    postIndex,
+                    isSole: boxes.length === 1,
+                    isLast: boxIndex === boxes.length - 1,
+                    norm: CleanupText.normalizeAnswer(value),
+                });
+            });
+        });
+
+        const pool =
+            answerKind === "mcq"
+                ? candidates.filter((c) =>
+                      CleanupText.isValidMCQAnswer(c.value, choices),
+                  )
+                : candidates;
+        if (pool.length === 0) return null;
+
+        // Vote: how many distinct posts carry each normalized value.
+        const postsByNorm = new Map();
+        for (const c of pool) {
+            if (!postsByNorm.has(c.norm)) postsByNorm.set(c.norm, new Set());
+            postsByNorm.get(c.norm).add(c.postIndex);
+        }
+
+        let best = null;
+        for (const c of pool) {
+            const vote = postsByNorm.get(c.norm).size;
+            const score = (c.isSole ? 100 : 0) + (c.isLast ? 10 : 0) + vote;
+            if (
+                best === null ||
+                score > best.score ||
+                (score === best.score && c.postIndex < best.postIndex)
+            ) {
+                best = { value: c.value, score, postIndex: c.postIndex };
+            }
+        }
+        return best ? best.value : null;
+    }
+
+    // Decides a test's answer format from the structural evidence of its own
+    // problems. A clear MCQ-vs-other majority (differing by ≥2) forces every
+    // problem to that kind; a tie or off-by-one leaves the test mixed, so each
+    // problem keeps its own detected kind. `otherKind` names the non-MCQ kind
+    // for this test (numeric or proof), taken from the contest name prior.
+    static decideTestKind(mcqCount, otherCount, otherKind = "numeric") {
+        if (Math.abs(mcqCount - otherCount) < 2) {
+            return { mixed: true, kind: null };
+        }
+        return {
+            mixed: false,
+            kind: mcqCount > otherCount ? "mcq" : otherKind,
+        };
+    }
+
     static cleanProblem(str) {
         return str
             .replace(/^\[b\]Problem #\d+:\[\/b\]\s*/i, "")

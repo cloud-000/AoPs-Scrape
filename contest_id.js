@@ -1,11 +1,16 @@
+// `answerKind` is the name-inferred prior ("mcq" | "numeric" | "proof") used to
+// seed a test's format before its problems vote on it (see
+// ForumSession._finalizeComputationalAnswers). `computational`/`choices` are the
+// legacy derived booleans kept in sync: computational = answerKind !== "proof",
+// choices = answerKind === "mcq".
 export const TYPES = {
-    AMC: { id: 0, computational: true, name: "AMC", choices: true },
-    AIME: { id: 1, computational: true, name: "AIME", choices: false },
-    AMO: { id: 2, computational: false, name: "OLY", choices: false },
-    COLLEGE: { id: 4, computational: true, name: "COLL", choices: false },
-    COMPUTE: { id: 97, computational: true, name: "COMP", choices: false },
-    ARML: { id: 98, computational: true, name: "ARML", choices: false },
-    UNKNOWN: { id: 99, computational: null, name: null, choices: false },
+    AMC: { id: 0, computational: true, name: "AMC", choices: true, answerKind: "mcq" },
+    AIME: { id: 1, computational: true, name: "AIME", choices: false, answerKind: "numeric" },
+    AMO: { id: 2, computational: false, name: "OLY", choices: false, answerKind: "proof" },
+    COLLEGE: { id: 4, computational: true, name: "COLL", choices: false, answerKind: "numeric" },
+    COMPUTE: { id: 97, computational: true, name: "COMP", choices: false, answerKind: "numeric" },
+    ARML: { id: 98, computational: true, name: "ARML", choices: false, answerKind: "numeric" },
+    UNKNOWN: { id: 99, computational: null, name: null, choices: false, answerKind: null },
 };
 
 export const CONTEST_IDS = {
