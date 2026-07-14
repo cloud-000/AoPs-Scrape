@@ -11,6 +11,40 @@ export class CleanupText {
 
     static INFER_WORDS = [
         {
+            name: "K",
+            keywords: [
+                "derivative",
+                "differentiate",
+                "differentiable",
+                "differentiation",
+                "integration",
+                "integrate",
+                "integral",
+                "antiderivative",
+                "\\lim",
+                "\\int",
+                "dy/dx",
+                "\\frac{dx}",
+                "d/dx",
+                "f'(x)",
+                "g'(x)",
+                "rate of change",
+                "critical point",
+                "inflection point",
+                "taylor series",
+                "maclaurin series",
+                "chain rule",
+                "l'hopital",
+                "riemann sum",
+                "limit as",
+                "continuous function",
+                "continuity",
+                "mean value theorem",
+                "intermediate value theorem",
+                "calculus",
+            ],
+        },
+        {
             name: "A",
             keywords: [
                 "real number",
@@ -441,7 +475,7 @@ export class CleanupText {
             }
             scores[mathType.name] = score;
         }
-        // Find highest scoring; ties go to first (A→C→G→N)
+        // Find highest scoring; ties go to first (K→A→C→G→N)
         let best = null;
         let bestScore = 0;
         for (const mathType of this.INFER_WORDS) {

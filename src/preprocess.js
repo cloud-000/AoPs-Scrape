@@ -91,13 +91,13 @@ function refreshChoices(db) {
 
 function reclassifyAcgn(db) {
     console.log("Step 2: Re-inferring ACGN classification...");
-    const problems = db.query("SELECT id, aops_statement FROM problems WHERE aops_statement IS NOT NULL").all();
+    const problems = db.query("SELECT id, statement FROM problems WHERE statement IS NOT NULL").all();
     let updated = 0;
     const stmt = db.prepare("UPDATE problems SET acgn = ? WHERE id = ?");
 
     db.transaction(() => {
         for (const p of problems) {
-            const newAcgn = CleanupText.inferACGN(p.aops_statement);
+            const newAcgn = CleanupText.inferACGN(p.statement);
             stmt.run(newAcgn, p.id);
             updated++;
         }
@@ -108,13 +108,13 @@ function reclassifyAcgn(db) {
 
 function retagProblems(db) {
     console.log("Step 3: Re-applying auto-tags (union with existing)...");
-    const problems = db.query("SELECT id, aops_statement, tags FROM problems WHERE aops_statement IS NOT NULL").all();
+    const problems = db.query("SELECT id, statement, tags FROM problems WHERE statement IS NOT NULL").all();
     let updated = 0;
     const stmt = db.prepare("UPDATE problems SET tags = ? WHERE id = ?");
 
     db.transaction(() => {
         for (const p of problems) {
-            const newTags = getAutoTags(p.aops_statement);
+            const newTags = getAutoTags(p.statement);
             if (newTags.length === 0) continue;
 
             const existingTags = p.tags ? JSON.parse(p.tags) : [];
