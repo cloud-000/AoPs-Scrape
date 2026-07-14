@@ -267,6 +267,38 @@ export class WikiSession {
         return text.replace(/^#\s*(.+)$/gm, (_, item) => `${++i}. ${item}`);
     }
 
+    // Resolves a raw Answer Key value (a letter for MCQ, or a literal for
+    // numeric) into { answerValue, answerIndex } for a problem with the given
+    // `choices` (null for numeric contests).
+    static _resolveKeyAnswer(raw, choices) {
+        if (choices) {
+            const parsed = CleanupText.parseMCQAns(raw);
+            if (parsed?.type === "letter") {
+                return {
+                    answerValue: parsed.value,
+                    answerIndex: MCQ_LETTERS.indexOf(parsed.value),
+                };
+            }
+            const value = parsed?.value ?? raw;
+            return { answerValue: value, answerIndex: choices.indexOf(value) };
+        }
+        return { answerValue: raw, answerIndex: -1 };
+    }
+
+    // Normalizes an answer literal for cross-checking a boxed solution answer
+    // against the Answer Key: strips $…$ delimiters and \textbf wrappers,
+    // upcases MCQ letters, and collapses integers (so "008" == "8") and stray
+    // whitespace in LaTeX so equal answers aren't reported as a mismatch.
+    static _normalizeAnswer(v) {
+        if (v == null) return null;
+        let s = String(v).trim();
+        s = s.replace(/^\$+|\$+$/g, "").trim();
+        s = s.replace(/\\textbf\{([^}]*)\}/g, "$1").trim();
+        if (/^[A-Ea-e]$/.test(s)) return s.toUpperCase();
+        if (/^-?\d+$/.test(s)) return String(parseInt(s, 10));
+        return s.replace(/\s+/g, "");
+    }
+
     // Assembles a full test for one contest variant + year (e.g. "AMC 10A",
     // 2021). `name` must match the forum's normalized category name so the
     // natural key (series, name, year) merges wiki rows onto forum rows.
@@ -320,23 +352,30 @@ export class WikiSession {
             }
             problem.n = k - 1;
 
-            // Apply the answer-key fallback when the page had no boxed answer.
-            if (problem.answerValue == null && key[String(k)] != null) {
-                const raw = key[String(k)];
-                if (problem.choices) {
-                    const parsed = CleanupText.parseMCQAns(raw);
-                    if (parsed?.type === "letter") {
-                        problem.answerValue = parsed.value;
-                        problem.answerIndex = MCQ_LETTERS.indexOf(parsed.value);
-                    } else {
-                        problem.answerValue = parsed?.value ?? raw;
-                        problem.answerIndex = problem.choices.indexOf(
-                            problem.answerValue,
-                        );
-                    }
-                } else {
-                    problem.answerValue = raw;
+            // Cross-check against the official Answer Key page. The key is
+            // authoritative (curated), while the boxed answer comes from
+            // user-written solution content — so the key wins on disagreement
+            // and fills in a missing answer, and any conflict is logged.
+            if (key[String(k)] != null) {
+                const resolved = WikiSession._resolveKeyAnswer(
+                    key[String(k)],
+                    problem.choices,
+                );
+                const boxed = WikiSession._normalizeAnswer(problem.answerValue);
+                const keyed = WikiSession._normalizeAnswer(resolved.answerValue);
+                if (problem.answerValue == null) {
+                    // No boxed answer: adopt the key silently.
+                    problem.answerValue = resolved.answerValue;
+                    problem.answerIndex = resolved.answerIndex;
+                } else if (boxed !== keyed) {
+                    // Mismatch: the key is authoritative — overwrite and warn.
+                    this.log(
+                        `\n⚠️  ${name} Problem ${k}: boxed answer "${problem.answerValue}" disagrees with Answer Key "${resolved.answerValue}"; using the key.`,
+                    );
+                    problem.answerValue = resolved.answerValue;
+                    problem.answerIndex = resolved.answerIndex;
                 }
+                // else: they agree — nothing to do.
             }
 
             problems.push(problem);
