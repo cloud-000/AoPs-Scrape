@@ -107,10 +107,10 @@ const CMIMC_FORMATS = {
 };
 
 const CHMMC_SEASONS = {
-    fall: "Fall",
-    winter: "Winter",
-    spring: "Spring",
-    annual: "Annual",
+    winter: { label: "Winter", order: 10 },
+    spring: { label: "Spring", order: 20 },
+    fall: { label: "Fall", order: 30 },
+    annual: { label: "Annual", order: 40 },
 };
 
 const CHMMC_FORMATS = {
@@ -440,10 +440,12 @@ export const SERIES_CONFIG = {
             if (!Number.isInteger(year) || !season || !format) return null;
 
             return {
-                name: `${year} ${season} CHMMC ${format.label}`,
+                name: `${year} ${season.label} CHMMC ${format.label}`,
                 year,
                 section: -1,
                 sectionName: null,
+                division: season.label,
+                divisionOrder: season.order,
                 format: format.label,
                 formatOrder: format.order,
             };
