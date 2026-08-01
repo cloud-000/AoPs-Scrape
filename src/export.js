@@ -350,6 +350,8 @@ const STAGING_TABLES = {
             "section",
             "type",
             "is_computational",
+            "response_kind",
+            "answer_status",
             "difficulty",
             "quality",
         ],
@@ -369,6 +371,8 @@ const STAGING_TABLES = {
             "topic",
             "tags",
             "is_computational",
+            "response_kind",
+            "answer_status",
             "difficulty",
             "quality",
             "verified",
@@ -413,7 +417,7 @@ export async function exportStagingSQL(
         SELECT t.id, s.name AS series_name, t.name, t.year, t.division,
                t.division_order, t.format, t.format_order, t.aops_category_id,
                t.section, t.type, t.is_computational, t.response_kind,
-               t.difficulty, t.quality
+               t.answer_status, t.difficulty, t.quality
         FROM tests t JOIN series s ON t.series_id = s.id
         ORDER BY t.id
     `,
@@ -433,8 +437,8 @@ export async function exportStagingSQL(
         SELECT pp.test_id, pp.n, pp.canonical_test_id, pp.canonical_n,
                pp.aops_id, pp.statement, pp.choices,
                pp.answer_index, pp.official_solutions, pp.topic, pp.tags,
-               pp.is_computational, pp.difficulty, pp.quality, pp.verified,
-               pp.notes
+               pp.is_computational, pp.response_kind, pp.answer_status,
+               pp.difficulty, pp.quality, pp.verified, pp.notes
         FROM production_problems pp
         ORDER BY pp.test_id, pp.n
     `,
