@@ -32,6 +32,11 @@ import {
     upsertProblemLink,
 } from "./db.js";
 import {
+    readTestProfile,
+    readProblemCoverage,
+    resolveCoverage,
+} from "./coverage.js";
+import {
     mathcountsTestMetadata,
     numberedFormatMetadata,
     schoolDivisionMetadata,
@@ -80,6 +85,48 @@ const PUMAC_SUBJECTS = {
     geometry: { label: "Geometry", order: 30 },
     number_theory: { label: "Number Theory", order: 40 },
     individual_finals: { label: "Individual Finals", order: 50 },
+};
+
+const CMIMC_DIVISIONS = {
+    individual: { label: "Individual", order: 10 },
+    team: { label: "Team", order: 20 },
+    "division-1": { label: "Division 1", order: 30 },
+    "division-2": { label: "Division 2", order: 40 },
+    "mini-events": { label: "Mini-Events", order: 50 },
+};
+
+const CMIMC_FORMATS = {
+    algebra: { label: "Algebra", order: 10 },
+    combinatorics: { label: "Combinatorics", order: 20 },
+    geometry: { label: "Geometry", order: 30 },
+    "number-theory": { label: "Number Theory", order: 40 },
+    "computer-science": { label: "Computer Science", order: 50 },
+    team: { label: "Team", order: 60 },
+    finals: { label: "Finals", order: 70 },
+    "integration-bee": { label: "Integration Bee", order: 80 },
+};
+
+const CHMMC_SEASONS = {
+    fall: "Fall",
+    winter: "Winter",
+    spring: "Spring",
+    annual: "Annual",
+};
+
+const CHMMC_FORMATS = {
+    individual: { label: "Individual", order: 10 },
+    team: { label: "Team", order: 20 },
+    tiebreaker: { label: "Tiebreaker", order: 30 },
+    mixer: { label: "Mixer", order: 40 },
+    proof: { label: "Proof", order: 50 },
+    "integration-bee-qualifying": {
+        label: "Integration Bee Qualifying",
+        order: 60,
+    },
+    "integration-bee-finals": {
+        label: "Integration Bee Finals",
+        order: 70,
+    },
 };
 
 // Per OCR-series-folder config. `seriesName` is the canonical DB series name
@@ -354,6 +401,54 @@ export const SERIES_CONFIG = {
             };
         },
     },
+    cmimc: {
+        seriesName: "CMIMC",
+        isOfficial: true,
+        isComputational: true,
+        parseTest(folder) {
+            const [yearToken, divisionToken, formatToken] = folder.split("_");
+            const year = Number(yearToken);
+            const division = CMIMC_DIVISIONS[divisionToken];
+            const format = CMIMC_FORMATS[formatToken];
+
+            if (!Number.isInteger(year) || !division || !format) return null;
+
+            return {
+                name: `${year} CMIMC ${division.label} ${format.label}`,
+                year,
+                section: -1,
+                sectionName: null,
+                division: division.label,
+                divisionOrder: division.order,
+                format: format.label,
+                formatOrder: format.order,
+            };
+        },
+    },
+    chmm: {
+        seriesName: "CHMMC",
+        isOfficial: true,
+        isComputational: true,
+        parseTest(folder) {
+            const [yearToken, seasonToken, formatToken, ...rest] =
+                folder.split("_");
+            const year = Number(yearToken);
+            const season = CHMMC_SEASONS[seasonToken];
+            const formatKey = [formatToken, ...rest].join("-");
+            const format = CHMMC_FORMATS[formatKey];
+
+            if (!Number.isInteger(year) || !season || !format) return null;
+
+            return {
+                name: `${year} ${season} CHMMC ${format.label}`,
+                year,
+                section: -1,
+                sectionName: null,
+                format: format.label,
+                formatOrder: format.order,
+            };
+        },
+    },
 };
 
 function titleCase(word) {
@@ -404,6 +499,25 @@ function ocrKeyToN(key, kind, where) {
         return null;
     }
     return n;
+}
+
+// Resolve one field from an optional authoritative coverage snapshot. Absent or
+// invalid files preserve stored state; an omitted entry in a present map clears
+// it; an invalid field value preserves only that field.
+function coverageSnapshotField({
+    file,
+    entry,
+    field,
+    existingValue,
+}) {
+    if (file.state !== "present") {
+        return { value: existingValue ?? null, update: false };
+    }
+    if (entry == null) return { value: null, update: true };
+    if (entry[field] === undefined) {
+        return { value: existingValue ?? null, update: false };
+    }
+    return { value: entry[field], update: true };
 }
 
 // Returns the OCR series folders present in `outDir` that we know how to import.
@@ -499,10 +613,22 @@ export function importPdfProblems(db, outDir, options = {}) {
                 const solutions =
                     readJson(join(testPath, "problem_solution.json")) ?? {};
 
+                // Source-backed coverage semantics. The profile DECLARES the
+                // test (present only for proof families); coverage is a sparse
+                // per-problem exception map. Both are stored as-is, on their
+                // own tier — resolving them into a single per-problem verdict
+                // is buildProductionProblems' job. See src/coverage.js.
+                const where = `${seriesFolder}/${testFolder}`;
+                const profileFile = readTestProfile(testPath, where);
+                const coverageFile = readProblemCoverage(testPath, where);
+
                 const seriesName = meta.seriesName ?? cfg.seriesName;
                 // Series default, overridable per test where a single series
                 // mixes formats (e.g. MPFG: computational Math Prize vs.
                 // proof-based Olympiad). Mirrors the seriesName override above.
+                // This stays the RAW config value. The coverage-aware value is
+                // derived at read time by isComputationalFor(), so a later
+                // AoPS re-scrape writing its own guess here cannot regress it.
                 const isComputational =
                     meta.isComputational ?? cfg.isComputational;
                 let seriesId = seriesIds.get(seriesName);
@@ -526,6 +652,24 @@ export function importPdfProblems(db, outDir, options = {}) {
                         formatOrder: meta.formatOrder,
                         type: null,
                         isComputational,
+                        // Only pass these when a profile was actually read —
+                        // upsertTest keys off presence, so an absent profile
+                        // must leave any existing value alone rather than
+                        // asserting NULL over it.
+                        ...(profileFile.state === "present" &&
+                        profileFile.value.response_kind !== undefined
+                            ? {
+                                  responseKind:
+                                      profileFile.value.response_kind,
+                              }
+                            : {}),
+                        ...(profileFile.state === "present" &&
+                        profileFile.value.answer_status !== undefined
+                            ? {
+                                  answerStatus:
+                                      profileFile.value.answer_status,
+                              }
+                            : {}),
                         // Section structure is scraper-owned; PDF import must
                         // not rewrite section/section_name on an existing row.
                         updateSection: false,
@@ -533,6 +677,24 @@ export function importPdfProblems(db, outDir, options = {}) {
                     seriesId,
                 );
                 summary.tests++;
+
+                // Resolve against state after the profile upsert. This matters
+                // when the current file is absent/invalid: its stored declaration
+                // remains authoritative for answer retraction.
+                const declaration = db
+                    .query(
+                        `SELECT response_kind, answer_status FROM tests WHERE id = ?`,
+                    )
+                    .get(testId);
+                const existingCoverageByN = new Map(
+                    db
+                        .query(
+                            `SELECT n, coverage_response_kind, coverage_answer_status
+                             FROM problems WHERE test_id = ? AND section = -1`,
+                        )
+                        .all(testId)
+                        .map((row) => [row.n, row]),
+                );
 
                 let count = 0;
                 const problemIdByN = new Map(); // n -> problem id, for attaching solutions
@@ -543,14 +705,66 @@ export function importPdfProblems(db, outDir, options = {}) {
                         `${seriesFolder}/${testFolder}`,
                     );
                     if (n === null) continue;
+                    // Coverage keys are the OCR's 1-based numbers, same as
+                    // `problems`/`answers`, so they index by `key` not `n`.
+                    const answer = answers[key] ?? null;
+                    const existingCoverage = existingCoverageByN.get(n);
+                    const snapshotEntry =
+                        coverageFile.state === "present"
+                            ? coverageFile.value[key]
+                            : undefined;
+                    const responseKindUpdate = coverageSnapshotField({
+                        file: coverageFile,
+                        entry: snapshotEntry,
+                        field: "response_kind",
+                        existingValue:
+                            existingCoverage?.coverage_response_kind,
+                    });
+                    const answerStatusUpdate = coverageSnapshotField({
+                        file: coverageFile,
+                        entry: snapshotEntry,
+                        field: "answer_status",
+                        existingValue:
+                            existingCoverage?.coverage_answer_status,
+                    });
+                    const resolvedCoverage = resolveCoverage({
+                        overrideResponseKind: responseKindUpdate.value,
+                        declarationResponseKind:
+                            declaration?.response_kind ?? null,
+                        overrideAnswerStatus: answerStatusUpdate.value,
+                        declarationAnswerStatus:
+                            declaration?.answer_status ?? null,
+                        rawIsComputational: isComputational,
+                    });
                     const problemId = upsertPdfProblem(
                         db,
                         {
                             n,
                             statement: problems[key],
-                            answer: answers[key] ?? null,
+                            answer,
                             source: `${seriesFolder}/${testFolder}`,
                             is_computational: isComputational,
+                            // Stored on the override tier only: NULL here means
+                            // no source named this problem, never "it inherited
+                            // the test's declaration".
+                            ...(responseKindUpdate.update
+                                ? {
+                                      coverage_response_kind:
+                                          responseKindUpdate.value,
+                                  }
+                                : {}),
+                            ...(answerStatusUpdate.update
+                                ? {
+                                      coverage_answer_status:
+                                          answerStatusUpdate.value,
+                                  }
+                                : {}),
+                            // Clearing a stale answer must follow the RESOLVED
+                            // verdict, since the claim usually lives on the test
+                            // row (a proof profile) rather than the override.
+                            answerNotApplicable:
+                                resolvedCoverage.answerStatus ===
+                                "not_applicable",
                         },
                         testId,
                     );

@@ -3,7 +3,21 @@ import { createHash } from "node:crypto";
 import { CleanupText } from "./CleanupText.js";
 import { getAutoTags } from "./autoTags.js";
 import { sectionTestMetadata } from "./testMetadata.js";
+import {
+    ANSWER_STATUS_CLAIMS,
+    RESPONSE_KINDS,
+    RESOLVED_ANSWER_STATUSES,
+    resolveCoverage,
+} from "./coverage.js";
 import { SOLUTIONS_USERS } from "../contest_id.js";
+
+function sqlStringList(values) {
+    return values.map((value) => `'${value.replaceAll("'", "''")}'`).join(",");
+}
+
+const RESPONSE_KIND_SQL = sqlStringList(RESPONSE_KINDS);
+const ANSWER_STATUS_CLAIM_SQL = sqlStringList(ANSWER_STATUS_CLAIMS);
+const RESOLVED_ANSWER_STATUS_SQL = sqlStringList(RESOLVED_ANSWER_STATUSES);
 
 // ---------------------------------------------------------------------------
 // MERGE CONTRACT (how a re-scrape combines with existing rows)
@@ -66,6 +80,14 @@ CREATE TABLE IF NOT EXISTS tests (
   aops_category_id TEXT,
   type             TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
+  -- Test-level DECLARATION, from comp-OCR's test_profile.json. Written only
+  -- where a source declared the format (proof families today); NULL means "no
+  -- source has said", not "computational". is_computational above stays the raw
+  -- config value -- the coverage-aware value is derived by isComputationalFor()
+  -- at read time (buildProductionProblems / exportStagingSQL), so no importer
+  -- can regress it. See src/coverage.js.
+  response_kind    TEXT CHECK (response_kind IN (${RESPONSE_KIND_SQL})),
+  answer_status    TEXT CHECK (answer_status IN (${ANSWER_STATUS_CLAIM_SQL})),
   difficulty       INTEGER DEFAULT 0,
   quality          INTEGER DEFAULT 0,
   aops_url TEXT GENERATED ALWAYS AS ('https://artofproblemsolving.com/community/c' || aops_category_id) STORED,
@@ -105,6 +127,15 @@ CREATE TABLE IF NOT EXISTS problems (
   acgn             TEXT,   -- inferred Algebra/Combinatorics/Geometry/NumberTheory class
   tags             TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
+  -- Sparse per-problem coverage OVERRIDE, from problem_coverage.json. These
+  -- never inherit the parent test's declaration -- a value here means a source
+  -- named this problem specifically, which is what distinguishes a verified
+  -- exception from an inherited default. The resolved value consumers filter on
+  -- is COALESCE(override, test declaration, derived) and is computed in
+  -- buildProductionProblems. 'known' is deliberately not storable: it is the
+  -- absence of a claim, so it is derived rather than written. See coverage.js.
+  coverage_response_kind TEXT CHECK (coverage_response_kind IN (${RESPONSE_KIND_SQL})),
+  coverage_answer_status TEXT CHECK (coverage_answer_status IN (${ANSWER_STATUS_CLAIM_SQL})),
   difficulty       INTEGER DEFAULT 0,
   quality          INTEGER DEFAULT 0,
   verified         BOOLEAN NOT NULL DEFAULT FALSE CHECK (verified IN (0, 1)),
@@ -145,6 +176,10 @@ CREATE TABLE IF NOT EXISTS solutions (
   updated_at               TEXT DEFAULT (datetime('now')),
   UNIQUE(problem_id, normalized_hash)
 );
+CREATE INDEX IF NOT EXISTS idx_solutions_problem_status
+  ON solutions (problem_id, status, duplicate_of_solution_id);
+CREATE INDEX IF NOT EXISTS idx_solutions_duplicate_of
+  ON solutions (duplicate_of_solution_id);
 
 CREATE TABLE IF NOT EXISTS solution_sources (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,6 +294,12 @@ CREATE TABLE IF NOT EXISTS production_problems (
   topic              TEXT,   -- Algebra/Combinatorics/Geometry/NumberTheory class
   tags               TEXT[],   -- TEXT[] array (custom type)
   is_computational   BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
+  -- RESOLVED coverage semantics: COALESCE(problem override, test declaration,
+  -- 'known' when an answer exists). Derived here and nowhere else, so a rebuild
+  -- always reflects the current declarations. 'known' is valid here (unlike in
+  -- the source columns) because at this point it is a computed fact.
+  response_kind      TEXT CHECK (response_kind IN (${RESPONSE_KIND_SQL})),
+  answer_status      TEXT CHECK (answer_status IN (${RESOLVED_ANSWER_STATUS_SQL})),
   difficulty         INTEGER DEFAULT 0,
   quality            INTEGER DEFAULT 0,
   verified           BOOLEAN NOT NULL DEFAULT FALSE CHECK (verified IN (0, 1)),
@@ -266,7 +307,11 @@ CREATE TABLE IF NOT EXISTS production_problems (
 
   built_at           TEXT DEFAULT (datetime('now')),
 
-  UNIQUE(test_id, n)
+  UNIQUE(test_id, n),
+  CHECK (answer_status IS NULL OR answer_status <> 'not_applicable'
+         OR COALESCE(answer_index, -1) = -1),
+  CHECK (answer_status IS NULL OR answer_status <> 'known'
+         OR COALESCE(answer_index, -1) >= 0)
 );
 `;
 
@@ -723,63 +768,6 @@ export function classifySolutions(
     return { updated, duplicates };
 }
 
-function migrateSolutionsSchema(db) {
-    const solutionCols = db
-        .query("PRAGMA table_info(solutions)")
-        .all()
-        .map((r) => r.name);
-    if (solutionCols.includes("normalized_hash")) return;
-
-    const oldRows = db.query(`SELECT * FROM solutions ORDER BY id`).all();
-    db.transaction(() => {
-        db.exec(`PRAGMA foreign_keys = OFF;`);
-        db.exec(`ALTER TABLE solutions RENAME TO solutions_old;`);
-        db.exec(`DROP INDEX IF EXISTS idx_solutions_aops_post_id;`);
-        db.exec(SCHEMA);
-        for (const row of oldRows) {
-            const source = row.source ?? "aops";
-            const isOfficial = row.is_official ? 1 : 0;
-            const isVerified = row.verified ? 1 : 0;
-            upsertSolutionCandidate(db, {
-                problemId: row.problem_id,
-                source,
-                sourceKey:
-                    row.aops_post_id != null
-                        ? `post:${row.aops_post_id}`
-                        : `${source}:legacy:${row.id}`,
-                content: row.content,
-                raw_content: row.content,
-                aops_topic_id: row.aops_topic_id,
-                aops_post_id: row.aops_post_id,
-                aops_user_id: row.aops_user_id,
-                aops_username: row.aops_username,
-                posted_at: row.posted_at,
-                is_official: isOfficial,
-                reliability_hint: isOfficial ? 90 : 0,
-                quality_score: Math.max(0, Math.min(100, row.quality ?? 0)),
-                status: isVerified || isOfficial ? "accepted" : "candidate",
-                status_source: isVerified ? "manual" : "auto",
-            });
-        }
-        db.exec(`DROP TABLE solutions_old;`);
-        db.exec(`PRAGMA foreign_keys = ON;`);
-    })();
-}
-
-function ensureSolutionIndexes(db) {
-    const solutionCols = db
-        .query("PRAGMA table_info(solutions)")
-        .all()
-        .map((r) => r.name);
-    if (!solutionCols.includes("status")) return;
-    db.exec(`
-CREATE INDEX IF NOT EXISTS idx_solutions_problem_status
-  ON solutions (problem_id, status, duplicate_of_solution_id);
-CREATE INDEX IF NOT EXISTS idx_solutions_duplicate_of
-  ON solutions (duplicate_of_solution_id);
-    `);
-}
-
 export function initDB(dbPath) {
     const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
@@ -1050,6 +1038,7 @@ FROM tests_old;
         prodCols.includes("answer_value") ||
         prodCols.includes("acgn") ||
         !prodCols.includes("topic") ||
+        !prodCols.includes("response_kind") ||
         prodCols.includes("section") ||
         (choicesCol && choicesCol.type !== "TEXT[]") ||
         (tagsCol && tagsCol.type !== "TEXT[]")
@@ -1090,9 +1079,6 @@ FROM tests_old;
             db.exec(`ALTER TABLE problems ADD COLUMN ${col} ${type}`);
         }
     }
-
-    migrateSolutionsSchema(db);
-    ensureSolutionIndexes(db);
 
     return db;
 }
@@ -1278,6 +1264,8 @@ export function upsertTest(db, test, seriesId) {
         divisionOrder,
         format,
         formatOrder,
+        responseKind,
+        answerStatus,
     } = test;
     const has = (key) => Object.prototype.hasOwnProperty.call(test, key);
     const updateDivisionOrder =
@@ -1310,6 +1298,10 @@ export function upsertTest(db, test, seriesId) {
                 format_order     = CASE WHEN ? THEN ? ELSE format_order END,
                 type             = ?,
                 is_computational = ?,
+                -- Coverage semantics are only rewritten by an importer that
+                -- actually read a profile; a scrape without one leaves them be.
+                response_kind    = CASE WHEN ? THEN ? ELSE response_kind END,
+                answer_status    = CASE WHEN ? THEN ? ELSE answer_status END,
                 series_id        = ?,
                 -- Link the AoPS id when one arrives; never clobber an existing link.
                 aops_category_id = COALESCE(aops_category_id, ?)
@@ -1332,6 +1324,10 @@ export function upsertTest(db, test, seriesId) {
                 normalizedFormatOrder ?? null,
                 type ?? null,
                 isComputational ? 1 : 0,
+                has("responseKind") ? 1 : 0,
+                responseKind ?? null,
+                has("answerStatus") ? 1 : 0,
+                answerStatus ?? null,
                 seriesId,
                 aopsCategoryId ?? null,
                 existingId,
@@ -1345,9 +1341,10 @@ export function upsertTest(db, test, seriesId) {
         INSERT INTO tests (
             series_id, name, section, section_name, year,
             division, division_order, format, format_order,
-            aops_category_id, type, is_computational
+            aops_category_id, type, is_computational,
+            response_kind, answer_status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
         [
             seriesId,
@@ -1362,6 +1359,8 @@ export function upsertTest(db, test, seriesId) {
             aopsCategoryId ?? null,
             type ?? null,
             isComputational ? 1 : 0,
+            responseKind ?? null,
+            answerStatus ?? null,
         ],
     );
     return db
@@ -1527,10 +1526,30 @@ function upsertProblem(db, problem, testId) {
 // touches aops_*, acgn, tags, verified, difficulty, quality or notes on an
 // existing row, and a missing OCR answer never wipes an existing pdf_answer.
 // PDF import is additive only — no orphan cleanup — so AoPS-only rows survive.
+//
+// Coverage: `coverage_response_kind`/`coverage_answer_status` are the SPARSE
+// OVERRIDE tier and hold only what a source said about this problem specifically
+// (see src/coverage.js). The caller separately passes `answerNotApplicable`, the
+// RESOLVED verdict including any inherited test declaration, because clearing a
+// stale answer is an action that must follow the resolved state even when the
+// claim lives on the test row.
+//
+// That clearing is the one exception to "a missing answer never wipes": when the
+// resolved answer_status is `not_applicable`, a source has affirmatively said no
+// answer exists, so any previously imported one goes. That is what retracts the
+// answers OCR'd out of proof prose before comp-OCR declared those tests proof —
+// deleting the upstream problem_answer.json alone would not, because the
+// COALESCE below is otherwise designed to preserve exactly such a value.
 export function upsertPdfProblem(db, problem, testId) {
     const section = -1; // section lives on the test row; problems always -1
     const statement = problem.statement;
-    const answer = problem.answer ?? null;
+    const has = (key) => Object.prototype.hasOwnProperty.call(problem, key);
+    const updateCoverageResponseKind = has("coverage_response_kind");
+    const updateCoverageAnswerStatus = has("coverage_answer_status");
+    const coverageResponseKind = problem.coverage_response_kind ?? null;
+    const coverageAnswerStatus = problem.coverage_answer_status ?? null;
+    const answerNotApplicable = problem.answerNotApplicable === true;
+    const answer = answerNotApplicable ? null : (problem.answer ?? null);
     const source = problem.source ?? null;
     const acgn = CleanupText.inferACGN(statement);
     const autoTagsList = getAutoTags(statement);
@@ -1548,24 +1567,33 @@ export function upsertPdfProblem(db, problem, testId) {
             test_id, n, section,
             pdf_statement, pdf_answer, pdf_source,
             statement, answer_index, answer_value,
-            acgn, tags, is_computational
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            acgn, tags, is_computational,
+            coverage_response_kind, coverage_answer_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (test_id, n, section) DO UPDATE SET
             pdf_statement = excluded.pdf_statement,
-            -- A missing OCR answer must not wipe an existing one.
-            pdf_answer    = COALESCE(excluded.pdf_answer, problems.pdf_answer),
+            -- A source-backed not_applicable retracts an automatic answer, but
+            -- never destroys verified curation. A verified contradiction is
+            -- stored and surfaced as a blocking build conflict below.
+            pdf_answer    = CASE
+                WHEN problems.verified THEN problems.pdf_answer
+                WHEN ? THEN NULL
+                ELSE COALESCE(excluded.pdf_answer, problems.pdf_answer)
+            END,
             pdf_source    = excluded.pdf_source,
             -- Resolved values, trust order verified > pdf > wiki > aops. pdf tier
             -- from excluded.*, wiki/aops from problems.*.
             statement    = COALESCE(excluded.pdf_statement, problems.wiki_statement, problems.aops_statement),
             answer_value = CASE
                 WHEN problems.verified THEN problems.answer_value
+                WHEN ? THEN NULL
                 ELSE COALESCE(excluded.pdf_answer, problems.pdf_answer, problems.wiki_answer, problems.aops_answer)
             END,
             -- pdf carries no choice index; the resolved index rides on whichever
             -- choices win (wiki > aops), keeping it order-independent.
             answer_index = CASE
                 WHEN problems.verified THEN problems.answer_index
+                WHEN ? THEN -1
                 WHEN problems.wiki_choices IS NOT NULL THEN problems.wiki_answer_index
                 ELSE problems.aops_answer_index
             END,
@@ -1573,6 +1601,16 @@ export function upsertPdfProblem(db, problem, testId) {
             -- (upsertTest) so a corrected config propagates to existing rows and a
             -- test never disagrees with its problems.
             is_computational = excluded.is_computational,
+            -- Property presence carries snapshot ownership: omitted properties
+            -- preserve stored overrides; an explicit NULL clears them.
+            coverage_response_kind = CASE
+                WHEN ? THEN excluded.coverage_response_kind
+                ELSE problems.coverage_response_kind
+            END,
+            coverage_answer_status = CASE
+                WHEN ? THEN excluded.coverage_answer_status
+                ELSE problems.coverage_answer_status
+            END,
             updated_at = datetime('now')
         RETURNING id
     `,
@@ -1590,6 +1628,15 @@ export function upsertPdfProblem(db, problem, testId) {
             acgn,
             tagsJson,
             problem.is_computational ? 1 : 0,
+            coverageResponseKind,
+            coverageAnswerStatus,
+            // The three `?`s guarding the not_applicable branches above, in
+            // statement order: pdf_answer, answer_value, answer_index.
+            answerNotApplicable ? 1 : 0,
+            answerNotApplicable ? 1 : 0,
+            answerNotApplicable ? 1 : 0,
+            updateCoverageResponseKind ? 1 : 0,
+            updateCoverageAnswerStatus ? 1 : 0,
         ).id;
 }
 
@@ -2010,6 +2057,45 @@ export function toPostgresTextArray(value) {
     return `{${escapedElements.join(",")}}`;
 }
 
+export class VerifiedCoverageConflictError extends Error {
+    constructor(conflicts) {
+        const locations = conflicts
+            .map(
+                (row) =>
+                    `  - ${row.test_name} problem ${row.n + 1} ` +
+                    `(problem_id=${row.problem_id}, test_id=${row.test_id})`,
+            )
+            .join("\n");
+        super(
+            "Cannot build production_problems: verified answer data " +
+                "conflicts with answer_status='not_applicable'.\n" +
+                locations +
+                "\nResolve each conflict by correcting the coverage claim " +
+                "or intentionally removing/unverifying the answer.",
+        );
+        this.name = "VerifiedCoverageConflictError";
+        this.conflicts = conflicts;
+    }
+}
+
+function getVerifiedCoverageConflicts(db) {
+    return db
+        .query(
+            `SELECT p.id AS problem_id, p.test_id, p.n,
+                    COALESCE(t.name, '[missing test]') AS test_name,
+                    p.answer_value, p.answer_index
+             FROM problems p
+             LEFT JOIN tests t ON t.id = p.test_id
+             WHERE p.verified = 1
+               AND COALESCE(p.coverage_answer_status, t.answer_status)
+                   = 'not_applicable'
+               AND (p.answer_value IS NOT NULL
+                    OR COALESCE(p.answer_index, -1) >= 0)
+             ORDER BY p.test_id, p.n, p.id`,
+        )
+        .all();
+}
+
 // Rebuilds the denormalized production_problems table from the curated problems
 // + solutions data. The table is purely derived, so we wipe and rebuild it in a
 // single transaction. Duplicate problems (accepted problem_links) are handled
@@ -2021,6 +2107,13 @@ export function toPostgresTextArray(value) {
 export function buildProductionProblems(db) {
     let count = 0;
     db.transaction(() => {
+        const verifiedCoverageConflicts = getVerifiedCoverageConflicts(db);
+        if (verifiedCoverageConflicts.length > 0) {
+            throw new VerifiedCoverageConflictError(
+                verifiedCoverageConflicts,
+            );
+        }
+
         db.run(`DELETE FROM production_problems`);
 
         // To restrict production to vetted rows, add a WHERE here
@@ -2030,8 +2123,14 @@ export function buildProductionProblems(db) {
                 `
             SELECT p.id, p.test_id, p.n, p.section, p.aops_topic_id AS aops_id, p.statement,
                    COALESCE(p.wiki_choices, p.aops_choices) AS choices, p.answer_index, p.answer_value, p.acgn, p.tags,
-                   p.is_computational, p.difficulty, p.quality, p.verified, p.notes
+                   p.is_computational,
+                   p.coverage_response_kind, t.response_kind AS test_response_kind,
+                   p.coverage_answer_status, t.answer_status AS test_answer_status,
+                   p.difficulty, p.quality, p.verified, p.notes
             FROM problems p
+            -- LEFT so a problem with a dangling test_id still builds, exactly as
+            -- it did before resolution needed the parent row.
+            LEFT JOIN tests t ON t.id = p.test_id
             ORDER BY p.test_id, p.section, p.n
         `,
             )
@@ -2067,6 +2166,32 @@ export function buildProductionProblems(db) {
                 : hasAnswerValue
                   ? 0
                   : -1;
+            const coverage = resolveCoverage({
+                overrideResponseKind: r.coverage_response_kind,
+                declarationResponseKind: r.test_response_kind,
+                overrideAnswerStatus: r.coverage_answer_status,
+                declarationAnswerStatus: r.test_answer_status,
+                hasAnswer: productionAnswerIndex >= 0,
+                rawIsComputational: r.is_computational,
+            });
+            if (
+                coverage.answerStatus === "not_applicable" &&
+                productionAnswerIndex >= 0
+            ) {
+                throw new Error(
+                    `Coverage invariant failed for problem_id=${r.id}: ` +
+                        "answer_status='not_applicable' requires answer_index=-1",
+                );
+            }
+            if (
+                coverage.answerStatus === "known" &&
+                productionAnswerIndex < 0
+            ) {
+                throw new Error(
+                    `Coverage invariant failed for problem_id=${r.id}: ` +
+                        "answer_status='known' requires a usable answer",
+                );
+            }
             contentById.set(r.id, {
                 statement: r.statement,
                 choices: toPostgresTextArray(productionChoices),
@@ -2074,7 +2199,9 @@ export function buildProductionProblems(db) {
                 official_solutions: sols.length ? JSON.stringify(sols) : null,
                 topic: r.acgn,
                 tags: toPostgresTextArray(r.tags),
-                is_computational: r.is_computational,
+                is_computational: coverage.isComputational,
+                response_kind: coverage.responseKind,
+                answer_status: coverage.answerStatus,
                 difficulty: r.difficulty,
                 quality: r.quality,
                 verified: r.verified,
@@ -2087,8 +2214,9 @@ export function buildProductionProblems(db) {
             INSERT INTO production_problems (
                 test_id, n, canonical_test_id, canonical_n, aops_id,
                 statement, choices, answer_index, official_solutions,
-                topic, tags, is_computational, difficulty, quality, verified, notes
-            ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
+                topic, tags, is_computational, response_kind, answer_status,
+                difficulty, quality, verified, notes
+            ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?)
         `);
 
         // Pass 2: resolve canonical, propagate its content to aliases, insert.
@@ -2113,6 +2241,8 @@ export function buildProductionProblems(db) {
                 bundle.topic,
                 bundle.tags,
                 bundle.is_computational,
+                bundle.response_kind,
+                bundle.answer_status,
                 bundle.difficulty,
                 bundle.quality,
                 bundle.verified,

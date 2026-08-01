@@ -5,6 +5,25 @@ import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 import { RATING_POLICY } from "../rating_policy.js";
 import { matchRule, computeSeed } from "./ratingSeed.js";
+import { isComputationalFor } from "./coverage.js";
+
+// `tests` rows are exported straight from the table, with no derived layer in
+// between (unlike problems, which go through production_problems). So every
+// path that reads them applies the coverage-aware is_computational here, using
+// the same isComputationalFor() buildProductionProblems uses. Rows must carry
+// `response_kind`. Mutates in place and returns the rows for chaining.
+//
+// Safe with respect to identity: testSyncKey() is built from
+// aops_category_id/series/year/name/section and never from is_computational.
+function resolveTestRows(rows) {
+    for (const t of rows) {
+        t.is_computational = isComputationalFor(
+            t.is_computational,
+            t.response_kind,
+        );
+    }
+    return rows;
+}
 
 function sanitizeStringCSV(content) {
     content = content.replace(/\r\n/g, "\n");
@@ -69,6 +88,7 @@ export async function exportProductionCSV(db, outDir = "scrape_data") {
     `,
         )
         .all();
+    resolveTestRows(tests);
 
     const series = db.query(`SELECT * FROM series ORDER BY name`).all();
 
@@ -166,10 +186,11 @@ const SQL_EXPORT_TABLES = [
         select: `
             SELECT id, series_id, name, section, year, division,
                    division_order, format, format_order, aops_category_id,
-                   type, is_computational, difficulty, quality
+                   type, is_computational, response_kind, difficulty, quality
             FROM tests
             ORDER BY id
         `,
+        resolveRows: resolveTestRows,
     },
     {
         name: "problems",
@@ -391,12 +412,14 @@ export async function exportStagingSQL(
             `
         SELECT t.id, s.name AS series_name, t.name, t.year, t.division,
                t.division_order, t.format, t.format_order, t.aops_category_id,
-               t.section, t.type, t.is_computational, t.difficulty, t.quality
+               t.section, t.type, t.is_computational, t.response_kind,
+               t.difficulty, t.quality
         FROM tests t JOIN series s ON t.series_id = s.id
         ORDER BY t.id
     `,
         )
         .all();
+    resolveTestRows(tests);
 
     const testKeyById = new Map();
     for (const t of tests) {
@@ -653,7 +676,9 @@ export async function exportProductionSQL(
     if (includeInserts) {
         parts.push("", "BEGIN;");
         for (const table of SQL_EXPORT_TABLES) {
-            const rows = db.query(table.select).all();
+            const rows = table.resolveRows
+                ? table.resolveRows(db.query(table.select).all())
+                : db.query(table.select).all();
             counts[table.name] = rows.length;
             parts.push("", `-- ${table.name}`, insertStatements(table, rows));
         }
