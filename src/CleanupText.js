@@ -1,3 +1,16 @@
+// The `problems.acgn` / `production_problems.topic` vocabulary. `O` is the
+// "nothing scored" fallback, not a subject. Defined here because INFER_WORDS
+// below emits these codes; src/topicPolicy.js and src/testMetadata.js name
+// them from here so the set has exactly one definition.
+export const TOPIC = {
+    CALCULUS: "K",
+    ALGEBRA: "A",
+    COMBINATORICS: "C",
+    GEOMETRY: "G",
+    NUMBER_THEORY: "N",
+    OTHER: "O",
+};
+
 export class CleanupText {
     static multiLineRegexes = [
         {
@@ -11,7 +24,7 @@ export class CleanupText {
 
     static INFER_WORDS = [
         {
-            name: "K",
+            name: TOPIC.CALCULUS,
             keywords: [
                 "derivative",
                 "differentiate",
@@ -45,7 +58,7 @@ export class CleanupText {
             ],
         },
         {
-            name: "A",
+            name: TOPIC.ALGEBRA,
             keywords: [
                 "real number",
                 "complex number",
@@ -71,7 +84,7 @@ export class CleanupText {
             ],
         },
         {
-            name: "C",
+            name: TOPIC.COMBINATORICS,
             keywords: [
                 "probability",
                 "number of ways",
@@ -98,7 +111,7 @@ export class CleanupText {
             ],
         },
         {
-            name: "G",
+            name: TOPIC.GEOMETRY,
             keywords: [
                 "circle",
                 "radius",
@@ -143,7 +156,7 @@ export class CleanupText {
             ],
         },
         {
-            name: "N",
+            name: TOPIC.NUMBER_THEORY,
             keywords: [
                 "integer",
                 "divisor",
@@ -623,7 +636,7 @@ export class CleanupText {
                 best = mathType.name;
             }
         }
-        return best ?? "O";
+        return best ?? TOPIC.OTHER;
     }
 
     static removePSHideAns(text) {

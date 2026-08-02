@@ -48,86 +48,18 @@ import {
     mandelbrotDivisionMetadata,
     bmtDivisionMetadata,
     bmtFormatMetadata,
+    splitBmtRegion,
     smtDivisionMetadata,
     smtFormatMetadata,
+    cmimcDivisionMetadata,
+    cmimcFormatMetadata,
+    chmmcSeasonMetadata,
+    chmmcFormatMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
 
 const HMMT_MONTHS = { feb: "February", nov: "November" };
-// HMMT round/theme -> format label + order (the "which format" axis).
-const HMMT_ROUNDS = {
-    adv: { label: "Advanced", order: 10 },
-    alg: { label: "Algebra", order: 20 },
-    calc: { label: "Calculus", order: 30 },
-    comb: { label: "Combinatorics", order: 40 },
-    geo: { label: "Geometry", order: 50 },
-    gen: { label: "General", order: 60 },
-    gen1: { label: "General 1", order: 61 },
-    gen2: { label: "General 2", order: 62 },
-    guts: { label: "Guts", order: 70 },
-    oral: { label: "Oral", order: 80 },
-    pow: { label: "Power", order: 90 },
-    team: { label: "Team", order: 100 },
-    team1: { label: "Team 1", order: 101 },
-    team2: { label: "Team 2", order: 102 },
-    algcalc: { label: "Algebra/Calculus", order: 110 },
-    algcomb: { label: "Algebra/Combinatorics", order: 120 },
-    alggeo: { label: "Algebra/Geometry", order: 130 },
-    calccomb: { label: "Calculus/Combinatorics", order: 140 },
-    calcgeo: { label: "Calculus/Geometry", order: 150 },
-    combgeo: { label: "Combinatorics/Geometry", order: 160 },
-    thm: { label: "Theme", order: 170 },
-};
-const PUMAC_SUBJECTS = {
-    algebra: { label: "Algebra", order: 10 },
-    combinatorics: { label: "Combinatorics", order: 20 },
-    geometry: { label: "Geometry", order: 30 },
-    number_theory: { label: "Number Theory", order: 40 },
-    individual_finals: { label: "Individual Finals", order: 50 },
-};
-
-const CMIMC_DIVISIONS = {
-    individual: { label: "Individual", order: 10 },
-    team: { label: "Team", order: 20 },
-    "division-1": { label: "Division 1", order: 30 },
-    "division-2": { label: "Division 2", order: 40 },
-    "mini-events": { label: "Mini-Events", order: 50 },
-};
-
-const CMIMC_FORMATS = {
-    algebra: { label: "Algebra", order: 10 },
-    combinatorics: { label: "Combinatorics", order: 20 },
-    geometry: { label: "Geometry", order: 30 },
-    "number-theory": { label: "Number Theory", order: 40 },
-    "computer-science": { label: "Computer Science", order: 50 },
-    team: { label: "Team", order: 60 },
-    finals: { label: "Finals", order: 70 },
-    "integration-bee": { label: "Integration Bee", order: 80 },
-};
-
-const CHMMC_SEASONS = {
-    winter: { label: "Winter", order: 10 },
-    spring: { label: "Spring", order: 20 },
-    fall: { label: "Fall", order: 30 },
-    annual: { label: "Annual", order: 40 },
-};
-
-const CHMMC_FORMATS = {
-    individual: { label: "Individual", order: 10 },
-    team: { label: "Team", order: 20 },
-    tiebreaker: { label: "Tiebreaker", order: 30 },
-    mixer: { label: "Mixer", order: 40 },
-    proof: { label: "Proof", order: 50 },
-    "integration-bee-qualifying": {
-        label: "Integration Bee Qualifying",
-        order: 60,
-    },
-    "integration-bee-finals": {
-        label: "Integration Bee Finals",
-        order: 70,
-    },
-};
 
 // Per OCR-series-folder config. `seriesName` is the canonical DB series name
 // (must match an existing row exactly to reuse it). `parseTest` turns an OCR
@@ -158,17 +90,21 @@ export const SERIES_CONFIG = {
         isOfficial: true,
         isComputational: true,
         // "2015_national_sprint" -> "2015 MATHCOUNTS National Sprint"
+        // "2000_national_cdr" / "2024_state_countdown" -> "… Countdown"
+        // The name is built from the resolved labels rather than the raw folder
+        // tokens, so the two Countdown spellings land on one test name (and one
+        // test) instead of a "Cdr"/"Countdown" pair.
         parseTest(folder) {
-            const [year, division, format, ...extra] = folder.split("_");
-            if (format?.toLowerCase() === "countdown") return null;
-            const rest = [division, format, ...extra].filter(Boolean);
-            const label = rest.map(titleCase).join(" ");
+            const [year, division, format] = folder.split("_");
+            const meta = mathcountsTestMetadata(division, format);
+            if (!Number.isInteger(Number(year))) return null;
+            if (!meta.division || !meta.format) return null;
             return {
-                name: `${year} MATHCOUNTS ${label}`.trim(),
+                name: `${year} MATHCOUNTS ${meta.division} ${meta.format}`,
                 year: Number(year),
                 section: -1,
                 sectionName: null,
-                ...mathcountsTestMetadata(division, format),
+                ...meta,
             };
         },
     },
@@ -246,22 +182,21 @@ export const SERIES_CONFIG = {
                     sectionName: null,
                     seriesName: "HMMT",
                     ...hmmtSeasonMetadata("hmic"),
-                    ...hmmtRoundMetadata(null, null),
+                    ...hmmtRoundMetadata(null),
                 };
             }
             const month = HMMT_MONTHS[monthOrKind?.toLowerCase()];
-            const roundKey = round?.toLowerCase();
-            const roundMeta = HMMT_ROUNDS[roundKey];
-            if (!month || !roundMeta) return null;
+            const roundMeta = hmmtRoundMetadata(round);
+            if (!month || !roundMeta.format) return null;
             const seriesName = month === "November" ? "HMMT November" : "HMMT";
             return {
-                name: `${year} HMMT ${month} ${roundMeta.label}`,
+                name: `${year} HMMT ${month} ${roundMeta.format}`,
                 year,
                 section: -1,
                 sectionName: null,
                 seriesName,
                 ...hmmtSeasonMetadata(monthOrKind),
-                ...hmmtRoundMetadata(roundMeta.label, roundMeta.order),
+                ...roundMeta,
             };
         },
     },
@@ -330,20 +265,20 @@ export const SERIES_CONFIG = {
                     sectionName: null,
                     seriesName: "PUMAC",
                     ...pumacDivisionMetadata("TEAM"),
-                    ...pumacSubjectMetadata(null, null),
+                    ...pumacSubjectMetadata(null),
                 };
             }
             if (L !== "A" && L !== "B") return null;
-            const subj = PUMAC_SUBJECTS[subject?.toLowerCase()];
-            if (!subj) return null;
+            const subj = pumacSubjectMetadata(subject);
+            if (!subj.format) return null;
             return {
-                name: `${year} PUMaC ${L} ${subj.label}`,
+                name: `${year} PUMaC ${L} ${subj.format}`,
                 year,
                 section: -1,
                 sectionName: null,
                 seriesName: "PUMAC",
                 ...pumacDivisionMetadata(L),
-                ...pumacSubjectMetadata(subj.label, subj.order),
+                ...subj,
             };
         },
     },
@@ -353,16 +288,20 @@ export const SERIES_CONFIG = {
         isComputational: true,
         // Folder is "<division>_<year>_<format>" (division may hyphenate, e.g.
         // "bmmt-online"). The division (BMT/BMMT/BMMT Online) rides on the
-        // `division` axis; the round/subject rides on `format`.
-        // "bmt_2024_algebra"      -> "2024 BMT Algebra"
-        // "bmmt_2012_individual"  -> "2012 BMMT Individual"
+        // `division` axis; the round/subject rides on `format`. The format token
+        // may carry a "-tiebreaker" and/or a trailing regional edition, the
+        // latter folding into the division (see splitBmtRegion).
+        // "bmt_2024_algebra"           -> "2024 BMT Algebra"
+        // "bmmt_2012_individual"       -> "2012 BMMT Individual"
+        // "bmt_2020_calculus-tiebreaker" -> "2020 BMT Calculus Tiebreaker"
+        // "bmmt_2019_team-us-iran"     -> "2019 BMMT US/Iran Team"
         parseTest(folder) {
             const [divToken, yearStr, ...rest] = folder.split("_");
             const year = Number(yearStr);
-            const fmtToken = rest.join("_");
-            if (!Number.isInteger(year) || !fmtToken) return null;
-            const div = bmtDivisionMetadata(divToken);
-            const fmt = bmtFormatMetadata(fmtToken);
+            const { formatToken, regionToken } = splitBmtRegion(rest.join("_"));
+            if (!Number.isInteger(year) || !formatToken) return null;
+            const div = bmtDivisionMetadata(divToken, regionToken);
+            const fmt = bmtFormatMetadata(formatToken);
             if (!div.division || !fmt.format) return null;
             return {
                 name: `${year} ${div.division} ${fmt.format}`,
@@ -408,20 +347,19 @@ export const SERIES_CONFIG = {
         parseTest(folder) {
             const [yearToken, divisionToken, formatToken] = folder.split("_");
             const year = Number(yearToken);
-            const division = CMIMC_DIVISIONS[divisionToken];
-            const format = CMIMC_FORMATS[formatToken];
+            const div = cmimcDivisionMetadata(divisionToken);
+            const fmt = cmimcFormatMetadata(formatToken);
 
-            if (!Number.isInteger(year) || !division || !format) return null;
+            if (!Number.isInteger(year) || !div.division || !fmt.format)
+                return null;
 
             return {
-                name: `${year} CMIMC ${division.label} ${format.label}`,
+                name: `${year} CMIMC ${div.division} ${fmt.format}`,
                 year,
                 section: -1,
                 sectionName: null,
-                division: division.label,
-                divisionOrder: division.order,
-                format: format.label,
-                formatOrder: format.order,
+                ...div,
+                ...fmt,
             };
         },
     },
@@ -433,29 +371,24 @@ export const SERIES_CONFIG = {
             const [yearToken, seasonToken, formatToken, ...rest] =
                 folder.split("_");
             const year = Number(yearToken);
-            const season = CHMMC_SEASONS[seasonToken];
+            const sea = chmmcSeasonMetadata(seasonToken);
             const formatKey = [formatToken, ...rest].join("-");
-            const format = CHMMC_FORMATS[formatKey];
+            const fmt = chmmcFormatMetadata(formatKey);
 
-            if (!Number.isInteger(year) || !season || !format) return null;
+            if (!Number.isInteger(year) || !sea.division || !fmt.format)
+                return null;
 
             return {
-                name: `${year} ${season.label} CHMMC ${format.label}`,
+                name: `${year} ${sea.division} CHMMC ${fmt.format}`,
                 year,
                 section: -1,
                 sectionName: null,
-                division: season.label,
-                divisionOrder: season.order,
-                format: format.label,
-                formatOrder: format.order,
+                ...sea,
+                ...fmt,
             };
         },
     },
 };
-
-function titleCase(word) {
-    return word ? word[0].toUpperCase() + word.slice(1) : word;
-}
 
 // Confidence policy for auto-linking duplicate groups (matches the plan):
 //   similarity >= 1.0            -> auto-accept

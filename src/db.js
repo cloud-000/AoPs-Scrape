@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { CleanupText } from "./CleanupText.js";
 import { getAutoTags } from "./autoTags.js";
 import { sectionTestMetadata } from "./testMetadata.js";
+import { resolveTopic } from "./topicPolicy.js";
 import {
     ANSWER_STATUS_CLAIMS,
     RESPONSE_KINDS,
@@ -1080,6 +1081,25 @@ FROM tests_old;
         }
     }
 
+    // Migration: MATHCOUNTS Countdown tests were named from the raw OCR folder
+    // token ("2000 MATHCOUNTS National Cdr") while their format column already
+    // said "Countdown". pdfImport now builds MATHCOUNTS names from the resolved
+    // labels, so the older rows are renamed to match — otherwise the "cdr" and
+    // "countdown" folder spellings would resolve to two tests for one round.
+    // Idempotent, and the NOT EXISTS guard keeps a rename from colliding with a
+    // row that already carries the new name.
+    db.run(`
+        UPDATE tests AS t SET name = replace(t.name, ' Cdr', ' Countdown')
+        WHERE t.format = 'Countdown'
+          AND t.name LIKE '% Cdr'
+          AND NOT EXISTS (
+              SELECT 1 FROM tests o
+              WHERE o.series_id = t.series_id
+                AND o.name = replace(t.name, ' Cdr', ' Countdown')
+                AND o.year IS t.year
+          )
+    `);
+
     return db;
 }
 
@@ -1400,13 +1420,25 @@ function upsertSolutions(db, problemId, solutions, allPosts, isOly) {
     }
 }
 
+// The `acgn` topic for a problem being written under `testId`: the parent
+// test's declared subject when it has one (a Calculus / Integration Bee round),
+// else the keyword inference over the statement. See src/topicPolicy.js. Every
+// path that writes problems.acgn — here and in preprocess's reclassify step —
+// must resolve it this way, or a re-run of `preprocess` would undo the
+// declaration. bun:sqlite caches prepared statements per SQL string, so the
+// per-problem lookup is a hash hit, not a re-parse.
+function topicForTest(db, testId, statement) {
+    const test = db.query(`SELECT format FROM tests WHERE id = ?`).get(testId);
+    return resolveTopic(statement, test);
+}
+
 function upsertProblem(db, problem, testId) {
     const aopsChoices =
         problem.choices != null ? JSON.stringify(problem.choices) : null;
     const aopsAnswer = problem.answerValue ?? null; // literal answer (letter or number)
     const aopsAnswerIndex = problem.answerIndex ?? -1; // index into choices for MCQ
     const section = problem.section ?? -1;
-    const acgn = CleanupText.inferACGN(problem.statement);
+    const acgn = topicForTest(db, testId, problem.statement);
     const autoTagsList = getAutoTags(problem.statement);
     const tagsJson =
         autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
@@ -1551,7 +1583,7 @@ export function upsertPdfProblem(db, problem, testId) {
     const answerNotApplicable = problem.answerNotApplicable === true;
     const answer = answerNotApplicable ? null : (problem.answer ?? null);
     const source = problem.source ?? null;
-    const acgn = CleanupText.inferACGN(statement);
+    const acgn = topicForTest(db, testId, statement);
     const autoTagsList = getAutoTags(statement);
     const tagsJson =
         autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;
@@ -1653,7 +1685,7 @@ export function upsertWikiProblem(db, problem, testId) {
     const wikiAnswer = problem.answerValue ?? null;
     const wikiAnswerIndex = problem.answerIndex ?? -1;
     const statement = problem.statement;
-    const acgn = CleanupText.inferACGN(statement);
+    const acgn = topicForTest(db, testId, statement);
     const autoTagsList = getAutoTags(statement);
     const tagsJson =
         autoTagsList.length > 0 ? JSON.stringify(autoTagsList) : null;

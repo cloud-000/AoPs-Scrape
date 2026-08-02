@@ -1,5 +1,6 @@
 import { CleanupText } from './CleanupText.js';
 import { getAutoTags } from './autoTags.js';
+import { resolveTopic } from './topicPolicy.js';
 import { SOLUTIONS_USERS } from '../contest_id.js';
 import {
     classifySolutions,
@@ -14,7 +15,7 @@ import {
  *
  * Responsibilities:
  * 1. Re-extract MCQ choices / clean statements on the source of truth
- * 2. Re-run inferACGN on every problem (can update acgn)
+ * 2. Re-resolve every problem's acgn (test-declared subject, else inferACGN)
  * 3. Apply AUTO_TAGS and union into existing tags
  * 4. is_official detection for solution sources based on known organizers
  * 5. Re-apply solution classification rules to existing solutions
@@ -91,13 +92,25 @@ function refreshChoices(db) {
 
 function reclassifyAcgn(db) {
     console.log("Step 2: Re-inferring ACGN classification...");
-    const problems = db.query("SELECT id, statement FROM problems WHERE statement IS NOT NULL").all();
+    // Joined to tests because a test can declare its problems' subject outright
+    // (a Calculus / Integration Bee round), in which case that declaration wins
+    // over the keyword inference — see src/topicPolicy.js.
+    const problems = db
+        .query(
+            `SELECT p.id, p.statement, t.format AS test_format
+             FROM problems p
+             LEFT JOIN tests t ON t.id = p.test_id
+             WHERE p.statement IS NOT NULL`,
+        )
+        .all();
     let updated = 0;
     const stmt = db.prepare("UPDATE problems SET acgn = ? WHERE id = ?");
 
     db.transaction(() => {
         for (const p of problems) {
-            const newAcgn = CleanupText.inferACGN(p.statement);
+            const newAcgn = resolveTopic(p.statement, {
+                format: p.test_format,
+            });
             stmt.run(newAcgn, p.id);
             updated++;
         }
