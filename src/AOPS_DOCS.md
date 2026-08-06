@@ -165,7 +165,11 @@ Items returned inside `category.items` / `new_items` from `fetch_category_data` 
 
 - `item_type === "view_posts"` → a problem post (scrape it)
 - `item_type === "folder"` → a sub-folder containing more tests (recurse)
-- `item_type === "post"` or `post_type === "view_posts_text"` → usually a section marker or description post (not a problem). **Exception:** some contests pack the entire test into one such post as a numbered list ("1. … 2. …" with MCQ choices) and expose no per-problem forum topics. `getTest` detects this via `_isPackedProblemPost` and routes the post through the multi-problem path instead of treating it as a section title. Such problems have `topic_id === 0` and therefore no discussion thread to mine for answers (answers stay `-1`/`null`).
+- `item_type === "post"` or `post_type === "view_posts_text"` → usually a section marker or description post (not a problem). **Two exceptions**, both routed away from the section path by `getTest`:
+  - Some contests pack the entire test into one such post as a numbered list ("1. … 2. …" with MCQ choices) and expose no per-problem forum topics. `_isPackedProblemPost` detects this and feeds the post to the multi-problem path.
+  - A single problem is sometimes posted as plain text rather than as a forum topic (a redacted problem, a `"Same as A5"` duplicate marker, a joke problem). AoPS labels these with the problem's own number in `item_text` (`"7"`, `"B1"`, `"12a"`), which is what distinguishes them from a header — a header has either no `item_text` or a non-label one (`"2022-23"`). `isProblemSlot` tests that label and `_handleProblemSlot` handles the item.
+
+  Problems from either exception have `topic_id === 0` and therefore no discussion thread to mine for answers (answers stay `-1`/`null` unless an answer key supplies one).
 - `item_type === "post_hidden"` → hidden/locked post (skip)
 
 ---
@@ -295,7 +299,7 @@ Fetches and parses a single test category into a structured test object.
   type: string,             // e.g. "AMC 10", "AIME", "AMO"
   computational: boolean,
   answerKind: string | null, // "mcq" | "numeric" | "proof" | "mixed" | null — decided from the problems' own evidence
-  sections: string[],       // empty array if no sections
+  sections: string[],       // empty array if no sections; a leading "" is the unnamed lead section
   problems: Problem[] | Problem[][],  // flat if no sections; nested array if sectioned
   count: number,            // total number of problems scraped
 }
@@ -320,15 +324,25 @@ Fetches and parses a single test category into a structured test object.
 
 Numeric answers: computational tests without MCQ choices (AIME, ARML, COMP, COLLEGE, …) keep `choices = null` and `answerIndex = -1`; the known answer lives in `answerValue` (set by `_setNumericAnswer`) and may be any string (LaTeX, fraction, word). MCQ problems have `choices` populated, `answerIndex` pointing at the correct option, and `answerValue` holding the option letter. Whether a given problem is treated as MCQ vs. numeric is decided per-test by the resolve pass (`_finalizeComputationalAnswers`), not by the contest name alone — see the answer-resolution note under `searchTopicForAnswer`. A tie/off-by-one MCQ-vs-numeric split leaves the test `answerKind: "mixed"` with each problem keeping its own kind.
 
-Sections: if a test has sections, `problems` is an array of arrays (`problems[sectionIndex][problemIndex]`). If only one section is detected, the section is collapsed and `problems` is flat. When collapsing, `_normalizeSections` checks the lone header via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`) and retained as normalized `division` or `format` metadata; noise headers (problem counts, time limits, …) are dropped. Multi-section AIME I/II and `Day N` labels are normalized when their separate test rows are stored.
+Sections: the item walk never writes `problems` directly. It appends every problem to the current **bucket** — one implicit unnamed bucket up front, one more per section header (`ctx.buckets`) — and `_normalizeSections(test, ctx)` converts the buckets into the published shape once, before any consumer reads it. That is what makes the flat-or-nested union safe to resolve by checking `problems[0]`: the array can never hold a mix of problems and section buckets, which is what a header arriving after already-collected problems used to produce.
+
+Materialization rules, in order: a bucket opened by a logistics header (`CleanupText.isLogisticsHeader` — "10 problems for 75 minutes") is un-named, since that header introduces the test itself rather than a part of it; buckets no problem landed in are dropped (a trailing or duplicated header, or the lead bucket of a test that opens with a header); one surviving bucket publishes flat `problems` with `sections: []`; two or more publish `problems[sectionIndex][problemIndex]` with `sections[sectionIndex]`. `problem.section` is stamped here — the bucket index, or `-1` when flat.
+
+Buckets are never merged, however few problems one holds: a trailing round with a single problem ("Team Round", a one-problem `"shortlisted"` appendix) stays its own section. Merging it would carry its restarted numbering into the previous section, where the DB's `(test_id, n)` key would collapse it onto that section's first problem.
+
+An unnamed bucket that survives alongside named ones (a test whose problems are followed by a `"shortlist"` header or by tiebreaker rounds) is published with the empty name `""`: its problems are the test proper and the named buckets are what the headers introduced. `db.js` names that row after the test alone, so a category previously scraped flat merges onto its existing row rather than duplicating.
+
+When exactly one bucket survives, its header is checked via `CleanupText.extractSectionLabel`: an identifying label ("High School", "Middle School", or an A/B test/version letter) is appended to `name` (e.g. `"2023 Purple Comet"` → `"2023 Purple Comet Middle School"`) and retained as normalized `division` or `format` metadata; noise headers (problem counts, time limits, …) are dropped. Multi-section AIME I/II and `Day N` labels are normalized when their separate test rows are stored. The AIME I/II rename requires both section labels to be administration dates ("March 13th") or roman numerals — AoPS heads each half of an official AIME category with a numeral followed by its date, and the walk keeps the date. A mock AIME split into two named rounds ("Individual Round"/"Team Round") or followed by an appendix keeps its own labels.
 
 Review metadata is nullable presentation data only. It is populated from structured section information at ingestion, never inferred by a generic pass over finished display names, and does not participate in test identity. An omitted property means the source has no classification to contribute; an explicit `null` clears a stale classification during upsert.
 
 Name normalization: the category name is passed through `CleanupText.normalizeContestName` before it becomes the test/series name (currently rewrites `"Purple Comet Problems"` → `"Purple Comet"`).
 
-Packed posts: for each item, a `view_posts_text`/description item is normally a section marker, but `_isPackedProblemPost(item, ctx)` first checks whether it actually contains multiple numbered problems (`CleanupText.checkContainsMultiple`). If so, the item is fed to `_handleProblemItem` (multi-problem split) instead of `_handleSectionMarker`. This is the only path that produces problems with `topicId === 0`.
+Non-header `view_posts_text` items: a description item is only routed to `_handleSectionMarker` after two checks. `_isPackedProblemPost(item, ctx)` asks whether it contains multiple numbered problems (`CleanupText.checkContainsMultiple`) and, if so, feeds it to `_handleProblemItem` (multi-problem split); otherwise `isProblemSlot(item)` asks whether AoPS labeled it with a problem number and, if so, feeds it to `_handleProblemSlot`. These two paths are the only ones that produce problems with `topicId === 0`/`null`.
 
-Answer keys: after the problem list is built **and the resolve pass has run** (and only for computational tests), `getTest` always calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). If found, it is parsed with `CleanupText.parseAnswerKey(post_canonical, name)` and applied via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`); when a post packs multiple `[hide=label]` keys (e.g. one per subtest), the block whose label best matches `name` is chosen. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
+Answer keys: before walking the problem list (and only for computational tests), `getTest` calls `_extractInCategoryAnswerKey(items, name)` to look for an answer key shipped inside the category itself (a `post_hidden` item whose `item_text` matches `/answers?\s*key/i`). Every item matching that predicate is excluded from the structural problem/section walk, so a `view_posts_text` answer key cannot become a section marker. The parsed key is retained and applied only **after the resolve pass** via `_applyForumAnswerKey`. `parseAnswerKey` handles several layouts — bare letters/short numbers (`4. D`), `$…$` math (`4. $\frac{17}{6}$`), and free-form lists with optional `| author` annotations (`3. 1018081 | james4l`).
+
+When a post packs several **competing** keys — one per subtest, each numbered from 1 — the right one is chosen **before** any of those formats run (`_competingAnswerBlocks` → `_bestLabeledBlock`). That ordering matters: the format cascade scans the whole post and keeps the first entry it finds per number, so two keys parsed together interleave (the first block's answer wins for one number, a later block's for the next wherever the first block's line didn't match that format). Both layouts posters use are recognized: `[hide=label]` blocks, and plain heading lines above each list (`"Algebra\n1. 3\n…\nGeometry\n1. 49\n…"`, headings BBCode-stripped). Blocks are scored by how many of their label's words `name` also uses, and when nothing matches, a label that calls itself the answers beats one that doesn't (a "Scores" leaderboard is numbered from 1 too). A key merely *split* across blocks by range (`[hide=1-5]…[hide=6-10]…`) has only one block starting at 1, so it is left alone and still merges. If the chosen block parses to nothing, the whole post is parsed as before. Only when no in-category key is present does it fall back to the stickied-forum lookup (`_fetchStickyAnswerKey`, gated by `enableStickyAnswerKey`). The in-category key requires no extra request — it comes from the data already fetched by `_fetchCategory`.
 
 ---
 
@@ -345,7 +359,7 @@ Finds and parses an answer key embedded in a test category's own item list.
 
 **Output:** `Record<string, string>` mapping 1-based problem number to answer string, or `null` if no answer-key item is found or it parses to nothing.
 
-Selects the first item with `item_type === "post_hidden"` whose `item_text` matches `/answers?\s*key/i`, then runs `CleanupText.parseAnswerKey(post_canonical, name)`. These items are excluded from the problem list by `_isProblemItem`, so they must be parsed separately here. No network request.
+Selects the first item with `item_type === "post_hidden"` whose `item_text` matches `/answers?\s*key/i`, then runs `CleanupText.parseAnswerKey(post_canonical, name)`. `getTest` uses the same predicate to exclude every matching item from its structural problem/section walk, then applies the parsed result after answer resolution. No network request.
 
 ---
 
@@ -483,7 +497,7 @@ Runs **after** the resolve pass, so it overrides the `\boxed{}`-derived answers 
 - **MCQ** (branches per-problem on `problem.choices`, so a mixed test is handled correctly): answer key is authoritative — re-resolves the `answerIndex` via `CleanupText.choiceIndexOfAnswer` (normalized letter/value match) and sets `answerValue` to the option letter, overriding any `\boxed{}` result.
 - **Numeric** (AIME, COMP, etc.): only fills in the answer when `answerValue` is currently `null` (never overrides a `\boxed{}` answer); when it does, it sets `answerValue` via `_setNumericAnswer`.
 - Problems with no entry in `answerMap` are untouched.
-- Works on both flat and section-nested `problems` arrays; uses a running counter (not `problem.n`) for 1-based numbering across sections.
+- Works on both flat and section-nested `problems` arrays (via `allProblems`), and looks each problem up by its own number (`problem.n + 1`), not by arrival order: a slot that reserved a number without producing a problem (a redacted item) must not shift every later answer, and each section restarts at 1.
 
 ---
 

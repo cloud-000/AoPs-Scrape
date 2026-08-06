@@ -54,7 +54,9 @@
  * @property {number|null} [formatOrder]       Stable sibling format display order.
  * @property {string}  type                Type name (e.g. "AMC 10", "AIME").
  * @property {boolean} computational       Has numeric/MCQ answers (vs. proof-based).
- * @property {string[]} sections           Section names; empty for flat tests.
+ * @property {string[]} sections           Section names; empty for flat tests. A
+ *                                         leading "" is the unnamed lead section:
+ *                                         the problems listed before the first header.
  * @property {ScrapedProblem[]|ScrapedProblem[][]} problems  Flat, or 2D when sectioned.
  * @property {number}  count               Total problem count.
  */

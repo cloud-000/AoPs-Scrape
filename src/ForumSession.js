@@ -32,6 +32,53 @@ function isPostDesc(item) {
    );
 }
 
+// A problem's own label as AoPS shows it in the category listing: "7", "B1",
+// "12a". Section headers carry either no item_text at all or a non-label one
+// ("2022-23"), which is what separates the two kinds of non-forum item.
+const PROBLEM_LABEL = /^[A-Za-z]{0,2}\d+[a-z]?$/;
+
+// A slot whose body only says the statement isn't there: a redacted problem or
+// a pointer at the problem it duplicates. It still owns its number.
+const PLACEHOLDER_SLOT = /^(?:redacted|removed|voided?|n\/?a|same as\b.*)$/i;
+
+// Some problems are posted as plain text instead of a forum topic — redacted
+// problems, "Same as A5" duplicate markers, joke problems. They reach us as
+// view_posts_text items just like section headers do, and are told apart by
+// AoPS's own label rather than by matching their body against a phrase list.
+function isProblemSlot(item) {
+   return PROBLEM_LABEL.test((item.item_text ?? "").trim());
+}
+
+// Whether an item can open a section, used both to route it and to look ahead
+// from the item before it. Deliberately ignores packed-post detection: that
+// depends on how many problems have been walked so far, which is unknown for
+// an item we haven't reached yet.
+function isHeaderItem(item, isOly) {
+   return !isOly && isPostDesc(item) && !isProblemSlot(item);
+}
+
+// A section header naming the day a test was administered ("March 13th",
+// "February 7th, 2023"). AoPS heads each half of an AIME category with a roman
+// numeral followed by its date, and the date is the header the walk keeps.
+const ADMINISTRATION_DATE =
+   /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+
+// The one place that resolves `problems`' flat-or-sectioned union. Safe only
+// because _normalizeSections materializes the shape before any consumer runs,
+// so the array is never a mix of problems and section buckets.
+function allProblems(test) {
+   return test.problems.length > 0 && Array.isArray(test.problems[0])
+      ? test.problems.flat()
+      : test.problems;
+}
+
+function isInCategoryAnswerKey(item) {
+   return (
+      item.item_type === "post_hidden" &&
+      /answers?\s*key/i.test(item.item_text ?? "")
+   );
+}
+
 // Single source of truth for the scraped-problem shape. Both the single- and
 // multi-problem paths build through this so every problem has identical fields.
 // See ScrapedProblem in src/types.js.
@@ -51,13 +98,12 @@ export function makeProblem(fields) {
    };
 }
 
-function addProblemToTest(problem, ctx, test, onProblemAdd) {
-   if (ctx.sectionCounter >= 0) {
-      problem.section = ctx.sectionCounter;
-      test.problems[test.problems.length - 1].push(problem);
-   } else {
-      test.problems.push(problem);
-   }
+// Problems always land in the current bucket — never straight into
+// `test.problems`, so a header arriving mid-test can't leave that array a mix
+// of problems and section buckets. `problem.section` is stamped later, by
+// _normalizeSections, once the surviving buckets are known.
+function addProblemToTest(problem, ctx, onProblemAdd) {
+   ctx.buckets[ctx.buckets.length - 1].problems.push(problem);
    onProblemAdd(problem);
 }
 
@@ -454,45 +500,54 @@ export class ForumSession {
       this.log(`Test ${id} | Type: ${type.name}`);
 
       const isOly = type.computational === false;
+      // Hidden in-category answer keys are metadata, not structural content.
+      // Parse the key now, then keep every matching item out of the problem /
+      // section walk so a view_posts_text key cannot become a fake section.
+      // The parsed answers are still applied only after answer resolution.
+      const inCategoryKey = !isOly
+         ? this._extractInCategoryAnswerKey(items, name)
+         : null;
+      const contentItems = items.filter((item) => !isInCategoryAnswerKey(item));
+      // Problems accumulate into buckets — one implicit unnamed bucket up
+      // front, one more per section header — and _normalizeSections turns the
+      // surviving buckets into the flat-or-sectioned `problems` shape once the
+      // whole category has been walked.
       const ctx = {
-         sectionCounter: -1,
+         buckets: [{ name: "", problems: [] }],
          problemIndex: 0,
          isPrevMulti: false,
          problemCount: 0,
       };
-      let lastItem = null;
 
-      for (let i = 0; i < items.length; i++) {
-         const item = items[i];
-         lastItem = item;
+      for (let i = 0; i < contentItems.length; i++) {
+         const item = contentItems[i];
 
          if (!isOly && isPostDesc(item)) {
-            // Normally a view_posts_text item is a section/description
-            // marker. But some contests pack the entire problem set into
-            // a single such post (numbered "1. … 2. …" with choices) and
-            // expose no per-problem forum topics. Detect that and route it
-            // through the problem path instead of dropping it as a title.
+            // A view_posts_text item is normally a section/description marker,
+            // but two kinds of problem arrive this way too: a contest that
+            // packs its whole problem set into one numbered post ("1. … 2. …"),
+            // and a single problem posted as text rather than as a forum topic.
             if (this._isPackedProblemPost(item, ctx)) {
-               await this._handleProblemItem(
-                  item,
-                  type,
-                  ctx,
-                  test,
-                  seenTopicIds,
-               );
+               await this._handleProblemItem(item, type, ctx, seenTopicIds);
+            } else if (isProblemSlot(item)) {
+               this._handleProblemSlot(item, type, ctx);
             } else {
                type = this._handleSectionMarker(
                   item,
-                  items[i + 1],
+                  contentItems[i + 1],
                   ctx,
-                  test,
                   type,
+                  isOly,
                );
             }
          } else if (this._isProblemItem(item, seenTopicIds)) {
-            await this._handleProblemItem(item, type, ctx, test, seenTopicIds);
+            await this._handleProblemItem(item, type, ctx, seenTopicIds);
          }
       }
+
+      // Materialize `sections`/`problems` before anything reads them, so every
+      // consumer below sees a settled flat-or-sectioned shape.
+      this._normalizeSections(test, ctx);
 
       test.type = type.name;
       if (type.computational) {
@@ -509,9 +564,6 @@ export class ForumSession {
       // Prefer an answer key embedded directly in the test category — it
       // ships with the data we already fetched, no extra request. Fall back
       // to the stickied forum lookup only when none is present.
-      const inCategoryKey = !isOly
-         ? this._extractInCategoryAnswerKey(items, name)
-         : null;
       if (inCategoryKey) {
          this._applyForumAnswerKey(test, inCategoryKey, type);
       } else if (
@@ -526,14 +578,22 @@ export class ForumSession {
          if (answerMap) this._applyForumAnswerKey(test, answerMap, type);
       }
 
-      this._normalizeSections(test);
-
       // AIME quirk: AoPS files a year's two AIME administrations as one
       // category with two date-labeled sections ("March 16th"/"March 31st").
       // Rename them to the canonical "I"/"II" (in administration order) so the
       // section tests become "<year> AIME I"/"<year> AIME II", matching the
       // wiki series (which lists AIME I/II as separate tests) so they merge.
-      if (type.name === "AIME" && test.sections.length === 2) {
+      // Only date-labeled sections are that pair: a mock AIME split into two
+      // named rounds ("Individual Round"/"Team Round") or followed by an
+      // appendix (an unnamed lead section plus a shortlist) is not, and must
+      // keep its own labels.
+      if (
+         type.name === "AIME" &&
+         test.sections.length === 2 &&
+         test.sections.every(
+            (s) => ADMINISTRATION_DATE.test(s) || /^I{1,2}$/.test(s),
+         )
+      ) {
          test.sections = ["I", "II"];
       }
 
@@ -567,29 +627,54 @@ export class ForumSession {
       );
    }
 
-   _handleSectionMarker(item, nextItem, ctx, test, type) {
-      const isSameAs = /^same as ([a-zA-Z]+ ){1,3}(\d+)$/.test(
-         item.post_data.post_canonical,
-      );
-      if ((nextItem && isPostDesc(nextItem)) || isSameAs) {
-         if (isSameAs) ctx.problemIndex++;
+   _handleSectionMarker(item, nextItem, ctx, type, isOly) {
+      const body = item.post_data.post_canonical.trim();
+      // An unlabeled "same as" note is a problem slot AoPS didn't label; it
+      // holds a number but contributes no statement. (A labeled one never
+      // reaches here — isProblemSlot catches it first.)
+      if (PLACEHOLDER_SLOT.test(body)) {
+         ctx.problemIndex++;
          return type;
       }
-      if (/^(?:[dD]ay)\s\d+$/.test(item.post_data.post_canonical)) {
+      // Runs of consecutive headers are one header plus its subtitle, and the
+      // last one wins ("I" then "March 13th"). Only headers count for this:
+      // a problem slot after a header is that header's first problem.
+      if (nextItem && isHeaderItem(nextItem, isOly)) return type;
+      if (/^(?:[dD]ay)\s\d+$/.test(body)) {
          type = TYPES.AMO;
       }
-      if (item.post_data.post_canonical.trim() === "Mixer Round") {
+      if (body === "Mixer Round") {
          return type;
       }
-      test.sections.push(item.post_data.post_canonical.trim());
-      ctx.sectionCounter++;
+      ctx.buckets.push({ name: body, problems: [] });
       ctx.problemIndex = 0;
       ctx.isPrevMulti = false;
-      test.problems.push([]);
       return type;
    }
 
-   async _handleProblemItem(item, type, ctx, test, seenTopicIds) {
+   // A problem posted as plain text rather than as a forum topic, recognized by
+   // the problem label AoPS gives it. A placeholder body ("redacted", "Same as
+   // A5") only reserves the number, so later problems keep their real numbering
+   // and the answer key still lines up; any other body is the statement itself.
+   _handleProblemSlot(item, type, ctx) {
+      const body = (item.post_data.post_canonical ?? "").trim();
+      if (!PLACEHOLDER_SLOT.test(body)) {
+         const problem = makeProblem({
+            statement: CleanupText.cleanProblem(body),
+            postId: item.post_data.post_id,
+            topicId: item.post_data.topic_id || null,
+            n: ctx.problemIndex,
+         });
+         // No topic means no discussion to mine, so there are no answer posts.
+         if (type.computational) problem._answerPosts = [];
+         addProblemToTest(problem, ctx, this.onProblemAdd);
+         ctx.problemCount++;
+      }
+      ctx.problemIndex++;
+      ctx.isPrevMulti = false;
+   }
+
+   async _handleProblemItem(item, type, ctx, seenTopicIds) {
       const processed = CleanupText.toAsyLinks(
          item.post_data.post_canonical,
          item.post_data.post_rendered,
@@ -603,27 +688,19 @@ export class ForumSession {
             ctx.problemIndex + 1,
          )).length > 1
       ) {
-         await this._handleMultiProblem(
-            isMulti,
-            item,
-            type,
-            ctx,
-            test,
-            seenTopicIds,
-         );
+         await this._handleMultiProblem(isMulti, item, type, ctx, seenTopicIds);
       } else {
          await this._handleSingleProblem(
             processed,
             item,
             type,
             ctx,
-            test,
             seenTopicIds,
          );
       }
    }
 
-   async _handleMultiProblem(isMulti, item, type, ctx, test, seenTopicIds) {
+   async _handleMultiProblem(isMulti, item, type, ctx, seenTopicIds) {
       ctx.isPrevMulti = true;
       let answerPostsByProblem = {};
       let topicSolutions = [];
@@ -652,14 +729,14 @@ export class ForumSession {
             problem._answerPosts =
                answerPostsByProblem[(j + 1).toString()] ?? [];
          }
-         addProblemToTest(problem, ctx, test, this.onProblemAdd);
+         addProblemToTest(problem, ctx, this.onProblemAdd);
          seenTopicIds.push(item.post_data.topic_id);
          ctx.problemCount++;
       }
       ctx.problemIndex += isMulti.length;
    }
 
-   async _handleSingleProblem(processed, item, type, ctx, test, seenTopicIds) {
+   async _handleSingleProblem(processed, item, type, ctx, seenTopicIds) {
       const problem = await this._buildProblem(
          processed,
          type,
@@ -668,41 +745,62 @@ export class ForumSession {
       problem.postId = item.post_data.post_id;
       problem.topicId = item.post_data.topic_id;
       problem.n = ctx.problemIndex;
-      addProblemToTest(problem, ctx, test, this.onProblemAdd);
+      addProblemToTest(problem, ctx, this.onProblemAdd);
       seenTopicIds.push(problem.topicId);
       ctx.problemCount++;
       ctx.problemIndex++;
    }
 
-   _normalizeSections(test) {
-      if (test.sections.length === 2 && test.problems[1].length === 1) {
-         test.sections.pop();
+   // Turns the walk's buckets into the public `sections`/`problems` shape. This
+   // is the only place that shape is decided, and it runs before any consumer
+   // reads it, so `problems` is always either flat or fully sectioned.
+   _normalizeSections(test, ctx) {
+      // A logistics header ("10 problems for 75 minutes") introduces the test
+      // itself, not a part of it, so the bucket it opened is an unnamed lead
+      // section just like the implicit one.
+      for (const bucket of ctx.buckets) {
+         if (CleanupText.isLogisticsHeader(bucket.name)) bucket.name = "";
       }
-      if (test.sections.length === 1) {
+
+      // A bucket no problem landed in was never a section: a trailing header,
+      // or the implicit lead bucket of a test that opens with one.
+      const buckets = ctx.buckets.filter((b) => b.problems.length > 0);
+
+      if (buckets.length <= 1) {
+         const lone = buckets[0];
          // A lone section is folded into a flat test. If its header carries
          // identifying info (High School / Middle School / A / B), append it
          // to the test name; otherwise the header is noise (problem count,
          // time limit, …) and is dropped.
-         const label = CleanupText.extractSectionLabel(test.sections[0]);
+         const label = lone?.name
+            ? CleanupText.extractSectionLabel(lone.name)
+            : null;
          if (label) {
             test.name = `${test.name} ${label}`;
             const metadata = foldedSectionMetadata(label);
             if (metadata) Object.assign(test, metadata);
          }
-         test.sections.pop();
-         test.problems = test.problems.flat();
+         test.sections = [];
+         test.problems = lone ? lone.problems : [];
+         for (const problem of test.problems) problem.section = -1;
+         return;
       }
+
+      // Several sections survive. The lead bucket keeps its empty name: its
+      // problems are the test proper, and the named buckets that follow it
+      // (a shortlist, a tiebreaker round) are what the headers introduced.
+      test.sections = buckets.map((b) => b.name);
+      test.problems = buckets.map((b) => b.problems);
+      buckets.forEach((bucket, i) => {
+         for (const problem of bucket.problems) problem.section = i;
+      });
    }
 
    _extractInCategoryAnswerKey(items, name = null) {
       // Some tests carry their answer key as a hidden post right inside the
-      // category (item_text like "answer key"). It is dropped from the
-      // problem list by _isProblemItem, so parse it here separately.
-      const keyItem = items.find(
-         (item) =>
-            item.item_type === "post_hidden" &&
-            /answers?\s*key/i.test(item.item_text ?? ""),
-      );
+      // category (item_text like "answer key"). The same predicate also keeps
+      // it out of getTest's structural item walk.
+      const keyItem = items.find(isInCategoryAnswerKey);
       if (!keyItem) return null;
 
       const answerMap = CleanupText.parseAnswerKey(
@@ -783,10 +881,11 @@ export class ForumSession {
    }
 
    _applyForumAnswerKey(test, answerMap, type) {
-      let counter = 0;
       const apply = (problem) => {
-         counter++;
-         const ans = answerMap[String(counter)];
+         // Keyed by the problem's own number, not by arrival order: a slot that
+         // reserved a number without producing a problem (a redacted item) must
+         // not shift every later answer, and each section restarts at 1.
+         const ans = answerMap[String(problem.n + 1)];
          if (ans == null) return;
          // Branch on the problem's own resolved kind (a mixed test has both),
          // not the contest-level prior.
@@ -811,13 +910,7 @@ export class ForumSession {
          }
       };
 
-      if (test.problems.length > 0 && Array.isArray(test.problems[0])) {
-         for (const section of test.problems) {
-            for (const problem of section) apply(problem);
-         }
-      } else {
-         for (const problem of test.problems) apply(problem);
-      }
+      for (const problem of allProblems(test)) apply(problem);
    }
 
    _setNumericAnswer(problem, rawAnswer) {
@@ -863,9 +956,7 @@ export class ForumSession {
    // its own problems (MCQ-vs-other majority; a tie/off-by-one stays mixed and
    // each problem keeps its detected kind), then resolve every \boxed{} answer.
    _finalizeComputationalAnswers(test, type) {
-      const nested =
-         test.problems.length > 0 && Array.isArray(test.problems[0]);
-      const all = nested ? test.problems.flat() : test.problems;
+      const all = allProblems(test);
       if (all.length === 0) {
          test.answerKind = type.answerKind ?? "numeric";
          return;

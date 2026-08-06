@@ -1856,6 +1856,10 @@ export function upsertScrapeResults(db, raw) {
             // name) is materialized as one test row per section, named
             // "<test name> <section name>". A flat test is a single row with
             // section = -1. `units` normalizes both into the same shape.
+            // A section may be unnamed — the problems a category listed before
+            // its first header (the test proper, ahead of a shortlist or a
+            // tiebreaker round); that row keeps the plain test name, which is
+            // also how resolveTestId re-finds it if it was scraped flat before.
             const sectioned = (test.sections?.length ?? 0) > 0;
             const inheritedMetadata = testMetadataFields(test);
             const units = sectioned
@@ -1865,9 +1869,9 @@ export function upsertScrapeResults(db, raw) {
                           sectionName,
                       );
                       return {
-                          name: `${test.name} ${sectionName}`,
+                          name: `${test.name} ${sectionName}`.trim(),
                           section: i,
-                          sectionName,
+                          sectionName: sectionName || null,
                           problems: test.problems[i] ?? [],
                           metadata: sectionMetadata ?? inheritedMetadata,
                       };

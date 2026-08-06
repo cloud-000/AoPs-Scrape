@@ -579,6 +579,20 @@ export class CleanupText {
         return null;
     }
 
+    // A header stating the test's logistics rather than naming a part of it:
+    // "10 problems for 75 minutes", "15 (14) problems for 2.5 hours",
+    // "12 problems for 2 hours, integer answers 0-999". These head the test
+    // itself, so the section they open is the test's own problems and carries
+    // no name (see ForumSession._normalizeSections). Deliberately narrow: it
+    // must lead with a problem count and state a duration, so round names
+    // ("Team Round", "2021-22 Set 1", "High School") never match.
+    static isLogisticsHeader(sectionName) {
+        if (!sectionName) return false;
+        return /^\d+\s*(?:\(\d+\)\s*)?problems?\b.*\b(?:minutes?|hours?|hrs?)\b/i.test(
+            sectionName.trim(),
+        );
+    }
+
     // Canonicalizes AoPS category/folder names before they become series/test
     // names. Trims redundant "Problems" suffixes so names match the curated
     // registry / wiki spelling ("Purple Comet" not "Purple Comet Problems",
@@ -643,7 +657,114 @@ export class CleanupText {
         return text.replace(/P\.?S\.?.*hide for answers.*$/i, "").trim();
     }
 
+    // Picks the block of a multi-key post that belongs to `name`, scoring each
+    // block's label by how many of its words the test name also uses. Shared by
+    // both multi-key layouts ([hide=label] blocks and plain heading lines).
+    // When nothing matches the name, a label that calls itself the answers wins
+    // over one that doesn't (a "Scores" leaderboard is numbered from 1 too).
+    static _bestLabeledBlock(blocks, name) {
+        const nameWords = new Set(name?.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+        const score = (label) => {
+            const words = (label.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(
+                (w) => !["answer", "answers", "key", "for"].includes(w),
+            );
+            return words.filter((w) => nameWords.has(w)).length;
+        };
+        const namesAnswers = (label) => /\banswers?\b|\bkey\b/i.test(label);
+
+        let best = blocks[0];
+        let bestScore = -1;
+        for (const block of blocks) {
+            const s = score(block.label);
+            const better =
+                s > bestScore ||
+                (s === bestScore &&
+                    bestScore === 0 &&
+                    namesAnswers(block.label) &&
+                    !namesAnswers(best.label));
+            if (better) {
+                bestScore = s;
+                best = block;
+            }
+        }
+        return best;
+    }
+
+    // The labeled blocks of a post that carries several *competing* answer
+    // keys — one per subtest, each restarting at 1 — in either layout AoPS
+    // posters use: [hide=label] blocks, or plain heading lines. Returns [] for
+    // anything else, including a key split across blocks by range
+    // ("[hide=1-5]…[hide=6-10]…"), where only one block starts at 1 and the
+    // blocks complete each other rather than compete.
+    static _competingAnswerBlocks(content) {
+        const startsAtOne = (text) => /^\s*1[.)]\s*\S/m.test(text);
+        const hideRe =
+            /\[hide(?:\s*=\s*"?([^\]"]*)"?)?\]([\s\S]*?)\[\/hide\]/gi;
+        const hideBlocks = [...content.matchAll(hideRe)].map((m) => ({
+            label: (m[1] ?? "").trim(),
+            body: m[2],
+        }));
+        if (hideBlocks.length > 0) {
+            const competing = hideBlocks.filter((b) => startsAtOne(b.body));
+            return competing.length > 1 ? competing : [];
+        }
+        return CleanupText._labeledAnswerSections(content);
+    }
+
+    // Splits a post that stacks several numbered answer lists under plain
+    // heading lines ("Algebra\n1. 3\n…\nGeometry\n1. 49\n…") into one block per
+    // heading. Each list restarts at 1, so parsing the post as a single list
+    // interleaves them — whichever block's entry is matched first wins for that
+    // number. Returns [] unless at least two headed lists are found.
+    static _labeledAnswerSections(content) {
+        const lines = content.split("\n");
+        const isListStart = (l) => /^\s*1[.)]\s*\S/.test(l);
+        const isListItem = (l) => /^\s*\d+[.)]\s*\S/.test(l);
+
+        const sections = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (!isListStart(lines[i])) continue;
+            // The heading is the nearest non-empty line above the list, with
+            // its BBCode stripped ("[b] Answers [/b]" → "Answers").
+            let h = i - 1;
+            while (h >= 0 && lines[h].trim() === "") h--;
+            if (h < 0 || isListItem(lines[h])) return [];
+            const label = lines[h].replace(/\[\/?[a-z]+[^\]]*\]/gi, "").trim();
+            if (!label) return [];
+            sections.push({ label, start: i, headingLine: h });
+        }
+        if (sections.length < 2) return [];
+
+        return sections.map((s, i) => ({
+            label: s.label,
+            body: lines
+                .slice(
+                    s.start,
+                    i + 1 < sections.length
+                        ? sections[i + 1].headingLine
+                        : lines.length,
+                )
+                .join("\n"),
+        }));
+    }
+
     static parseAnswerKey(content, name = null) {
+        // Narrow a multi-key post to the one key that belongs to `name` before
+        // parsing anything: the format cascade below scans the whole post and
+        // keeps the first entry it finds per number, so competing keys would
+        // otherwise interleave. Falls back to the whole post whenever the
+        // chosen block yields nothing, so a mis-split can only lose the
+        // improvement, never an existing key.
+        const blocks = CleanupText._competingAnswerBlocks(content);
+        if (blocks.length > 1) {
+            const chosen = CleanupText._bestLabeledBlock(blocks, name);
+            const scoped = CleanupText._parseOneAnswerKey(chosen.body, name);
+            if (scoped) return scoped;
+        }
+        return CleanupText._parseOneAnswerKey(content, name);
+    }
+
+    static _parseOneAnswerKey(content, name = null) {
         const result = {};
 
         // Extract hide tag contents, keeping the [hide=label] label so that a
@@ -715,25 +836,10 @@ export class CleanupText {
             .filter((b) => Object.keys(b.map).length > 0);
 
         if (blockMaps.length > 0) {
-            let chosen = blockMaps[0];
-            if (blockMaps.length > 1 && name) {
-                const nameWords = new Set(
-                    name.toLowerCase().match(/[a-z0-9]+/g) ?? [],
-                );
-                let bestScore = -1;
-                for (const b of blockMaps) {
-                    const labelWords = (
-                        b.label.toLowerCase().match(/[a-z0-9]+/g) ?? []
-                    ).filter((w) => !["answer", "key", "for"].includes(w));
-                    const score = labelWords.filter((w) =>
-                        nameWords.has(w),
-                    ).length;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        chosen = b;
-                    }
-                }
-            }
+            const chosen =
+                blockMaps.length > 1
+                    ? CleanupText._bestLabeledBlock(blockMaps, name)
+                    : blockMaps[0];
             return chosen.map;
         }
 
