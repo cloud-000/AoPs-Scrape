@@ -353,14 +353,10 @@ function solutionSourcePriority(source) {
     return 1;
 }
 
-function getSolutionSourceSummary(db, solutionId) {
-    const rows = db
-        .query(
-            `SELECT source, is_official_hint, reliability_hint, aops_user_id, posted_at
-             FROM solution_sources
-             WHERE solution_id = ?`,
-        )
-        .all(solutionId);
+// Kept pure over already-loaded `solution_sources` rows: the classifier
+// summarizes every solution (most of them twice), so it loads the table in one
+// sweep rather than issuing a query per solution.
+function summarizeSolutionSources(rows) {
     return {
         rows,
         hasWiki: rows.some((r) => r.source === "wiki"),
@@ -457,9 +453,7 @@ function tokenSet(content) {
     );
 }
 
-function tokenSimilarity(a, b) {
-    const left = tokenSet(a);
-    const right = tokenSet(b);
+function tokenSetSimilarity(left, right) {
     if (left.size === 0 || right.size === 0) return 0;
     let intersection = 0;
     for (const token of left) {
@@ -663,6 +657,33 @@ export function classifySolutions(
             )
             .all();
 
+        // Every solution here gets summarized (most of them twice — once to
+        // score, once to rank a duplicate group), so load solution_sources in
+        // one sweep and memoize. Per-row queries cost ~2x 50k round trips.
+        const sourceRowsBySolution = new Map();
+        for (const source of db
+            .query(
+                `SELECT solution_id, source, is_official_hint, reliability_hint,
+                        aops_user_id, posted_at
+                 FROM solution_sources`,
+            )
+            .all()) {
+            const list = sourceRowsBySolution.get(source.solution_id);
+            if (list) list.push(source);
+            else sourceRowsBySolution.set(source.solution_id, [source]);
+        }
+        const summaries = new Map();
+        const summaryFor = (solutionId) => {
+            let summary = summaries.get(solutionId);
+            if (!summary) {
+                summary = summarizeSolutionSources(
+                    sourceRowsBySolution.get(solutionId) ?? [],
+                );
+                summaries.set(solutionId, summary);
+            }
+            return summary;
+        };
+
         const updateStmt = db.prepare(
             `UPDATE solutions SET
                 status = ?,
@@ -678,7 +699,7 @@ export function classifySolutions(
         );
 
         for (const row of rows) {
-            const summary = getSolutionSourceSummary(db, row.id);
+            const summary = summaryFor(row.id);
             const scored = scoreSolutionContent(row.content, summary);
             const isOfficial = row.is_official || summary.hasWiki || summary.hasOfficialHint;
             let status;
@@ -706,10 +727,33 @@ export function classifySolutions(
             updated++;
         }
 
-        const problemIds = db
-            .query(`SELECT DISTINCT problem_id FROM solutions ORDER BY problem_id`)
-            .all()
-            .map((r) => r.problem_id);
+        // Near-duplicate detection is per problem, but asking for one problem's
+        // candidates at a time made SQLite drive the scan off
+        // idx_solutions_duplicate_of (`duplicate_of_solution_id IS NULL` matches
+        // nearly every row, and the phase above just widened it), re-walking the
+        // whole table once per problem. Read the candidate set once and bucket it
+        // by problem_id here instead.
+        const candidatesByProblem = new Map();
+        for (const row of db
+            .query(
+                `SELECT s.*
+                 FROM solutions s
+                 WHERE s.status IN ('accepted', 'needs_review', 'candidate')
+                   AND s.duplicate_of_solution_id IS NULL
+                 ORDER BY s.problem_id, s.id`,
+            )
+            .all()) {
+            const summary = summaryFor(row.id);
+            const candidate = {
+                ...row,
+                best_source_priority: summary.bestSourcePriority,
+                has_known_solution_user: summary.hasKnownSolutionUser,
+                earliest_posted_at: summary.earliestPostedAt,
+            };
+            const bucket = candidatesByProblem.get(row.problem_id);
+            if (bucket) bucket.push(candidate);
+            else candidatesByProblem.set(row.problem_id, [candidate]);
+        }
 
         const markDuplicateStmt = db.prepare(
             `UPDATE solutions SET
@@ -719,26 +763,9 @@ export function classifySolutions(
              WHERE id = ? AND status_source != 'manual'`,
         );
 
-        for (const problemId of problemIds) {
-            const candidates = db
-                .query(
-                    `SELECT s.*
-                     FROM solutions s
-                     WHERE s.problem_id = ?
-                       AND s.status IN ('accepted', 'needs_review', 'candidate')
-                       AND s.duplicate_of_solution_id IS NULL
-                     ORDER BY s.id`,
-                )
-                .all(problemId)
-                .map((row) => {
-                    const summary = getSolutionSourceSummary(db, row.id);
-                    return {
-                        ...row,
-                        best_source_priority: summary.bestSourcePriority,
-                        has_known_solution_user: summary.hasKnownSolutionUser,
-                        earliest_posted_at: summary.earliestPostedAt,
-                    };
-                });
+        for (const candidates of candidatesByProblem.values()) {
+            // One token set per candidate rather than one per comparison.
+            const tokens = candidates.map((c) => tokenSet(c.content));
 
             const consumed = new Set();
             for (let i = 0; i < candidates.length; i++) {
@@ -747,7 +774,7 @@ export function classifySolutions(
                 for (let j = i + 1; j < candidates.length; j++) {
                     if (consumed.has(candidates[j].id)) continue;
                     if (
-                        tokenSimilarity(candidates[i].content, candidates[j].content) >=
+                        tokenSetSimilarity(tokens[i], tokens[j]) >=
                         nearDuplicateThreshold
                     ) {
                         group.push(candidates[j]);
