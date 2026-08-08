@@ -1,16 +1,19 @@
-// Source-backed coverage semantics for problems that cannot be machine graded.
+// Response-format and answer-coverage semantics for contest problems.
 //
 // comp-OCR emits two optional files per test folder:
 //
 //   test_profile.json     { response_kind, answer_status, practice_mode }
 //   problem_coverage.json { "<1-based num>": { reason, answer_status, ... } }
 //
-// `test_profile.json` DECLARES a whole test's shape and is written only for
-// proof families (HMIC, CHMM proof, PUMaC individual finals, CMIMC team CS).
+// `test_profile.json` DECLARES a whole test's shape and is written for source-
+// profiled families (proof families today). Contest registries can also make a
+// structural declaration when the response format is intrinsic to the series:
+// every AMC administration is MCQ even when a damaged source loses its choices.
 // `problem_coverage.json` is a sparse per-problem EXCEPTION map for otherwise
 // ordinary tests (a Guts item whose official key is blank, a tiebreaker).
 //
-// Those two are different kinds of claim, and the schema keeps them apart:
+// Test declarations and problem exceptions are different kinds of claim, and
+// the schema keeps them apart:
 //
 //   tests.response_kind / answer_status              -- the declaration
 //   problems.coverage_response_kind / coverage_...   -- the sparse override
@@ -27,12 +30,12 @@
 // function of the other two in every case it enumerates, and `solution_status`
 // only matters to a curation UI that does not exist yet.
 //
-// Operating principle: absence is not semantics. NULL means "no source has
-// told us", which is different from an affirmative `not_applicable`. Nothing
-// below guesses a response_kind it was not handed, and `known` is deliberately
-// NOT storable here -- it is the absence of a claim plus a fact about our own
-// data, so it is derived at build time rather than written by whichever
-// importer happened to touch the row.
+// Operating principle: absence is not semantics. NULL means neither a source
+// profile nor a structural registry has declared the field, which is different
+// from an affirmative `not_applicable`. Statement parsing never guesses a
+// response_kind, and `known` is deliberately NOT storable here -- it is the
+// absence of a claim plus a fact about our own data, so it is derived at build
+// time rather than written by whichever importer happened to touch the row.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -46,6 +49,25 @@ export const RESPONSE_KINDS = Object.freeze([
     "interactive",
     "unknown",
 ]);
+
+// Series-level facts, not name guesses. These labels are the canonical series
+// names persisted by the importers. Keep the declaration centralized so every
+// upsert path and the existing-row backfill apply exactly the same policy.
+export const SERIES_RESPONSE_KIND_DECLARATIONS = Object.freeze({
+    "AMC 8": "mcq",
+    "AMC 10": "mcq",
+    "AMC 12": "mcq",
+    "AMC 12/AHSME": "mcq",
+});
+
+export function responseKindForSeries(seriesName) {
+    return Object.prototype.hasOwnProperty.call(
+        SERIES_RESPONSE_KIND_DECLARATIONS,
+        seriesName,
+    )
+        ? SERIES_RESPONSE_KIND_DECLARATIONS[seriesName]
+        : null;
+}
 
 // `known` is intentionally absent: see the header note. It is a valid resolved
 // value (and appears in production_problems), but never a stored claim.

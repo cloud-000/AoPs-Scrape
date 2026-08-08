@@ -8,6 +8,8 @@ import {
     ANSWER_STATUS_CLAIMS,
     RESPONSE_KINDS,
     RESOLVED_ANSWER_STATUSES,
+    SERIES_RESPONSE_KIND_DECLARATIONS,
+    responseKindForSeries,
     resolveCoverage,
 } from "./coverage.js";
 import { SOLUTIONS_USERS } from "../contest_id.js";
@@ -81,12 +83,12 @@ CREATE TABLE IF NOT EXISTS tests (
   aops_category_id TEXT,
   type             TEXT,
   is_computational BOOLEAN NOT NULL DEFAULT FALSE CHECK (is_computational IN (0, 1)),
-  -- Test-level DECLARATION, from comp-OCR's test_profile.json. Written only
-  -- where a source declared the format (proof families today); NULL means "no
-  -- source has said", not "computational". is_computational above stays the raw
-  -- config value -- the coverage-aware value is derived by isComputationalFor()
-  -- at read time (buildProductionProblems / exportStagingSQL), so no importer
-  -- can regress it. See src/coverage.js.
+  -- Test-level DECLARATION, from comp-OCR's test_profile.json or a structural
+  -- series registry (e.g. every AMC is MCQ). NULL means no source/registry has
+  -- declared it, not "computational". is_computational above stays the raw config
+  -- value -- the coverage-aware value is derived by isComputationalFor() at read
+  -- time (buildProductionProblems / exportStagingSQL), so no importer can
+  -- regress it. See src/coverage.js.
   response_kind    TEXT CHECK (response_kind IN (${RESPONSE_KIND_SQL})),
   answer_status    TEXT CHECK (answer_status IN (${ANSWER_STATUS_CLAIM_SQL})),
   difficulty       INTEGER DEFAULT 0,
@@ -1127,6 +1129,21 @@ FROM tests_old;
           )
     `);
 
+    // Data migration: response formats that are structural facts of a series.
+    // AMC is MCQ regardless of whether a particular wiki/forum statement still
+    // contains extractable option text. Idempotent and shared with upsertTest's
+    // new-row/refresh policy via SERIES_RESPONSE_KIND_DECLARATIONS.
+    for (const [seriesName, responseKind] of Object.entries(
+        SERIES_RESPONSE_KIND_DECLARATIONS,
+    )) {
+        db.run(
+            `UPDATE tests SET response_kind = ?
+             WHERE series_id = (SELECT id FROM series WHERE name = ?)
+               AND response_kind IS NOT ?`,
+            [responseKind, seriesName, responseKind],
+        );
+    }
+
     return db;
 }
 
@@ -1295,8 +1312,10 @@ function testMetadataFields(test) {
 // "High School" test merging by name onto a genuinely two-section AoPS year must
 // not flatten a sibling section to -1 and collide on UNIQUE(aops_category_id,
 // section). A brand-new row still takes the caller's section on INSERT.
-// Review metadata uses property presence as ownership: omitted fields preserve
-// the stored value, while explicitly supplied null clears stale classification.
+// Review/coverage metadata uses property presence as ownership: omitted fields
+// preserve the stored value, while explicitly supplied null clears stale
+// classification. A structural series declaration outranks importer presence:
+// it is an intrinsic contest fact rather than a source snapshot.
 export function upsertTest(db, test, seriesId) {
     const {
         aopsCategoryId,
@@ -1315,6 +1334,13 @@ export function upsertTest(db, test, seriesId) {
         answerStatus,
     } = test;
     const has = (key) => Object.prototype.hasOwnProperty.call(test, key);
+    const seriesName = db
+        .query(`SELECT name FROM series WHERE id = ?`)
+        .get(seriesId)?.name;
+    const structuralResponseKind = responseKindForSeries(seriesName);
+    const effectiveResponseKind = structuralResponseKind ?? responseKind;
+    const updateResponseKind =
+        structuralResponseKind != null || has("responseKind");
     const updateDivisionOrder =
         has("divisionOrder") || (has("division") && division == null);
     const updateFormatOrder =
@@ -1371,8 +1397,8 @@ export function upsertTest(db, test, seriesId) {
                 normalizedFormatOrder ?? null,
                 type ?? null,
                 isComputational ? 1 : 0,
-                has("responseKind") ? 1 : 0,
-                responseKind ?? null,
+                updateResponseKind ? 1 : 0,
+                effectiveResponseKind ?? null,
                 has("answerStatus") ? 1 : 0,
                 answerStatus ?? null,
                 seriesId,
@@ -1406,7 +1432,7 @@ export function upsertTest(db, test, seriesId) {
             aopsCategoryId ?? null,
             type ?? null,
             isComputational ? 1 : 0,
-            responseKind ?? null,
+            effectiveResponseKind ?? null,
             answerStatus ?? null,
         ],
     );

@@ -363,6 +363,8 @@ Problems are built with the shared `makeProblem()` factory (exported from
 Contest → wiki page-title mapping lives in `contest_id.js` as a `wiki: { variants, years }`
 descriptor on the relevant entries (AMC 8/10/12, AIME). Ingest is via
 `db.upsertWikiResults` (additive; natural-key merge; trust order **pdf > wiki > forum**).
+The database's structural series policy independently declares every AMC test as
+`tests.response_kind='mcq'`; it does not depend on successfully extracting all five options.
 Variant metadata comes from that configured `titleBase`, not from a later parser
 over the completed display name.
 
