@@ -26,6 +26,7 @@ import {
     upsertSeries,
     upsertTest,
     upsertPdfProblem,
+    upsertPdfAnswerOnly,
     upsertSolutionCandidate,
     resolveTestId,
     resolveProblemId,
@@ -481,7 +482,10 @@ export function listPdfTests(outDir, seriesFolder) {
 }
 
 // Walks `outDir` and merges every recognized series/test into the DB in a single
-// transaction. Returns a summary { series, tests, problems } of what was upserted.
+// transaction. Returns a summary { series, tests, problems, answersOnly,
+// droppedAnswers, solutions } of what was upserted. `answersOnly` counts answers
+// applied to rows the OCR produced no statement for; `droppedAnswers` counts
+// those that had no row to land on at all (see the answer-only pass below).
 //
 // `options.series` (array of OCR series-folder names) and `options.tests` (array
 // of test-folder names) narrow what is imported; when either is null/empty that
@@ -496,7 +500,14 @@ export function importPdfProblems(db, outDir, options = {}) {
     const testFilter =
         options.tests?.length > 0 ? new Set(options.tests) : null;
 
-    const summary = { series: 0, tests: 0, problems: 0, solutions: 0 };
+    const summary = {
+        series: 0,
+        tests: 0,
+        problems: 0,
+        answersOnly: 0,
+        droppedAnswers: 0,
+        solutions: 0,
+    };
 
     db.transaction(() => {
         for (const seriesFolder of readdirSync(outDir)) {
@@ -631,6 +642,55 @@ export function importPdfProblems(db, outDir, options = {}) {
                         .map((row) => [row.n, row]),
                 );
 
+                // Coverage keys are the OCR's 1-based numbers, same as
+                // `problems`/`answers`, so they index by `key` not `n`.
+                const coverageFor = (key, n) => {
+                    const existingCoverage = existingCoverageByN.get(n);
+                    const snapshotEntry =
+                        coverageFile.state === "present"
+                            ? coverageFile.value[key]
+                            : undefined;
+                    const responseKind = coverageSnapshotField({
+                        file: coverageFile,
+                        entry: snapshotEntry,
+                        field: "response_kind",
+                        existingValue:
+                            existingCoverage?.coverage_response_kind,
+                    });
+                    const answerStatus = coverageSnapshotField({
+                        file: coverageFile,
+                        entry: snapshotEntry,
+                        field: "answer_status",
+                        existingValue:
+                            existingCoverage?.coverage_answer_status,
+                    });
+                    const resolved = resolveCoverage({
+                        overrideResponseKind: responseKind.value,
+                        declarationResponseKind:
+                            declaration?.response_kind ?? null,
+                        overrideAnswerStatus: answerStatus.value,
+                        declarationAnswerStatus:
+                            declaration?.answer_status ?? null,
+                        rawIsComputational: isComputational,
+                    });
+                    return {
+                        // Stored on the override tier only: NULL here means no
+                        // source named this problem, never "it inherited the
+                        // test's declaration".
+                        ...(responseKind.update
+                            ? { coverage_response_kind: responseKind.value }
+                            : {}),
+                        ...(answerStatus.update
+                            ? { coverage_answer_status: answerStatus.value }
+                            : {}),
+                        // Clearing a stale answer must follow the RESOLVED
+                        // verdict, since the claim usually lives on the test
+                        // row (a proof profile) rather than the override.
+                        answerNotApplicable:
+                            resolved.answerStatus === "not_applicable",
+                    };
+                };
+
                 let count = 0;
                 const problemIdByN = new Map(); // n -> problem id, for attaching solutions
                 for (const key of Object.keys(problems)) {
@@ -640,71 +700,67 @@ export function importPdfProblems(db, outDir, options = {}) {
                         `${seriesFolder}/${testFolder}`,
                     );
                     if (n === null) continue;
-                    // Coverage keys are the OCR's 1-based numbers, same as
-                    // `problems`/`answers`, so they index by `key` not `n`.
-                    const answer = answers[key] ?? null;
-                    const existingCoverage = existingCoverageByN.get(n);
-                    const snapshotEntry =
-                        coverageFile.state === "present"
-                            ? coverageFile.value[key]
-                            : undefined;
-                    const responseKindUpdate = coverageSnapshotField({
-                        file: coverageFile,
-                        entry: snapshotEntry,
-                        field: "response_kind",
-                        existingValue:
-                            existingCoverage?.coverage_response_kind,
-                    });
-                    const answerStatusUpdate = coverageSnapshotField({
-                        file: coverageFile,
-                        entry: snapshotEntry,
-                        field: "answer_status",
-                        existingValue:
-                            existingCoverage?.coverage_answer_status,
-                    });
-                    const resolvedCoverage = resolveCoverage({
-                        overrideResponseKind: responseKindUpdate.value,
-                        declarationResponseKind:
-                            declaration?.response_kind ?? null,
-                        overrideAnswerStatus: answerStatusUpdate.value,
-                        declarationAnswerStatus:
-                            declaration?.answer_status ?? null,
-                        rawIsComputational: isComputational,
-                    });
                     const problemId = upsertPdfProblem(
                         db,
                         {
                             n,
                             statement: problems[key],
-                            answer,
+                            answer: answers[key] ?? null,
                             source: `${seriesFolder}/${testFolder}`,
                             is_computational: isComputational,
-                            // Stored on the override tier only: NULL here means
-                            // no source named this problem, never "it inherited
-                            // the test's declaration".
-                            ...(responseKindUpdate.update
-                                ? {
-                                      coverage_response_kind:
-                                          responseKindUpdate.value,
-                                  }
-                                : {}),
-                            ...(answerStatusUpdate.update
-                                ? {
-                                      coverage_answer_status:
-                                          answerStatusUpdate.value,
-                                  }
-                                : {}),
-                            // Clearing a stale answer must follow the RESOLVED
-                            // verdict, since the claim usually lives on the test
-                            // row (a proof profile) rather than the override.
-                            answerNotApplicable:
-                                resolvedCoverage.answerStatus ===
-                                "not_applicable",
+                            ...coverageFor(key, n),
                         },
                         testId,
                     );
                     problemIdByN.set(n, problemId);
                     count++;
+                }
+
+                // An answer key covers the whole test, so it routinely names
+                // problems the OCR dropped a statement for. Those answers are
+                // still good, and another tier (usually an AoPS scrape) has
+                // often already supplied the statement, so apply them to the
+                // existing row instead of letting them fall on the floor.
+                // Update-only: with no statement there is nothing to insert.
+                let answerOnly = 0;
+                const orphanedAnswers = [];
+                for (const key of Object.keys(answers)) {
+                    if (key in problems) continue;
+                    const answer = answers[key];
+                    if (answer == null || answer === "") continue;
+                    const n = ocrKeyToN(
+                        key,
+                        "answer",
+                        `${seriesFolder}/${testFolder}`,
+                    );
+                    if (n === null) continue;
+                    const problemId = upsertPdfAnswerOnly(
+                        db,
+                        {
+                            n,
+                            answer,
+                            source: `${seriesFolder}/${testFolder}`,
+                            is_computational: isComputational,
+                            ...coverageFor(key, n),
+                        },
+                        testId,
+                    );
+                    if (problemId == null) {
+                        orphanedAnswers.push(key);
+                        continue;
+                    }
+                    problemIdByN.set(n, problemId);
+                    answerOnly++;
+                }
+                if (answerOnly > 0) {
+                    console.warn(
+                        `  ${meta.name}: applied ${answerOnly} answer(s) with no OCR statement — problems.json is missing them, check the OCR`,
+                    );
+                }
+                if (orphanedAnswers.length > 0) {
+                    console.warn(
+                        `  ${meta.name}: dropped ${orphanedAnswers.length} answer(s) with no statement from any source (problems ${orphanedAnswers.join(", ")}) — re-run the OCR for this test`,
+                    );
                 }
 
                 // Attach OCR'd solutions to the problems just upserted. Keys are
@@ -743,9 +799,12 @@ export function importPdfProblems(db, outDir, options = {}) {
                 }
 
                 summary.problems += count;
+                summary.answersOnly += answerOnly;
+                summary.droppedAnswers += orphanedAnswers.length;
                 summary.solutions += solCount;
                 console.log(
-                    `  ${meta.name}: ${count} problems, ${solCount} solutions`,
+                    `  ${meta.name}: ${count} problems, ${solCount} solutions` +
+                        (answerOnly > 0 ? `, ${answerOnly} answers-only` : ""),
                 );
             }
         }

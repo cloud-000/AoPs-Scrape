@@ -1672,6 +1672,92 @@ export function upsertPdfProblem(db, problem, testId) {
         ).id;
 }
 
+// Applies a PDF/OCR answer to a problem the OCR produced NO statement for.
+//
+// An answer key covers the whole test, but OCR can drop individual statements
+// (a lost page region), so problem_answer.json routinely names problems absent
+// from problems.json. Those answers used to be silently unreachable — the import
+// loop only visited statement keys — even when an AoPS scrape had already
+// supplied a perfectly good statement for the row.
+//
+// This is UPDATE-only, deliberately: with no statement there is nothing to
+// insert, and a row of pure answer would be worse than the gap it fills. Returns
+// the problem id, or null when no row exists (an OCR-only test where nothing
+// else supplied the statement — the caller reports it rather than inventing a
+// row). It writes the answer tier and is_computational only; every statement
+// column, and the acgn/tags derived from one, is left exactly as found.
+//
+// The answer semantics are upsertPdfProblem's, unchanged: verified outranks the
+// import, a resolved not_applicable retracts a stale answer, and the resolved
+// columns re-COALESCE down the same verified > pdf > wiki > aops ladder.
+export function upsertPdfAnswerOnly(db, problem, testId) {
+    const section = -1; // section lives on the test row; problems always -1
+    const has = (key) => Object.prototype.hasOwnProperty.call(problem, key);
+    const updateCoverageResponseKind = has("coverage_response_kind");
+    const updateCoverageAnswerStatus = has("coverage_answer_status");
+    const answerNotApplicable = problem.answerNotApplicable === true;
+    const answer = answerNotApplicable ? null : (problem.answer ?? null);
+
+    const row = db
+        .query(
+            `
+        UPDATE problems SET
+            pdf_answer = CASE
+                WHEN verified THEN pdf_answer
+                WHEN ? THEN NULL
+                ELSE COALESCE(?, pdf_answer)
+            END,
+            -- Provenance of the pdf_* tier, which this write now contributes to.
+            pdf_source = COALESCE(?, pdf_source),
+            answer_value = CASE
+                WHEN verified THEN answer_value
+                WHEN ? THEN NULL
+                ELSE COALESCE(?, pdf_answer, wiki_answer, aops_answer)
+            END,
+            answer_index = CASE
+                WHEN verified THEN answer_index
+                WHEN ? THEN -1
+                WHEN wiki_choices IS NOT NULL THEN wiki_answer_index
+                ELSE aops_answer_index
+            END,
+            -- Structural fact about the contest, refreshed here for the same
+            -- reason upsertPdfProblem refreshes it: this is the only write path
+            -- that knows the series config, so skipping it is what left these
+            -- rows disagreeing with their own test row.
+            is_computational = ?,
+            coverage_response_kind = CASE
+                WHEN ? THEN ?
+                ELSE coverage_response_kind
+            END,
+            coverage_answer_status = CASE
+                WHEN ? THEN ?
+                ELSE coverage_answer_status
+            END,
+            updated_at = datetime('now')
+        WHERE test_id = ? AND n = ? AND section = ?
+        RETURNING id
+    `,
+        )
+        .get(
+            answerNotApplicable ? 1 : 0,
+            answer,
+            problem.source ?? null,
+            answerNotApplicable ? 1 : 0,
+            answer,
+            answerNotApplicable ? 1 : 0,
+            problem.is_computational ? 1 : 0,
+            updateCoverageResponseKind ? 1 : 0,
+            problem.coverage_response_kind ?? null,
+            updateCoverageAnswerStatus ? 1 : 0,
+            problem.coverage_answer_status ?? null,
+            testId,
+            problem.n,
+            section,
+        );
+
+    return row?.id ?? null;
+}
+
 // Upserts a problem from the AoPS Wiki. Writes the wiki_* tier (statement,
 // choices, answer index/value) and re-resolves statement/answer following the
 // merge contract (verified > pdf > wiki > aops). Like the PDF path it is

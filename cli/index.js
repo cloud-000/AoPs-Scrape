@@ -260,6 +260,11 @@ async function main() {
             console.log(
                 `Imported PDF problems from ${outDir}: ${s.problems} problems, ${s.solutions} solutions across ${s.tests} tests in ${s.series} series (${c} total problems in DB).`,
             );
+            if (s.answersOnly > 0 || s.droppedAnswers > 0) {
+                console.log(
+                    `  Answer key beyond the OCR'd statements: ${s.answersOnly} applied to existing rows, ${s.droppedAnswers} dropped (no statement from any source).`,
+                );
+            }
             break;
         }
 
