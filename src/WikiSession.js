@@ -206,6 +206,10 @@ export class WikiSession {
             if (extracted.length >= 3) {
                 choiceList = extracted;
                 statementSrc = CleanupText.cleanChoices(statementSrc);
+            } else {
+                this.log(
+                    `\n⚠️  ${page}: expected MCQ choices but found ${extracted.length}; leaving the source statement intact.`,
+                );
             }
         }
         const statement = CleanupText.cleanWikiProblem(statementSrc, rendered);

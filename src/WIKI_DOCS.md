@@ -347,12 +347,16 @@ Problems are built with the shared `makeProblem()` factory (exported from
 2. Statement = the `== Problem ==` section (or the lead). `CleanupText.normalizeWikiMath`
    converts `<math>…</math>`/`<cmath>…</cmath>` to `$…$`/`$$…$$` so the forum-oriented
    `extractChoices` / `cleanChoices` / `getBoxed` apply unchanged.
-3. MCQ (`choices` true): `extractChoices` pulls `\textbf{(A)}…` options, `cleanChoices`
-   removes them from the statement; the answer is picked by `CleanupText.selectBoxedAnswer`
+3. MCQ (`choices` true): `extractChoices` pulls current `\textbf{(A)}…` options and
+   historical `\text{(A)}`, `\mathrm{(A)}`, `\textrm{(A)}`, `(\mathrm{A})`, and
+   malformed `\textbf{A}`
+   variants; `cleanChoices` removes them from the statement; the answer is picked by
+   `CleanupText.selectBoxedAnswer`
    across **all** solution sections (not just the first box), which for MCQ keeps only a box
    that is a valid choice and prefers a sole/last box over an intermediate one, then mapped to
    an option via `choiceIndexOfAnswer`. Numeric (AIME): the selected boxed value is taken
-   literally (any string).
+   literally (any string). An expected MCQ page with fewer than three extractable choices logs
+   a warning and keeps its source statement intact.
 4. `CleanupText.cleanWikiProblem` strips `{{templates}}`, `[[Category:…]]`, wikilinks,
    stray headers, and converts `<asy>` diagrams via `toWikiAsyLinks`.
 

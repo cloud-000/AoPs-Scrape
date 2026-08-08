@@ -501,44 +501,84 @@ export class CleanupText {
         return statements;
     }
 
+    // Locate one ordered answer-choice block (at least A-C). AMC uses A-E, but
+    // the shared helper also supports contests with three or four options.
+    // AoPS's current markup uses
+    // `\textbf{(A)}`, but older wiki/forum pages commonly use `\text{(A)}`,
+    // `\mathrm{(A)}`, `\textrm{(A)}`, or `(\mathrm{A})`. Match the structure
+    // rather than one spelling. Asymptote bodies are masked first so diagram
+    // labels such as `label("(A)", ...)` are not mistaken for textual choices.
+    static _choiceBlock(input) {
+        if (!input) return null;
+        const masked = input
+            .replace(/\[asy(?:=[^\]]*)?\][\s\S]*?\[\/asy\]/gi, (s) =>
+                " ".repeat(s.length),
+            )
+            .replace(/<asy\b[^>]*>[\s\S]*?<\/asy>/gi, (s) =>
+                " ".repeat(s.length),
+            );
+        const wrapper = String.raw`(?:textbf|text|textrm|mathrm)`;
+        const innerSpace = String.raw`(?:\s|\\[ ,;:!]|\\q?quad\b)*`;
+        const marker = new RegExp(
+            String.raw`\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)${innerSpace}\}|\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)|\(\s*\\${wrapper}\s*\{\s*([A-E])${innerSpace}\}\s*\)|\\textbf\s*\{\s*([A-E])\s*\}|\{?\s*\(\s*([A-E])\s*\)\s*\}?`,
+            "g",
+        );
+        const matches = [...masked.matchAll(marker)].map((m) => ({
+            label: m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5],
+            index: m.index,
+            end: m.index + m[0].length,
+            // Some old pages put both the label and value inside one style
+            // wrapper: `\mathrm{(A) 4}`. Its closing brace belongs to the
+            // wrapper, not to the choice value.
+            closesAfterValue: m[2] != null,
+        }));
+
+        for (let start = 0; start < matches.length; start++) {
+            if (matches[start].label !== "A") continue;
+            const block = [matches[start]];
+            for (let i = start + 1; i < matches.length; i++) {
+                if (matches[i].label !== "ABCDE"[block.length]) break;
+                block.push(matches[i]);
+                if (block.length === 5) break;
+            }
+            if (block.length >= 3) return block;
+        }
+        return null;
+    }
+
     static extractChoices(input) {
-        const choiceRegex = /\\textbf\s*\{\s*\(([A-E])\s*\)\s*\}/;
-        let parts = input.split(choiceRegex).slice(1);
-        let choices = [];
-        for (let i = 0; i < parts.length; ++i) {
-            if (i % 2 === 1) {
-                choices.push(
-                    parts[i]
-                        .replace(/\n[\s\S]*$/, "")
-                        // Strip the LaTeX spacing macros AoPS puts after the bold
-                        // label (e.g. `\textbf{(A) }\ 1` -> `1`): a leading run of
-                        // whitespace, escaped space `\ `, `\,`/`\;`/`\:`/`\!`, or
-                        // `\quad`/`\qquad`. A real value like `\frac{3}{10}` is kept.
-                        .replace(/^(?:\s|\\[ ,;:!]|\\q?quad\b)+/, "")
-                        .replace(/^\\(\d+)/, "$1")
-                        // Strip trailing separators/delimiters: whitespace, a
-                        // `\qquad`, a LaTeX line break `\\` (some pages, e.g. AMC 8
-                        // 2010 #23, break choices onto lines), or a closing `$`/`$$`
-                        // (from a converted </math>/</imath>/</cmath> on the last one).
-                        .replace(/(?:\s|\\qquad\b|\\\\|\${1,2})+$/, "")
-                        .trim(),
+        const block = CleanupText._choiceBlock(input);
+        if (!block) return [];
+
+        return block.map((match, i) => {
+            const end = i + 1 < block.length ? block[i + 1].index : input.length;
+            let value = input
+                .slice(match.end, end)
+                .replace(/\n[\s\S]*$/, "")
+                // Strip the LaTeX spacing macros AoPS puts after a label. A real
+                // value like `\frac{3}{10}` is deliberately kept.
+                .replace(/^(?:\s|\\[ ,;:!]|\\q?quad\b)+/, "")
+                .replace(/^\\(\d+)/, "$1");
+            if (match.closesAfterValue) {
+                value = value.replace(
+                    /\}(?=(?:\s|\\q?quad\b|\\\\|\${1,2})*$)/,
+                    "",
                 );
             }
-        }
-        return choices;
+            return value
+                // Strip separators and closing math delimiters from the value.
+                .replace(/(?:\s|\\q?quad\b|\\\\|\${1,2})+$/, "")
+                .trim();
+        });
     }
 
     static cleanChoices(str) {
-        let clean = str.trim();
-        let matches = [
-            ...str.matchAll(/\\textbf\s*{\s*\(\s*[A-E]\s*\)\s}[\s\S]*?/g),
-        ];
-        if (matches.length > 3) {
-            clean = clean
-                .slice(0, matches[0].index - 1)
-                .replace(/\${1,2}\s*$/, "");
-        }
-        return clean;
+        const block = CleanupText._choiceBlock(str);
+        if (!block) return str.trim();
+        return str
+            .slice(0, block[0].index)
+            .replace(/\${1,2}\s*$/, "")
+            .trim();
     }
 
     static parseMCQAns(input) {

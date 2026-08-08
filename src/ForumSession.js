@@ -995,6 +995,11 @@ export class ForumSession {
       if (kind === "mcq") {
          problem.choices = CleanupText.extractChoices(problem.statement);
          problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+         if (problem.choices.length < 3) {
+            this.log(
+               `  ⚠️  Problem ${problem.n + 1}: test resolved as MCQ but only ${problem.choices.length} choice(s) were extractable`,
+            );
+         }
          const raw = CleanupText.selectBoxedAnswer(posts, {
             answerKind: "mcq",
             choices: problem.choices,

@@ -49,45 +49,107 @@ function normalizeDuplicateLinks(db) {
     );
 }
 
-// Re-derives MCQ choices from the statement when missing, and re-cleans the
-// statement of any leftover appended answer-choice block. Operates on the
-// aops_* source columns (the merged `statement` is COALESCE(pdf,...) in the DB).
+// Re-derives MCQ choices from each scraped statement tier when missing, and
+// re-cleans any leftover appended answer-choice block. The resolved columns are
+// recomputed with the normal pdf > wiki > aops precedence.
 function refreshChoices(db) {
     console.log("Step 1: Re-extracting MCQ choices / cleaning statements...");
     const problems = db
         .query(
-            "SELECT id, aops_statement, aops_choices FROM problems WHERE aops_statement IS NOT NULL",
+            `SELECT id, verified, pdf_statement,
+                    wiki_statement, wiki_choices, wiki_answer_index, wiki_answer,
+                    aops_statement, aops_choices, aops_answer_index, aops_answer
+             FROM problems
+             WHERE wiki_statement IS NOT NULL OR aops_statement IS NOT NULL`,
         )
         .all();
-    let updated = 0;
-    // Keep the merged `statement` consistent for non-PDF rows (it is
-    // COALESCE(pdf_statement, aops_statement)); never clobber a pdf override.
+    let updatedProblems = 0;
+    let updatedWiki = 0;
+    let updatedAops = 0;
     const stmt = db.prepare(
-        "UPDATE problems SET aops_statement = ?, aops_choices = ?, statement = COALESCE(pdf_statement, ?) WHERE id = ?",
+        `UPDATE problems SET
+            wiki_statement = ?, wiki_choices = ?, wiki_answer_index = ?,
+            aops_statement = ?, aops_choices = ?, aops_answer_index = ?,
+            statement = CASE
+                WHEN verified THEN statement
+                ELSE COALESCE(pdf_statement, ?, ?)
+            END,
+            answer_index = CASE
+                WHEN verified THEN answer_index
+                WHEN ? IS NOT NULL THEN ?
+                ELSE ?
+            END
+         WHERE id = ?`,
     );
+
+    const refreshTier = (statement, choicesJson, answerIndex, answer) => {
+        if (statement == null) {
+            return { statement, choicesJson, answerIndex, changed: false };
+        }
+        const stored = choicesJson ? JSON.parse(choicesJson) : null;
+        const extracted = CleanupText.extractChoices(statement);
+        // A previous parser may have persisted only part of a malformed block.
+        // Prefer a newly recovered, longer sequence; otherwise preserve the
+        // stored choices when the already-cleaned statement no longer has them.
+        const choices =
+            extracted.length > (stored?.length ?? 0) ? extracted : stored;
+        if (!choices?.length) {
+            return { statement, choicesJson, answerIndex, changed: false };
+        }
+        const cleaned = CleanupText.cleanChoices(statement).trim();
+        const resolvedIndex = CleanupText.choiceIndexOfAnswer(answer, choices);
+        const nextIndex = resolvedIndex >= 0 ? resolvedIndex : (answerIndex ?? -1);
+        const nextChoicesJson = JSON.stringify(choices);
+        return {
+            statement: cleaned,
+            choicesJson: nextChoicesJson,
+            answerIndex: nextIndex,
+            changed:
+                cleaned !== statement ||
+                nextChoicesJson !== choicesJson ||
+                nextIndex !== (answerIndex ?? -1),
+        };
+    };
 
     db.transaction(() => {
         for (const p of problems) {
-            const hasChoices =
-                p.aops_choices &&
-                p.aops_choices !== "[]" &&
-                JSON.parse(p.aops_choices).length > 0;
-            const extracted = hasChoices
-                ? JSON.parse(p.aops_choices)
-                : CleanupText.extractChoices(p.aops_statement);
+            const wiki = refreshTier(
+                p.wiki_statement,
+                p.wiki_choices,
+                p.wiki_answer_index,
+                p.wiki_answer,
+            );
+            const aops = refreshTier(
+                p.aops_statement,
+                p.aops_choices,
+                p.aops_answer_index,
+                p.aops_answer,
+            );
+            if (!wiki.changed && !aops.changed) continue;
 
-            // Nothing to extract → not an MCQ problem; leave it untouched.
-            if (!extracted || extracted.length === 0) continue;
-
-            const cleaned = CleanupText.cleanChoices(p.aops_statement).trim();
-            if (cleaned !== p.aops_statement || !hasChoices) {
-                stmt.run(cleaned, JSON.stringify(extracted), cleaned, p.id);
-                updated++;
-            }
+            stmt.run(
+                wiki.statement,
+                wiki.choicesJson,
+                wiki.answerIndex,
+                aops.statement,
+                aops.choicesJson,
+                aops.answerIndex,
+                wiki.statement,
+                aops.statement,
+                wiki.choicesJson,
+                wiki.answerIndex,
+                aops.answerIndex,
+                p.id,
+            );
+            updatedProblems++;
+            if (wiki.changed) updatedWiki++;
+            if (aops.changed) updatedAops++;
         }
     })();
 
-    console.log(`  Updated choices/statement for ${updated} problems.`);
+    console.log(
+        `  Updated ${updatedProblems} problem(s) (${updatedWiki} wiki tier, ${updatedAops} AoPS tier).`,
+    );
 }
 
 function reclassifyAcgn(db) {
