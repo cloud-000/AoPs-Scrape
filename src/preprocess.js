@@ -88,15 +88,18 @@ function refreshChoices(db) {
         }
         const stored = choicesJson ? JSON.parse(choicesJson) : null;
         const extracted = CleanupText.extractChoices(statement);
-        // A previous parser may have persisted only part of a malformed block.
-        // Prefer a newly recovered, longer sequence; otherwise preserve the
+        // A previous parser may have persisted only part of a malformed block
+        // or left spacing macros in an otherwise complete array. Prefer a newly
+        // recovered sequence when it is at least as complete; otherwise keep
         // stored choices when the already-cleaned statement no longer has them.
         const choices =
-            extracted.length > (stored?.length ?? 0) ? extracted : stored;
+            extracted.length >= (stored?.length ?? 0) && extracted.length > 0
+                ? extracted
+                : stored;
         if (!choices?.length) {
             return { statement, choicesJson, answerIndex, changed: false };
         }
-        const cleaned = CleanupText.cleanChoices(statement).trim();
+        const cleaned = CleanupText.cleanChoices(statement, choices).trim();
         const resolvedIndex = CleanupText.choiceIndexOfAnswer(answer, choices);
         const nextIndex = resolvedIndex >= 0 ? resolvedIndex : (answerIndex ?? -1);
         const nextChoicesJson = JSON.stringify(choices);

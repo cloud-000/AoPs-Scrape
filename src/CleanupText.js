@@ -557,7 +557,10 @@ export class CleanupText {
                 .replace(/\n[\s\S]*$/, "")
                 // Strip the LaTeX spacing macros AoPS puts after a label. A real
                 // value like `\frac{3}{10}` is deliberately kept.
-                .replace(/^(?:\s|\\[ ,;:!]|\\q?quad\b)+/, "")
+                .replace(
+                    /^(?:\s|\\[ ,;:!]|\\q?quad\b|\\qqua\b|\\hspace\*?\s*\{[^{}]*\})+/,
+                    "",
+                )
                 .replace(/^\\(\d+)/, "$1");
             if (match.closesAfterValue) {
                 value = value.replace(
@@ -567,18 +570,129 @@ export class CleanupText {
             }
             return value
                 // Strip separators and closing math delimiters from the value.
-                .replace(/(?:\s|\\q?quad\b|\\\\|\${1,2})+$/, "")
+                .replace(
+                    /(?:\s|\\q?quad\b|\\qqua\b|\\hspace\*?\s*\{[^{}]*\}|\\\\|\${1,2})+$/,
+                    "",
+                )
                 .trim();
         });
     }
 
-    static cleanChoices(str) {
-        const block = CleanupText._choiceBlock(str);
-        if (!block) return str.trim();
-        return str
-            .slice(0, block[0].index)
-            .replace(/\${1,2}\s*$/, "")
+    // Once a choice block is found, remove presentation tokens that opened the
+    // block immediately before its (A) marker. Slicing at the marker alone
+    // strands prefixes such as `\[`, `${{`, `$\displaystyle`, or
+    // `$\hspace*{5mm}` at the end of the problem statement.
+    static _stripUnmatchedTrailingDollar(str) {
+        const clean = str.trimEnd();
+        const run = /(?<!\\)(\$+)$/.exec(clean)?.[1] ?? "";
+        if (!run) return clean;
+
+        let singleCount = 0;
+        let doubleCount = 0;
+        for (let i = 0; i < clean.length; i++) {
+            if (clean[i] !== "$" || (i > 0 && clean[i - 1] === "\\")) continue;
+            if (clean[i + 1] === "$") {
+                doubleCount++;
+                i++;
+            } else {
+                singleCount++;
+            }
+        }
+
+        // An odd trailing run ends in a single-dollar delimiter; an even run
+        // ends in a display delimiter. Remove it only when that delimiter is
+        // unmatched in the prefix, meaning it opened the choice block. A
+        // balanced closing `$` belonging to the question is preserved.
+        if (run.length % 2 === 1 && singleCount % 2 === 1) {
+            return clean.slice(0, -1).trimEnd();
+        }
+        if (run.length % 2 === 0 && doubleCount % 2 === 1) {
+            return clean.slice(0, -2).trimEnd();
+        }
+        return clean;
+    }
+
+    static _stripChoiceBlockPrefix(prefix) {
+        let clean = prefix.trimEnd();
+        let previous;
+        do {
+            previous = clean;
+            clean = clean
+                .replace(/\\hspace\*?\s*\{[^{}]*\}\s*$/, "")
+                .replace(/\\q?quad\b\s*$/, "")
+                .replace(/\\(?:displaystyle|mathbf)\b\s*$/, "")
+                .replace(/\[b\]\s*$/i, "")
+                .replace(/<center>\s*$/i, "")
+                .replace(/\\begin\s*\{center\}\s*$/i, "")
+                .replace(/\{\s*$/, "")
+                .replace(/\\\[\s*$/, "")
+                .trimEnd();
+            clean = CleanupText._stripUnmatchedTrailingDollar(clean);
+        } while (clean !== previous);
+        return clean.trim();
+    }
+
+    // Repair a distinctive opening token left by an older cleanup even when
+    // the old statement no longer contains choice A. This intentionally omits
+    // a bare trailing `$`, which could legitimately close math in the question.
+    static _stripOrphanedChoicePrefix(str) {
+        const clean = str.trimEnd();
+        const orphan =
+            /(?:\\\[|\$\s*\{+|\$\s*\\(?:displaystyle|mathbf)\b|\$?\s*\\hspace\*?\s*\{[^{}]*\}|\$?\s*\\q?quad\b|\[b\])\s*$/i;
+        return orphan.test(clean)
+            ? CleanupText._stripChoiceBlockPrefix(clean)
+            : clean.trim();
+    }
+
+    // Some rows were partially cleaned by an older parser: the complete choice
+    // array survived, but the statement was truncated after choice A. Only use
+    // this recovery when the remaining suffix normalizes to the stored first
+    // choice; ordinary mentions of `(A)` are therefore left untouched.
+    static _danglingFirstChoiceStart(str, choices) {
+        if (!Array.isArray(choices) || choices.length < 3) return -1;
+        const masked = str
+            .replace(/\[asy(?:=[^\]]*)?\][\s\S]*?\[\/asy\]/gi, (s) =>
+                " ".repeat(s.length),
+            )
+            .replace(/<asy\b[^>]*>[\s\S]*?<\/asy>/gi, (s) =>
+                " ".repeat(s.length),
+            );
+        const marker =
+            /\\(?:textbf|text|textrm|mathrm)\s*\{\s*\(\s*A\s*\)(?:\s|\\[ ,;:!]|\\q?quad\b)*\}|\\(?:textbf|text|textrm|mathrm)\s*\{\s*\(\s*A\s*\)|\(\s*\\(?:textbf|text|textrm|mathrm)\s*\{\s*A\s*\}\s*\)/g;
+        const matches = [...masked.matchAll(marker)];
+        if (!matches.length) return -1;
+        const match = matches[matches.length - 1];
+        const tail = str
+            .slice(match.index + match[0].length)
+            .replace(/^(?:\s|\\[ ,;:!]|\\q?quad\b)+/, "")
+            // Historical cache entries sometimes end midway through `\qquad`.
+            .replace(/(?:\s|\\q(?:quad|qua|qu|q)?\b|\${1,2})+$/, "")
             .trim();
+        return CleanupText.normalizeAnswer(tail) ===
+            CleanupText.normalizeAnswer(choices[0])
+            ? match.index
+            : -1;
+    }
+
+    static cleanChoices(str, knownChoices = null) {
+        const block = CleanupText._choiceBlock(str);
+        if (block) {
+            return CleanupText._stripChoiceBlockPrefix(
+                str.slice(0, block[0].index),
+            );
+        }
+        const danglingStart = CleanupText._danglingFirstChoiceStart(
+            str,
+            knownChoices,
+        );
+        if (danglingStart >= 0) {
+            return CleanupText._stripChoiceBlockPrefix(
+                str.slice(0, danglingStart),
+            );
+        }
+        return Array.isArray(knownChoices) && knownChoices.length >= 3
+            ? CleanupText._stripOrphanedChoicePrefix(str)
+            : str.trim();
     }
 
     static parseMCQAns(input) {
