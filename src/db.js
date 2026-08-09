@@ -1992,9 +1992,11 @@ export function upsertScrapeResults(db, raw) {
             const isComputational = test.computational ?? false;
 
             // A sectioned test (problems is a 2D array, one bucket per section
-            // name) is materialized as one test row per section, named
-            // "<test name> <section name>". A flat test is a single row with
-            // section = -1. `units` normalizes both into the same shape.
+            // name) is materialized as one test row per section, named by
+            // CleanupText.sectionTestName — normally "<test name> <section
+            // name>", closed up for an AMC version letter ("2015 AMC 10A").
+            // A flat test is a single row with section = -1. `units` normalizes
+            // both into the same shape.
             // A section may be unnamed — the problems a category listed before
             // its first header (the test proper, ahead of a shortlist or a
             // tiebreaker round); that row keeps the plain test name, which is
@@ -2008,7 +2010,10 @@ export function upsertScrapeResults(db, raw) {
                           sectionName,
                       );
                       return {
-                          name: `${test.name} ${sectionName}`.trim(),
+                          name: CleanupText.sectionTestName(
+                              test.name,
+                              sectionName,
+                          ),
                           section: i,
                           sectionName: sectionName || null,
                           problems: test.problems[i] ?? [],

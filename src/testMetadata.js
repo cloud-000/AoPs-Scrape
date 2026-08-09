@@ -45,9 +45,12 @@ const SCHOOL_DIVISIONS = new Map([
     ["high school", { label: "High School", order: 20 }],
 ]);
 
+// Version letters of one contest (an AMC 10A vs. 10B). "P" is the 2002-only
+// third administration, which both AoPS and the wiki spell as a version.
 const LETTER_FORMATS = new Map([
     ["A", { label: "A", order: 10 }],
     ["B", { label: "B", order: 20 }],
+    ["P", { label: "P", order: 30 }],
 ]);
 
 const AIME_FORMATS = new Map([
@@ -359,6 +362,18 @@ export function sectionTestMetadata(type, sectionName) {
         return format ? { ...emptyTestMetadata(), ...format } : null;
     }
 
+    // An AMC section is a version (A/B/P) by the time it reaches here —
+    // CleanupText.resolveVersionSections has already turned the raw date labels
+    // into letters. Resolving them to the same format registry the wiki
+    // importer uses keeps the two sources' metadata identical on a merged row.
+    if (/^AMC\b/.test(type ?? "")) {
+        const format = fromEntry(
+            "format",
+            LETTER_FORMATS.get(label.toUpperCase()),
+        );
+        return format ? { ...emptyTestMetadata(), ...format } : null;
+    }
+
     const day = label.match(/^Day\s+(\d+)$/i);
     if (day) {
         const n = Number(day[1]);
@@ -374,7 +389,9 @@ export function sectionTestMetadata(type, sectionName) {
 export function wikiTestMetadata(titleBase) {
     if (titleBase === "AMC 8") return emptyTestMetadata();
 
-    const amc = titleBase.match(/^AMC\s+(?:10|12)([AB])$/);
+    // The season prefix ("Fall AMC 12A") is part of the wiki's page-title base
+    // and rides along in the test name; the version letter is still the format.
+    const amc = titleBase.match(/^(?:Fall\s+|Spring\s+)?AMC\s+(?:10|12)([ABP])$/);
     if (amc) {
         return {
             ...emptyTestMetadata(),

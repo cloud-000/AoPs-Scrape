@@ -597,6 +597,20 @@ export class ForumSession {
          test.sections = ["I", "II"];
       }
 
+      // AMC 10/12 quirk, the same shape as the AIME one above: AoPS files a
+      // year's two administrations (three, in 2002) as one category and labels
+      // the sections inconsistently — sometimes the bare version letter, more
+      // often the administration date ("February 3rd", "November 16, 2022").
+      // The wiki lists each version as its own test ("2015 AMC 10A"), so unless
+      // these resolve to version letters the two sources never meet on the
+      // (series, name, year) natural key and every AMC 10/12 lands twice.
+      // resolveVersionSections returns null for anything that is not a version
+      // split, so a mock AMC's named rounds keep their own labels.
+      if (/^AMC\b/.test(type.name ?? "")) {
+         const versions = CleanupText.resolveVersionSections(test.sections);
+         if (versions) test.sections = versions;
+      }
+
       test.count = ctx.problemCount;
       this._permissionDenied = false;
       return test;

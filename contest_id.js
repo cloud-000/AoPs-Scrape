@@ -4,13 +4,55 @@
 // legacy derived booleans kept in sync: computational = answerKind !== "proof",
 // choices = answerKind === "mcq".
 export const TYPES = {
-    AMC: { id: 0, computational: true, name: "AMC", choices: true, answerKind: "mcq" },
-    AIME: { id: 1, computational: true, name: "AIME", choices: false, answerKind: "numeric" },
-    AMO: { id: 2, computational: false, name: "OLY", choices: false, answerKind: "proof" },
-    COLLEGE: { id: 4, computational: true, name: "COLL", choices: false, answerKind: "numeric" },
-    COMPUTE: { id: 97, computational: true, name: "COMP", choices: false, answerKind: "numeric" },
-    ARML: { id: 98, computational: true, name: "ARML", choices: false, answerKind: "numeric" },
-    UNKNOWN: { id: 99, computational: null, name: null, choices: false, answerKind: null },
+    AMC: {
+        id: 0,
+        computational: true,
+        name: "AMC",
+        choices: true,
+        answerKind: "mcq",
+    },
+    AIME: {
+        id: 1,
+        computational: true,
+        name: "AIME",
+        choices: false,
+        answerKind: "numeric",
+    },
+    AMO: {
+        id: 2,
+        computational: false,
+        name: "OLY",
+        choices: false,
+        answerKind: "proof",
+    },
+    COLLEGE: {
+        id: 4,
+        computational: true,
+        name: "COLL",
+        choices: false,
+        answerKind: "numeric",
+    },
+    COMPUTE: {
+        id: 97,
+        computational: true,
+        name: "COMP",
+        choices: false,
+        answerKind: "numeric",
+    },
+    ARML: {
+        id: 98,
+        computational: true,
+        name: "ARML",
+        choices: false,
+        answerKind: "numeric",
+    },
+    UNKNOWN: {
+        id: 99,
+        computational: null,
+        name: null,
+        choices: false,
+        answerKind: null,
+    },
 };
 
 export const CONTEST_IDS = {
@@ -20,30 +62,57 @@ export const CONTEST_IDS = {
         3685109, // 2013 USAYNO (NIMO 2-13 Q11)
         2982588, // FMM duplicate
     ],
+    // As of the current time, AMC 10/12 2026 has not occurred, (they occur later in the year)
+    // AIME and AMC 8 has already been released however, so 2026 exists for them.
     MAA: [
         {
             name: "AMC 8",
             id: 3413,
             is_official: true,
-            wiki: { variants: ["AMC 8"], years: [1999, 2024] },
+            wiki: { variants: ["AMC 8"], years: [1999, 2026] },
         },
         {
             name: "AMC 10",
             id: 3414,
             is_official: true,
-            wiki: { variants: ["AMC 10A", "AMC 10B"], years: [2002, 2024] },
+            wiki: {
+                variants: [
+                    "AMC 10A",
+                    "AMC 10B",
+                    // 2021 ran a second, full administration in the fall, which
+                    // the wiki publishes as its own page family ("2021 Fall AMC
+                    // 10B Problems/Problem 2"). Without these the fall tests get
+                    // AoPS statements with no wiki choices or answer key.
+                    { name: "Fall AMC 10A", years: [2021, 2021] },
+                    { name: "Fall AMC 10B", years: [2021, 2021] },
+                    // 2002 had a third "P" (practice) administration.
+                    { name: "AMC 10P", years: [2002, 2002] },
+                ],
+                years: [2002, 2025],
+            },
         },
         {
             name: "AMC 12",
             id: 3415,
             is_official: true,
-            wiki: { variants: ["AMC 12A", "AMC 12B"], years: [2002, 2024] },
+            wiki: {
+                variants: [
+                    "AMC 12A",
+                    "AMC 12B",
+                    // See the AMC 10 note above: 2021's fall administration and
+                    // 2002's "P" are separate wiki page families.
+                    { name: "Fall AMC 12A", years: [2021, 2021] },
+                    { name: "Fall AMC 12B", years: [2021, 2021] },
+                    { name: "AMC 12P", years: [2002, 2002] },
+                ],
+                years: [2002, 2025],
+            },
         },
         {
             name: "AIME",
             id: 3416,
             is_official: true,
-            wiki: { variants: ["AIME I", "AIME II"], years: [2000, 2024] },
+            wiki: { variants: ["AIME I", "AIME II"], years: [1983, 2026] },
         },
         {
             name: "USAMTS",
@@ -83,7 +152,12 @@ export const CONTEST_IDS = {
             is_official: true,
             link: "https://www.stanfordmathtournament.org/past-tests/problems",
         },
-        { name: "BMT", id: 2503467, is_official: true, link: "https://berkeley.mt/resources/" },
+        {
+            name: "BMT",
+            id: 2503467,
+            is_official: true,
+            link: "https://berkeley.mt/resources/",
+        },
         {
             name: "PUMAC",
             id: 3426,
@@ -117,7 +191,12 @@ export const CONTEST_IDS = {
             is_official: true,
             link: "https://purplecomet.org/answers",
         },
-        { name: "OMMC", id: 2824982, is_official: true, link: "https://www.ommcofficial.org/" },
+        {
+            name: "OMMC",
+            id: 2824982,
+            is_official: true,
+            link: "https://www.ommcofficial.org/",
+        },
         {
             name: "NIMO",
             id: 3423,

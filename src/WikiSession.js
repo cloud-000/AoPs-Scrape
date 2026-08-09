@@ -315,8 +315,17 @@ export class WikiSession {
     // 2021). `name` must match the forum's normalized category name so the
     // natural key (series, name, year) merges wiki rows onto forum rows.
     async getContest(titleBase, year) {
-        const name = `${year} ${titleBase}`;
-        const metadata = wikiTestMetadata(titleBase);
+        let actualTitleBase = titleBase;
+        if (year < 2000 && (titleBase === "AIME I" || titleBase === "AIME II")) {
+            if (titleBase === "AIME II") return null;
+            actualTitleBase = "AIME";
+        }
+        const name = `${year} ${actualTitleBase}`;
+        // Resolve metadata from the title the test is actually published under,
+        // not the variant we asked for: a pre-2000 AIME was a single
+        // administration, so fetching it as the "AIME I" variant must not stamp
+        // it format = "I" alongside the genuine 2000+ AIME I tests.
+        const metadata = wikiTestMetadata(actualTitleBase);
         const type = ForumSession.inferType(name, true) ?? TYPES.UNKNOWN;
         const computational = type.computational ?? false;
         const hasChoices = type.choices ?? false;

@@ -1,0 +1,11 @@
+for s in "AMC 8" "AMC 10" "AMC 12" "AIME" ; do \
+    echo "=== Processing $s ==="
+    bun cli/index.js scrape --series="$s" --yes --cache && \
+    bun cli/index.js wiki --series="$s" --yes --cache; \
+done && \
+
+for s in "Purple Comet" "AIME mocks" "OMMC" "USA Computational Geo Mocks"; do \
+    bun cli/index.js scrape --series="$s" --yes --cache; \
+done && \
+
+bun cli/index.js import-pdf --all
