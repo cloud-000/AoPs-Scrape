@@ -409,6 +409,30 @@ async function main() {
             break;
         }
 
+        case "audit": {
+            const args = parseAuditArgs(process.argv.slice(3));
+            const { auditDatabaseFile, writeAuditReports } =
+                await import("../src/textAudit.js");
+            const report = auditDatabaseFile(DB_PATH, {
+                entities: args.entities,
+                sources: args.sources,
+            });
+            const written = writeAuditReports(report, {
+                jsonFile: args.jsonFile,
+                csvFile: args.csvFile,
+            });
+            const summary = report.summary;
+            console.log(
+                `Audited ${summary.totalAuditedTexts} stored texts: ` +
+                    `${summary.flaggedAuditedTexts} flagged, ${summary.totalFindings} findings ` +
+                    `(${summary.findingsBySeverity.error ?? 0} errors, ` +
+                    `${summary.findingsBySeverity.warning ?? 0} warnings).`,
+            );
+            if (written.jsonFile) console.log(`  JSON: ${written.jsonFile}`);
+            if (written.csvFile) console.log(`  CSV:  ${written.csvFile}`);
+            break;
+        }
+
         case "init-db": {
             const db = initDB(DB_PATH);
             db.close();
@@ -471,11 +495,39 @@ async function main() {
                 "  export-sql [file] [--schema-only|--data-only|--no-schema|--no-inserts]\n" +
                 "  sync-export [file]\n" +
                 "  seed-ratings-export [file] [--overwrite-seeds]\n" +
+                "  audit [--entity=statements,choices,solutions,solution-sources] [--source=aops,wiki,pdf,import,manual,canonical] [--json=file] [--csv=file] [--no-json|--no-csv]\n" +
                 "  init-db\n" +
                 "  clear-db [--yes|-y]"
             );
             break;
     }
+}
+
+function parseAuditArgs(args) {
+    const commaSet = (name) => {
+        const flag = args.find((arg) => arg.startsWith(`--${name}=`));
+        if (!flag) return new Set(["all"]);
+        const values = flag
+            .slice(name.length + 3)
+            .split(",")
+            .map((value) => value.trim().toLowerCase())
+            .filter(Boolean);
+        return new Set(values.length ? values : ["all"]);
+    };
+    const pathFlag = (name, fallback) => {
+        const flag = args.find((arg) => arg.startsWith(`--${name}=`));
+        return flag ? flag.slice(name.length + 3).trim() || fallback : fallback;
+    };
+    return {
+        entities: commaSet("entity"),
+        sources: commaSet("source"),
+        jsonFile: args.includes("--no-json")
+            ? null
+            : pathFlag("json", "scrape_data/text_audit.json"),
+        csvFile: args.includes("--no-csv")
+            ? null
+            : pathFlag("csv", "scrape_data/text_audit.csv"),
+    };
 }
 
 function parseExportSQLArgs(args) {
