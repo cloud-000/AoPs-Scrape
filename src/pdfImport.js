@@ -37,6 +37,7 @@ import {
     readProblemCoverage,
     resolveCoverage,
 } from "./coverage.js";
+import { normalizePdfStatement } from "./textAudit.js";
 import {
     mathcountsTestMetadata,
     numberedFormatMetadata,
@@ -704,7 +705,7 @@ export function importPdfProblems(db, outDir, options = {}) {
                         db,
                         {
                             n,
-                            statement: problems[key],
+                            statement: normalizePdfStatement(problems[key]),
                             answer: answers[key] ?? null,
                             source: `${seriesFolder}/${testFolder}`,
                             is_computational: isComputational,

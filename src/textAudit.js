@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 
 import { CleanupText } from "./CleanupText.js";
 
-export const TEXT_AUDIT_VERSION = "text-audit-v1";
+export const TEXT_AUDIT_VERSION = "text-audit-v2";
 
 const PAIRED_BBCODE = new Set([
     "b",
@@ -125,6 +125,222 @@ function maskAsymptote(text, findings) {
 
 function inRegion(offset, regions) {
     return regions.some((region) => offset >= region.start && offset < region.end);
+}
+
+// A literal price such as `$4.20` is valid prose but an unescaped dollar sign
+// is also a TeX math opener. Classify the unambiguous currency-shaped cases
+// before pairing math delimiters, then mask only their `$` so they cannot make
+// a later, otherwise-balanced math span look malformed. This deliberately does
+// not rewrite the stored text; the audit remains read-only.
+function maskUnescapedCurrency(text, original, findings, context = {}) {
+    const currencyOffsets = [];
+    let openInlineDollar = null;
+
+    const nextSingleDollar = (start) => {
+        for (let cursor = start; cursor < text.length; cursor++) {
+            if (text[cursor] !== "$" || isEscaped(text, cursor)) continue;
+            if (text[cursor - 1] === "$" || text[cursor + 1] === "$") continue;
+            return cursor;
+        }
+        return -1;
+    };
+
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] !== "$" || isEscaped(text, i)) continue;
+
+        let run = 1;
+        while (text[i + run] === "$" && !isEscaped(text, i + run)) run++;
+        if (run >= 2) {
+            // Match mathTokenAt's adjacent-delimiter behavior. With inline
+            // math open, the first dollar closes it; any remaining pair is a
+            // display delimiter and one odd remainder opens inline math again.
+            // Without an inline opener, pairs are display delimiters and an
+            // odd remainder opens inline math.
+            const leavesInlineOpen =
+                openInlineDollar == null ? run % 2 === 1 : run % 2 === 0;
+            openInlineDollar = leavesInlineOpen ? i + run - 1 : null;
+            i += run - 1;
+            continue;
+        }
+
+        // A parenthesized standalone symbol, as in "value in dollars ($)", is
+        // currency even though no amount follows it.
+        const standaloneSymbol = text[i - 1] === "(" && text[i + 1] === ")";
+        const amount = /^\$(-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/.exec(
+            text.slice(i),
+        );
+        if (!standaloneSymbol && !amount) {
+            openInlineDollar = openInlineDollar == null ? i : null;
+            continue;
+        }
+
+        // A currency-shaped dollar can actually be the closer for a preceding
+        // span: `\times$12`, `$n$37`, and even malformed `$more than $4` all
+        // have an unmatched inline opener before this dollar. Closing that span
+        // takes precedence over interpreting the following digits as money.
+        if (openInlineDollar != null) {
+            const possibleMathBody = text.slice(openInlineDollar + 1, i);
+            const withoutCommands = possibleMathBody.replace(/\\[A-Za-z]+/g, "");
+            // Do not let an actually-unclosed formula swallow a later price.
+            // A legitimate close has no prose-sized bare words once TeX
+            // commands are removed (`n`, `\times`, `7^c = 8` all qualify).
+            if (
+                (possibleMathBody.trim() !== "" &&
+                    !/[A-Za-z]{2,}/.test(withoutCommands)) ||
+                (context.entityType === "answer_choice" &&
+                    openInlineDollar === 0)
+            ) {
+                openInlineDollar = null;
+                continue;
+            }
+            openInlineDollar = null;
+        }
+
+        if (amount) {
+            const amountEnd = i + amount[0].length;
+            // `$5$` is a balanced numeric math span, not currency.
+            if (
+                text[amountEnd] === "$" ||
+                /^[.,;:!?]\$/.test(text.slice(amountEnd))
+            ) {
+                openInlineDollar = i;
+                continue;
+            }
+
+            const remainder = text.slice(amountEnd);
+            const next = /^\s*(.)/s.exec(remainder)?.[1] ?? "";
+            const obscuredPrice =
+                amount[1].startsWith("-") &&
+                /^-\s*(?:[,.;:!?)]|$)/.test(remainder);
+            // No whitespace between the leading number and a letter is TeX
+            // implicit multiplication/variable syntax (`$3x+2$`, `$10p$`).
+            const immediate = text[amountEnd] ?? "";
+            const magnitudeSuffix = /^[KMB]\b/.test(text.slice(amountEnd));
+            if (magnitudeSuffix && text[amountEnd + 1] === "$") {
+                openInlineDollar = i;
+                continue;
+            }
+            if (/[A-Za-z(@:|!]/.test(immediate) && !magnitudeSuffix) {
+                openInlineDollar = i;
+                continue;
+            }
+            if (
+                immediate === "." &&
+                /[A-Za-z0-9]/.test(text[amountEnd + 1] ?? "")
+            ) {
+                openInlineDollar = i;
+                continue;
+            }
+            // A number followed by a mathematical operator/command is likely
+            // the start of an expression such as `$100 + x$`. The obscured
+            // price form `$-99.9-` observed in OCR is the intentional exception.
+            const htmlAfterAmount = /^\s*<(?:\/|br\b|td\b|tr\b|table\b)/i.test(
+                remainder,
+            );
+            if (
+                !obscuredPrice &&
+                /[+\-*/=^_\\{<>@:|!]/.test(next) &&
+                !(next === "<" && htmlAfterAmount)
+            ) {
+                openInlineDollar = i;
+                continue;
+            }
+
+            const possibleClose = nextSingleDollar(amountEnd);
+            if (possibleClose >= 0) {
+                const possibleBody = text.slice(amountEnd, possibleClose);
+                const nextStartsAmount = /^\$-?\d/.test(
+                    text.slice(possibleClose),
+                );
+                const numericListBody = /^(?:\s*,\s*[A-Za-z0-9]+)+\s*$/.test(
+                    possibleBody,
+                );
+                const spacedOperatorBody = /^\s*[A-Za-z]\s+\d+\s*$/.test(
+                    possibleBody,
+                );
+                const bodyWithoutCommands = possibleBody.replace(
+                    /\\[A-Za-z]+/g,
+                    "",
+                );
+                const mathExpressionBody =
+                    !/<\/?[A-Za-z]/.test(possibleBody) &&
+                    !/[A-Za-z]{3,}/.test(bodyWithoutCommands) &&
+                    /[+\-*=^_\\{}<>|!@]/.test(possibleBody);
+                // Numeric math can start with a bare number and continue with
+                // punctuation, operators, or TeX (`$2,4,\ldots,50$`). Plain
+                // alphabetic prose before the next dollar instead means that
+                // the two dollars are separate prices (`$5 and $10`). A next
+                // dollar that itself starts an amount is likewise a new price,
+                // not the closer for this one (`$5, $10`).
+                if (
+                    !nextStartsAmount &&
+                    (/[\\{}]/.test(possibleBody) ||
+                        !/[A-Za-z]/.test(possibleBody) ||
+                        numericListBody ||
+                        spacedOperatorBody ||
+                        mathExpressionBody ||
+                        (next === "," && !/[A-Za-z]{2,}/.test(possibleBody)))
+                ) {
+                    openInlineDollar = i;
+                    continue;
+                }
+            }
+        }
+
+        currencyOffsets.push(i);
+        findings.push(
+            finding(
+                original,
+                "currency.unescaped_dollar",
+                "warning",
+                i,
+                "Unescaped currency dollar may be parsed as a math delimiter; use \\$ for a literal dollar sign.",
+            ),
+        );
+    }
+
+    let masked = text;
+    for (const offset of currencyOffsets) {
+        masked = masked.slice(0, offset) + " " + masked.slice(offset + 1);
+    }
+    return masked;
+}
+
+export function escapeLiteralCurrency(value, context = {}) {
+    let text = String(value ?? "");
+    const findings = [];
+    const maskedAsy = maskAsymptote(text, findings);
+    maskUnescapedCurrency(maskedAsy, text, findings, {
+        entityType: "problem_statement",
+        source: "pdf",
+        ...context,
+    });
+    const offsets = findings
+        .filter((item) => item.ruleId === "currency.unescaped_dollar")
+        .map((item) => item.offset)
+        .sort((a, b) => b - a);
+    for (const offset of offsets) {
+        text = text.slice(0, offset) + "\\$" + text.slice(offset + 1);
+    }
+    return text;
+}
+
+// Proven OCR presentation residue only. General delimiter balancing is not
+// safe: an orphan can also signal truncated content or a missing expression.
+export function cleanPdfDelimiterResidue(value) {
+    return String(value ?? "")
+        .replace(
+            /^\${1,2}[ \t]+(?=(?:(?:A|I)\s+[a-z]|[A-Z][a-z]+\b))/,
+            "",
+        )
+        .replace(
+            /(\b\d+\.[ \t]*)\${1,2}[ \t]*(\n[ \t\n]*)?(?=!\[)/g,
+            "$1$2",
+        );
+}
+
+export function normalizePdfStatement(value) {
+    return escapeLiteralCurrency(cleanPdfDelimiterResidue(value));
 }
 
 function auditBbcode(text, original, findings, mathRegions = []) {
@@ -598,7 +814,8 @@ export function auditText(value, context = {}) {
         );
     }
 
-    const masked = maskAsymptote(text, findings);
+    let masked = maskAsymptote(text, findings);
+    masked = maskUnescapedCurrency(masked, text, findings, context);
     const regions = auditMathDelimiters(masked, text, findings);
     auditBbcode(masked, text, findings, regions);
     auditBraces(masked, text, findings);

@@ -9,6 +9,9 @@ import {
     auditDatabaseFile,
     auditFindingsCsv,
     auditText,
+    cleanPdfDelimiterResidue,
+    escapeLiteralCurrency,
+    normalizePdfStatement,
     writeAuditReports,
 } from "../src/textAudit.js";
 
@@ -46,6 +49,118 @@ describe("mixed-markup structural audit", () => {
                 source: "aops",
             }),
         ).toEqual([]);
+    });
+
+    test("separates unescaped currency from math delimiter failures", () => {
+        const findings = auditText(
+            String.raw`Tickets cost $5, $10.50, or $1,000; value in dollars ($). Let $x=5$, $5$, and $100 + x$ remain math. Escaped \$20 is already safe.`,
+            { entityType: "problem_statement", source: "pdf" },
+        );
+        expect(ruleIds(findings)).toEqual([
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+        ]);
+        expect(findings.every((item) => item.severity === "warning")).toBe(true);
+    });
+
+    test("masks currency without hiding a real unclosed math delimiter", () => {
+        const findings = auditText("The prize is $50. Compute $x+1.", {
+            entityType: "problem_statement",
+            source: "pdf",
+        });
+        expect(ruleIds(findings)).toEqual([
+            "currency.unescaped_dollar",
+            "math.unclosed_delimiter",
+        ]);
+    });
+
+    test("recognizes the observed obscured-price currency form", () => {
+        const findings = auditText("The trophies cost $-99.9-, where digits are hidden.", {
+            entityType: "problem_statement",
+            source: "pdf",
+        });
+        expect(ruleIds(findings)).toEqual(["currency.unescaped_dollar"]);
+    });
+
+    test("preserves number-led math expressions and numeric variable lists", () => {
+        const text =
+            "$3x+2=4$, $0<x<1$, $12,w,x,y,z,47$, $0.abcd$, " +
+            "$3@n=3$, $-2-i$, $15!m$, $100|a|$, $3,5,7,a,$, " +
+            "$59 m - 68 n = mn$, $26.$, and $2(n-5)$";
+        expect(
+            auditText(text, {
+                entityType: "problem_statement",
+                source: "pdf",
+            }),
+        ).toEqual([]);
+    });
+
+    test("normalizes high-confidence PDF currency idempotently", () => {
+        const source = String.raw`Tickets cost $5, $10.50 (or less), or $42K; let $x=5$, $2 Z 6$, and $10K$ remain math; keep \$20.`;
+        const expected = String.raw`Tickets cost \$5, \$10.50 (or less), or \$42K; let $x=5$, $2 Z 6$, and $10K$ remain math; keep \$20.`;
+        expect(escapeLiteralCurrency(source)).toBe(expected);
+        expect(escapeLiteralCurrency(expected)).toBe(expected);
+    });
+
+    test("removes only proven PDF delimiter residue patterns", () => {
+        expect(cleanPdfDelimiterResidue("$ A shirt costs $5.")).toBe(
+            "A shirt costs $5.",
+        );
+        expect(cleanPdfDelimiterResidue("$$ According to the graph...")).toBe(
+            "According to the graph...",
+        );
+        expect(
+            cleanPdfDelimiterResidue("Earnings? 13. $ ![](figure.png)"),
+        ).toBe("Earnings? 13. ![](figure.png)");
+        expect(
+            cleanPdfDelimiterResidue("Earnings? 13. $\n\n![](figure.png)"),
+        ).toBe("Earnings? 13. \n\n![](figure.png)");
+        expect(cleanPdfDelimiterResidue("Compute $x+1.")).toBe("Compute $x+1.");
+        expect(normalizePdfStatement("$ A ticket costs $5.")).toBe(
+            String.raw`A ticket costs \$5.`,
+        );
+    });
+
+    test("does not reinterpret a math closer followed by digits as currency", () => {
+        const text = String.raw`Three cm $\times$12; write $n$37 and 24,6$n$8.`;
+        expect(
+            auditText(text, {
+                entityType: "problem_statement",
+                source: "pdf",
+            }),
+        ).toEqual([]);
+    });
+
+    test("treats a dollar-wrapped textual choice as math markup", () => {
+        expect(
+            auditText("$more than $4", {
+                entityType: "answer_choice",
+                source: "wiki",
+            }),
+        ).toEqual([]);
+    });
+
+    test("still recognizes currency after an earlier balanced math span", () => {
+        const findings = auditText("Let $x=5$. The ticket costs $10.", {
+            entityType: "problem_statement",
+            source: "pdf",
+        });
+        expect(ruleIds(findings)).toEqual(["currency.unescaped_dollar"]);
+    });
+
+    test("does not let prose punctuation turn later prices into math", () => {
+        const findings = auditText(
+            "The first pile is worth $62. One-third is removed; the second is worth $162. A carton sells for $2.24. The total (worth $17,640,000) is shown.",
+            { entityType: "problem_statement", source: "pdf" },
+        );
+        expect(ruleIds(findings)).toEqual([
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+            "currency.unescaped_dollar",
+        ]);
     });
 
     test("reports exact structural failure categories", () => {

@@ -1,6 +1,10 @@
 import { CleanupText } from './CleanupText.js';
 import { getAutoTags } from './autoTags.js';
 import { resolveTopic } from './topicPolicy.js';
+import {
+    cleanPdfDelimiterResidue,
+    normalizePdfStatement,
+} from './textAudit.js';
 import { SOLUTIONS_USERS } from '../contest_id.js';
 import {
     classifySolutions,
@@ -14,16 +18,18 @@ import {
  * solution flags.
  *
  * Responsibilities:
- * 1. Re-extract MCQ choices / clean statements on the source of truth
- * 2. Re-resolve every problem's acgn (test-declared subject, else inferACGN)
- * 3. Apply AUTO_TAGS and union into existing tags
- * 4. is_official detection for solution sources based on known organizers
- * 5. Re-apply solution classification rules to existing solutions
- * 6. Answer cross-check: log warnings where aops_answer != pdf_answer
+ * 1. Normalize deterministic PDF currency and delimiter residue
+ * 2. Re-extract MCQ choices / clean statements on the source of truth
+ * 3. Re-resolve every problem's acgn (test-declared subject, else inferACGN)
+ * 4. Apply AUTO_TAGS and union into existing tags
+ * 5. is_official detection for solution sources based on known organizers
+ * 6. Re-apply solution classification rules to existing solutions
+ * 7. Answer cross-check: log warnings where aops_answer != pdf_answer
  */
 export async function runPreprocess(db) {
     console.log("Running pre-processing pipeline...\n");
 
+    normalizePdfStatements(db);
     await refreshChoices(db);
     await reclassifyAcgn(db);
     await retagProblems(db);
@@ -35,12 +41,49 @@ export async function runPreprocess(db) {
     console.log("\nPre-processing complete.");
 }
 
+function normalizePdfStatements(db) {
+    console.log("Step 1: Normalizing deterministic PDF text...");
+    const rows = db
+        .query(
+            `SELECT id, verified, pdf_statement
+               FROM problems
+              WHERE pdf_statement IS NOT NULL`,
+        )
+        .all();
+    const update = db.prepare(`
+        UPDATE problems
+           SET pdf_statement = ?,
+               statement = CASE WHEN verified THEN statement ELSE ? END
+         WHERE id = ?
+    `);
+    let updatedProblems = 0;
+    let currencyProblems = 0;
+    let residueProblems = 0;
+
+    db.transaction(() => {
+        for (const row of rows) {
+            const withoutResidue = cleanPdfDelimiterResidue(row.pdf_statement);
+            const normalized = normalizePdfStatement(row.pdf_statement);
+            if (normalized === row.pdf_statement) continue;
+            update.run(normalized, normalized, row.id);
+            updatedProblems++;
+            if (withoutResidue !== row.pdf_statement) residueProblems++;
+            if (normalized !== withoutResidue) currencyProblems++;
+        }
+    })();
+
+    console.log(
+        `  Updated ${updatedProblems} problem(s) ` +
+            `(${currencyProblems} with currency, ${residueProblems} with delimiter residue).`,
+    );
+}
+
 // Resolves any pending wiki redirects whose target is now imported and collapses
 // duplicate-link chains so every alias points directly at its ultimate canonical.
 // Both are idempotent and require no network.
 function normalizeDuplicateLinks(db) {
     console.log(
-        "Step 7: Resolving wiki redirects + normalizing duplicate links...",
+        "Step 8: Resolving wiki redirects + normalizing duplicate links...",
     );
     const r = resolveWikiRedirectLinks(db);
     const n = normalizeProblemLinks(db);
@@ -53,7 +96,7 @@ function normalizeDuplicateLinks(db) {
 // re-cleans any leftover appended answer-choice block. The resolved columns are
 // recomputed with the normal pdf > wiki > aops precedence.
 function refreshChoices(db) {
-    console.log("Step 1: Re-extracting MCQ choices / cleaning statements...");
+    console.log("Step 2: Re-extracting MCQ choices / cleaning statements...");
     const problems = db
         .query(
             `SELECT id, verified, pdf_statement,
@@ -172,7 +215,7 @@ function refreshChoices(db) {
 }
 
 function reclassifyAcgn(db) {
-    console.log("Step 2: Re-inferring ACGN classification...");
+    console.log("Step 3: Re-inferring ACGN classification...");
     // Joined to tests because a test can declare its problems' subject outright
     // (a Calculus / Integration Bee round), in which case that declaration wins
     // over the keyword inference — see src/topicPolicy.js.
@@ -201,7 +244,7 @@ function reclassifyAcgn(db) {
 }
 
 function retagProblems(db) {
-    console.log("Step 3: Re-applying auto-tags (union with existing)...");
+    console.log("Step 4: Re-applying auto-tags (union with existing)...");
     const problems = db.query("SELECT id, statement, tags FROM problems WHERE statement IS NOT NULL").all();
     let updated = 0;
     const stmt = db.prepare("UPDATE problems SET tags = ? WHERE id = ?");
@@ -225,7 +268,7 @@ function retagProblems(db) {
 }
 
 function reclassifySolutions(db) {
-    console.log("Step 5: Re-classifying solution candidates...");
+    console.log("Step 6: Re-classifying solution candidates...");
     const result = classifySolutions(db);
     console.log(
         `  Classified ${result.updated} solution(s); marked ${result.duplicates} near-duplicate(s).`,
@@ -233,7 +276,7 @@ function reclassifySolutions(db) {
 }
 
 function detectOfficialSolutions(db) {
-    console.log("Step 4: Detecting official solution sources by known organizers...");
+    console.log("Step 5: Detecting official solution sources by known organizers...");
 
     if (!SOLUTIONS_USERS || SOLUTIONS_USERS.length === 0) {
         console.log("  No SOLUTIONS_USERS defined, skipping.");
@@ -272,7 +315,7 @@ function detectOfficialSolutions(db) {
 }
 
 function crossCheckAnswers(db) {
-    console.log("Step 6: Cross-checking AoPS vs PDF answers...");
+    console.log("Step 7: Cross-checking AoPS vs PDF answers...");
 
     const mismatches = db.query(`
         SELECT p.id, p.aops_answer, p.pdf_answer, t.name AS test_name, p.n
