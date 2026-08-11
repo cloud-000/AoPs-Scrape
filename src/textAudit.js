@@ -128,7 +128,7 @@ function inRegion(offset, regions) {
 }
 
 function auditBbcode(text, original, findings, mathRegions = []) {
-    const tag = /\[(\/?)\s*([a-z][a-z0-9]*)(?:=[^\]]*)?\]/gi;
+    const tag = /\[(\/?)\s*([a-z][a-z0-9]*)(?:\s*=[^\]]*)?\]/gi;
     const stack = [];
     for (const match of text.matchAll(tag)) {
         // A LaTeX display opener such as `\[b=...` is not a `[b=...]`
@@ -460,7 +460,12 @@ function auditMathSyntax(text, original, regions, findings) {
         // A trailing `=` is commonly an intentional answer blank after choices
         // are separated from the statement, so it is not itself suspicious.
         const trailing = body.match(/(?:[+*/]|\\(?:div|cdot|pm|mp))\s*$/);
-        if (trailing) {
+        const beforeTrailing = trailing
+            ? body.slice(0, trailing.index).trimEnd()
+            : "";
+        const operatorOnly = trailing && beforeTrailing === "";
+        const scriptValue = trailing && /[_^]\s*$/.test(beforeTrailing);
+        if (trailing && !operatorOnly && !scriptValue) {
             add(
                 "latex.trailing_operator",
                 "warning",
@@ -607,8 +612,7 @@ export function auditText(value, context = {}) {
 
 function normalizeChoice(value) {
     return CleanupText.normalizeAnswer(String(value ?? ""))
-        .replace(/\s+/g, "")
-        .toLowerCase();
+        .replace(/\s+/g, "");
 }
 
 function entityEnabled(options, entity) {
@@ -756,7 +760,7 @@ function auditChoiceTier(state, row, source, statement, choicesJson, answerIndex
         }
         const label = firstMatch(
             value,
-            /^\s*(?:\\(?:textbf|text|textrm|mathrm)\s*\{\s*\(?[A-E]\)?\s*\}|\(\s*[A-E]\s*\)|[A-E]\s*[.):])\s*/i,
+            /^\s*(?:\\(?:textbf|text|textrm|mathrm)\s*\{\s*\(\s*[A-E]\s*\)\s*\}|\(\s*[A-E]\s*\)|[A-E]\s*[.):])\s*/,
         );
         if (label) {
             addDirectFinding(

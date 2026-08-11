@@ -339,9 +339,56 @@ export class CleanupText {
 
     static cleanProblem(str) {
         return str
+            // AoPS occasionally returns C0 formatting bytes in the middle of
+            // ordinary words (for example `fi\u000Cgure`). They have no
+            // meaningful representation in problem text or LaTeX and make it
+            // all the way to JSON/CSV as invisible corruption. Preserve the
+            // whitespace controls we intentionally support and drop the rest.
+            .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
             .replace(/^\[b\]Problem #\d+:\[\/b\]\s*/i, "")
+            // User-created contests use several malformed variants of the
+            // trailing proposer credit, including `[i]Author: Name[i]` and
+            // `[i]Proposed by [b]Name[b][/i]`. Once a trailing italic block
+            // identifies itself as an author/proposer credit, none of the
+            // remaining markup belongs to the statement.
+            .replace(
+                /\s*\[i\][^\n]*?\b(?:proposed\s+by|author\s*:)[\s\S]*$/i,
+                "",
+            )
             .replace(/\[i\][^\[]*?[pP]roposed by [^\[]*?\[\/i\]/gi, "")
+            // Some rendered table posts end with an orphan `$\newline`
+            // presentation fragment after their otherwise balanced display.
+            // It carries no problem content and leaves a false inline opener.
+            .replace(/\s*\$\\newline\s*$/i, "")
             .trim();
+    }
+
+    // A few category items are metadata or a replacement for a missing
+    // problem, even though AoPS exposes them in the same stream as problem
+    // topics. `skip` consumes no problem number; `reserve` keeps the missing
+    // slot so every later problem and answer-key entry stays aligned.
+    static nonProblemPostDisposition(str) {
+        const clean = (str ?? "").trim();
+        if (
+            /^This test and the matching AMC (?:10|12)P were developed for the use of a group of Taiwan schools\b[\s\S]*\breleased the questions here as a set of practice questions\b/i.test(
+                clean,
+            )
+        ) {
+            return "skip";
+        }
+        if (
+            /^Consider \$A=\\\{p,2p,\\dots,\(q-1\)p\\\}\$ and \$B=\\\{q,2q,\\dots,\(p-1\)q\\\}\$\.[\s\S]*\bIt's easy to see\b[\s\S]*\bHence we get\b/i.test(
+                clean,
+            )
+        ) {
+            return "reserve";
+        }
+        return null;
+    }
+
+    static preserveMixedPracticeAnswerKinds(testName) {
+        return /\bAIME(?:\b|-level\b)/i.test(testName ?? "") &&
+            /\bpractice\b/i.test(testName ?? "");
     }
 
     static toAsyLinks(normal, rendered) {
@@ -418,11 +465,27 @@ export class CleanupText {
     // form so the forum-oriented helpers (extractChoices, cleanChoices, getBoxed)
     // work unchanged. `<cmath>` -> `$$`, inline `<math>`/`<imath>` -> `$`.
     static normalizeWikiMath(str) {
+        const normalizeBody = (body) =>
+            body
+                // Some old AoPS wiki pages contain empty subscript/superscript
+                // artifacts on otherwise ordinary symbols (`m_{}`, `P^{}_{}`).
+                // They carry no content, so remove only the exact empty group.
+                .replace(/[_^]\s*\{\s*\}/g, "")
+                // A small set of AMC pages wrap literal choice values in three
+                // braces (`{{{4015}}}`). This is neither a usable template
+                // parameter nor intended mathematical grouping in a rendered
+                // problem; unwrap only a brace-free, single-line literal.
+                .replace(/\{\{\{([^{}\n]+)\}\}\}/g, "$1");
+
         return str
-            .replace(/<\s*cmath\b[^>]*>/gi, "$$$$")
-            .replace(/<\s*\/\s*cmath\s*>/gi, "$$$$")
-            .replace(/<\s*i?math\b[^>]*>/gi, "$")
-            .replace(/<\s*\/\s*i?math\s*>/gi, "$");
+            .replace(
+                /<\s*cmath\b[^>]*>([\s\S]*?)<\s*\/\s*cmath\s*>/gi,
+                (_, body) => `$$${normalizeBody(body)}$$`,
+            )
+            .replace(
+                /<\s*i?math\b[^>]*>([\s\S]*?)<\s*\/\s*i?math\s*>/gi,
+                (_, body) => `$${normalizeBody(body)}$`,
+            );
     }
 
     // MediaWiki analog of cleanProblem: strips wiki markup that isn't part of the
@@ -432,7 +495,12 @@ export class CleanupText {
     // statement is usually fetched as section 0). Converts <asy> diagrams first
     // when the rendered HTML is available. Returns the trimmed statement.
     static cleanWikiProblem(str, rendered = null) {
-        let s = CleanupText.normalizeWikiMath(str);
+        let s = CleanupText.normalizeWikiMath(str)
+            // Some wiki pages redundantly put TeX display delimiters inside a
+            // display-math element (`$$\[...\]$$`). Keep one delimiter pair;
+            // the nested forms otherwise look mismatched to every consumer.
+            .replace(/\$\$\s*\\\[/g, () => "$$")
+            .replace(/\\\]\s*\$\$/g, () => "$$");
 
         // Convert Asymptote diagrams before we strip anything else.
         if (/<asy\b/i.test(s)) {
@@ -505,9 +573,10 @@ export class CleanupText {
     // the shared helper also supports contests with three or four options.
     // AoPS's current markup uses
     // `\textbf{(A)}`, but older wiki/forum pages commonly use `\text{(A)}`,
-    // `\mathrm{(A)}`, `\textrm{(A)}`, or `(\mathrm{A})`. Match the structure
-    // rather than one spelling. Asymptote bodies are masked first so diagram
-    // labels such as `label("(A)", ...)` are not mistaken for textual choices.
+    // `\mathrm{(A)}`, `\textrm{(A)}`, `\hbox{(A)}`, or `(\mathrm{A})`.
+    // Match the structure rather than one spelling. Asymptote bodies are masked
+    // first so diagram labels such as `label("(A)", ...)` are not mistaken for
+    // textual choices.
     static _choiceBlock(input) {
         if (!input) return null;
         const masked = input
@@ -517,21 +586,122 @@ export class CleanupText {
             .replace(/<asy\b[^>]*>[\s\S]*?<\/asy>/gi, (s) =>
                 " ".repeat(s.length),
             );
-        const wrapper = String.raw`(?:textbf|text|textrm|mathrm)`;
+        const wrapper = String.raw`(?:textbf|text|textrm|mathrm|mathbf|hbox)`;
         const innerSpace = String.raw`(?:\s|\\[ ,;:!]|\\q?quad\b)*`;
         const marker = new RegExp(
-            String.raw`\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)${innerSpace}\}|\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)|\(\s*\\${wrapper}\s*\{\s*([A-E])${innerSpace}\}\s*\)|\\textbf\s*\{\s*([A-E])\s*\}|\{?\s*\(\s*([A-E])\s*\)\s*\}?`,
-            "g",
+            String.raw`\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)${innerSpace}\}|\\${wrapper}\s*\{\s*\(\s*([A-E])\s*\)|\(\s*\\${wrapper}\s*\{\s*([A-E])${innerSpace}\}\s*\)|\\textbf\s*\{\s*\(?\s*([A-E])\s*\)?\s*\}|(?<![A-Za-z0-9_])\{?\s*\(\s*([A-E])\s*\)\s*\}?|\\${wrapper}\s*\{\s*([A-E])\s*\)${innerSpace}\}|\\${wrapper}\s*\(\s*([A-E])\s*\)\s*\}|^[\t ]*([A-E])[.)](?=\s|\$)|(?<!\S)([A-E])[.)]\s*(?=\$)`,
+            "gm",
         );
-        const matches = [...masked.matchAll(marker)].map((m) => ({
-            label: m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5],
-            index: m.index,
-            end: m.index + m[0].length,
-            // Some old pages put both the label and value inside one style
-            // wrapper: `\mathrm{(A) 4}`. Its closing brace belongs to the
-            // wrapper, not to the choice value.
-            closesAfterValue: m[2] != null,
-        }));
+        const isOpeningDollar = (position, delimiter) => {
+            let singles = 0;
+            let doubles = 0;
+            for (let i = 0; i < position; i++) {
+                if (masked[i] !== "$") continue;
+                let slashes = 0;
+                for (let j = i - 1; j >= 0 && masked[j] === "\\"; j--) {
+                    slashes++;
+                }
+                if (slashes % 2 === 1) continue;
+                if (masked[i + 1] === "$" && i + 1 < position) {
+                    doubles++;
+                    i++;
+                } else {
+                    singles++;
+                }
+            }
+            return delimiter === "$$"
+                ? doubles % 2 === 0
+                : singles % 2 === 0;
+        };
+        const matches = [...masked.matchAll(marker)].map((m) => {
+            let index = m.index;
+            let end = m.index + m[0].length;
+            let closesAfterValue = m[2] != null;
+
+            // The compact inline form (`A)$46$`) is presentation markup only
+            // outside an existing math span. This prevents terminal variables
+            // in `n(A)`, `(90-A)`, or tuples ending in `B)` from becoming
+            // competing answer labels.
+            if (
+                m[9] != null &&
+                (!isOpeningDollar(index, "$") ||
+                    !isOpeningDollar(index, "$$"))
+            ) {
+                return null;
+            }
+
+            // Some AoPS posts nest the styled label inside a text wrapper:
+            // `\text{\textbf{(A)} red}`. Include that outer wrapper in the
+            // marker start and remove its closing brace from the value later;
+            // otherwise every value inherits `}\qquad\text{`, and the
+            // statement is stranded at `$\text`.
+            const outerText = masked
+                .slice(0, index)
+                .match(/\\(?:text|textrm|mathrm)\s*\{\s*$/);
+            if (outerText) {
+                index = outerText.index;
+                closesAfterValue = true;
+            }
+
+            // Wiki choices often put the label alone in its own math element:
+            // `<math>\textbf{(A) }</math>Choice text`. normalizeWikiMath turns
+            // that into `$\textbf{(A) }$Choice text`. The label regexp starts
+            // after the opening delimiter, so expand its span across an
+            // immediately surrounding math pair; otherwise the closing `$`
+            // becomes the first character of the extracted choice. Check the
+            // longest delimiters first so `$$...$$` is not consumed as `$...$`.
+            const wrappers = [
+                ["$$", "$$"],
+                ["\\[", "\\]"],
+                ["\\(", "\\)"],
+                ["$", "$"],
+            ];
+            const escapeRegex = (value) =>
+                value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            for (const [open, close] of wrappers) {
+                const before = masked.slice(0, index);
+                const after = masked.slice(end);
+                const openMatch = before.match(
+                    new RegExp(`${escapeRegex(open)}\\s*$`),
+                );
+                const closeMatch = after.match(
+                    new RegExp(`^\\s*${escapeRegex(close)}`),
+                );
+                if (!openMatch || !closeMatch) continue;
+                // `$value$ (B) $value$` also has dollar signs on both sides of
+                // its label, but the one before `(B)` closes choice A rather
+                // than opens a wrapper around B. Symmetric dollar delimiters
+                // must be in opening parity before they can wrap the label.
+                if (
+                    (open === "$" || open === "$$") &&
+                    !isOpeningDollar(openMatch.index, open)
+                ) {
+                    continue;
+                }
+                index = openMatch.index;
+                end += closeMatch[0].length;
+                break;
+            }
+
+            return {
+                label:
+                    m[1] ??
+                    m[2] ??
+                    m[3] ??
+                    m[4] ??
+                    m[5] ??
+                    m[6] ??
+                    m[7] ??
+                    m[8] ??
+                    m[9],
+                index,
+                end,
+                // Some old pages put both the label and value inside one style
+                // wrapper: `\mathrm{(A) 4}`. Its closing brace belongs to the
+                // wrapper, not to the choice value.
+                closesAfterValue,
+            };
+        }).filter(Boolean);
 
         for (let start = 0; start < matches.length; start++) {
             if (matches[start].label !== "A") continue;
@@ -552,9 +722,25 @@ export class CleanupText {
 
         return block.map((match, i) => {
             const end = i + 1 < block.length ? block[i + 1].index : input.length;
-            let value = input
-                .slice(match.end, end)
-                .replace(/\n[\s\S]*$/, "")
+            // A line break immediately after a label is layout, not an empty
+            // value. Remove only leading whitespace before deciding whether the
+            // value is a multiline diagram or a one-line textual choice.
+            let value = input.slice(match.end, end).trimStart();
+            const isAsymptoteChoice = /^\s*\[asy(?:=[^\]]*)?\]/i.test(value);
+
+            // Diagram choices are commonly multiline Asymptote programs. The
+            // old first-newline truncation kept only `[asy=...]size(...)` and
+            // discarded the closing tag. Preserve exactly one complete block.
+            if (isAsymptoteChoice) {
+                const close = /\[\/asy\]/i.exec(value);
+                if (close) {
+                    value = value.slice(0, close.index + close[0].length);
+                }
+            } else {
+                value = value.replace(/\n[\s\S]*$/, "");
+            }
+
+            value = value
                 // Strip the LaTeX spacing macros AoPS puts after a label. A real
                 // value like `\frac{3}{10}` is deliberately kept.
                 .replace(
@@ -568,13 +754,75 @@ export class CleanupText {
                     "",
                 );
             }
-            return value
-                // Strip separators and closing math delimiters from the value.
+            // Strip layout separators first, but retain a balanced closing
+            // math delimiter belonging to the choice itself (`$1$`). Only an
+            // unmatched trailing delimiter inherited from a shared choice
+            // block (`$\textbf{(A)} 1 ... \textbf{(E)} 5$`) is presentation
+            // markup and should be removed.
+            value = value
+                // Choice tables contribute alignment separators and, on the
+                // final cell, the display/table closers. They describe layout,
+                // not choice content.
                 .replace(
-                    /(?:\s|\\q?quad\b|\\qqua\b|\\hspace\*?\s*\{[^{}]*\}|\\\\|\${1,2})+$/,
+                    /\s*\\end\s*\{(?:array|tabular)\}\s*\\\]\s*$/i,
+                    "",
+                )
+                .replace(/^\s*&+\s*|\s*&+\s*$/g, "")
+                // Bold tags often wrap the A-E label, leaving their two halves
+                // at the boundaries of the extracted value.
+                .replace(/^\s*(?:\[\/(?:b|i)\]\s*)+/i, "")
+                .replace(/(?:\s*\[(?:b|i)\])+\s*$/i, "")
+                // Wiki and forum tables sometimes leave the opening command
+                // for the next label on the previous value when that label is
+                // malformed. A formatting command with no body at the outer
+                // boundary is presentation residue, never choice content.
+                .replace(
+                    /(?:\s|\\q?quad\b)*\\(?:textbf|mathbf|rm)\s*\{\s*$/i,
+                    "",
+                )
+                .replace(
+                    /(?:\s*\$)?\s*<br\s*\/?\s*>(?:\s*\$)?\s*$/i,
+                    "",
+                )
+                .replace(
+                    /(?:\s|\\q?quad\b|\\qqua\b|\\hspace\*?\s*\{[^{}]*\}|\\\\(?:\s*\[[^\]]*\])?)+$/,
                     "",
                 )
                 .trim();
+            // A closing brace whose opener lived in presentation markup
+            // outside this choice can never be meaningful in the standalone
+            // value. Remove only unmatched closing braces; balanced and
+            // escaped literal braces are preserved.
+            if (!isAsymptoteChoice) {
+                const chars = [...value];
+                const opens = [];
+                for (let j = 0; j < chars.length; j++) {
+                    if (chars[j] === "\\") {
+                        j++;
+                        continue;
+                    }
+                    if (chars[j] === "{") {
+                        opens.push(j);
+                    } else if (chars[j] === "}") {
+                        if (opens.length) opens.pop();
+                        else chars[j] = "";
+                    }
+                }
+                value = chars
+                    .join("")
+                    // Removing an unmatched wrapper brace can expose spacing or
+                    // an alignment separator that was immediately behind it.
+                    .replace(
+                        /^(?:\s|&|\\[ ,;:!]|\\q?quad\b|\\qqua\b|\\hspace\*?\s*\{[^{}]*\})+/,
+                        "",
+                    )
+                    .replace(/(?:\s*&)+\s*$/, "")
+                    .trim();
+            }
+            value = CleanupText._stripUnmatchedTrailingDollar(value).trim();
+            value = CleanupText._stripUnmatchedChoiceBoundaryDollar(value);
+            value = CleanupText._stripUnmatchedChoiceBoundaryDisplay(value);
+            return CleanupText._unwrapChoiceTableCell(value);
         });
     }
 
@@ -612,15 +860,87 @@ export class CleanupText {
         return clean;
     }
 
+    // Choice presentation wrappers sometimes donate only one boundary dollar
+    // to the extracted value (`$ none of these` or `\frac{1}{2}$.`). When the
+    // single-dollar count is odd, remove a delimiter only when it is literally
+    // at the outer boundary (allowing terminal punctuation). Interior odd
+    // delimiters are left intact for the audit to report rather than guessed.
+    static _stripUnmatchedChoiceBoundaryDollar(str) {
+        const clean = str.trim();
+        let singleCount = 0;
+        for (let i = 0; i < clean.length; i++) {
+            if (clean[i] !== "$") continue;
+            let slashes = 0;
+            for (let j = i - 1; j >= 0 && clean[j] === "\\"; j--) slashes++;
+            if (slashes % 2 === 1) continue;
+            if (clean[i + 1] === "$") {
+                i++;
+                continue;
+            }
+            singleCount++;
+        }
+        if (singleCount % 2 === 0) return clean;
+        if (clean.startsWith("$")) return clean.slice(1).trimStart();
+        return clean.replace(/\$(?=\s*[.!?,;:]?\s*$)/, "").trim();
+    }
+
+    // Older AHSME pages lay out A-C and D-E in separate display rows. The
+    // closing `\]` from each row is outside the choice value semantically, but
+    // lands at the end of C and E after the labels are split. Preserve a real
+    // balanced display expression inside a choice and remove only a surplus
+    // closing delimiter at the outer boundary.
+    static _stripUnmatchedChoiceBoundaryDisplay(str) {
+        let clean = str
+            .trim()
+            // When the next row opens its own display before the following
+            // label, both the previous `\]` and next `\[` are sliced onto the
+            // preceding choice. Together they are purely a row boundary.
+            .replace(/\s*\\\]\s*\\\[\s*$/, "")
+            .trim();
+        let opens = 0;
+        let closes = 0;
+        for (const match of clean.matchAll(/\\\[|\\\]/g)) {
+            if (match[0] === "\\[") opens++;
+            else closes++;
+        }
+        while (
+            closes > opens &&
+            /\\\](?=\s*[.!?,;:]?\s*$)/.test(clean)
+        ) {
+            clean = clean
+                .replace(/\s*\\\](?=(\s*[.!?,;:]?)\s*$)/, "$1")
+                .trim();
+            closes--;
+        }
+        return clean;
+    }
+
+    // A legacy array sometimes spans the final option across columns with
+    // `\multicolumn{...}{...}{\hbox{None of these}}`. The first two arguments
+    // are table layout; expose the actual cell body as the standalone choice.
+    static _unwrapChoiceTableCell(str) {
+        let clean = str.trim();
+        const multicolumn = clean.match(
+            /^\\multicolumn\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{([\s\S]*)\}$/i,
+        );
+        if (multicolumn) clean = multicolumn[1].trim();
+        const hbox = clean.match(/^\\hbox\s*\{([^{}]*)\}$/i);
+        return hbox ? hbox[1].trim() : clean;
+    }
+
     static _stripChoiceBlockPrefix(prefix) {
         let clean = prefix.trimEnd();
         let previous;
         do {
             previous = clean;
             clean = clean
+                .replace(
+                    /\\\[\s*\\begin\s*\{(?:array|tabular)\}\s*(?:\{[^{}]*\})?\s*$/i,
+                    "",
+                )
                 .replace(/\\hspace\*?\s*\{[^{}]*\}\s*$/, "")
                 .replace(/\\q?quad\b\s*$/, "")
-                .replace(/\\(?:displaystyle|mathbf)\b\s*$/, "")
+                .replace(/\\(?:displaystyle|mathbf|textbf)\b\s*$/, "")
                 .replace(/\[b\]\s*$/i, "")
                 .replace(/<center>\s*$/i, "")
                 .replace(/\\begin\s*\{center\}\s*$/i, "")
@@ -638,7 +958,7 @@ export class CleanupText {
     static _stripOrphanedChoicePrefix(str) {
         const clean = str.trimEnd();
         const orphan =
-            /(?:\\\[|\$\s*\{+|\$\s*\\(?:displaystyle|mathbf)\b|\$?\s*\\hspace\*?\s*\{[^{}]*\}|\$?\s*\\q?quad\b|\[b\])\s*$/i;
+            /(?:\\\[|\$\s*\{+|\$\s*\\(?:displaystyle|mathbf|textbf)\b|\$?\s*\\hspace\*?\s*\{[^{}]*\}|\$?\s*\\q?quad\b|\[b\])\s*$/i;
         return orphan.test(clean)
             ? CleanupText._stripChoiceBlockPrefix(clean)
             : clean.trim();

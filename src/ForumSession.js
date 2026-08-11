@@ -694,6 +694,14 @@ export class ForumSession {
          item.post_data.post_rendered,
       );
 
+      const nonProblem = CleanupText.nonProblemPostDisposition(processed);
+      if (nonProblem) {
+         seenTopicIds.push(item.post_data.topic_id);
+         if (nonProblem === "reserve") ctx.problemIndex++;
+         ctx.isPrevMulti = false;
+         return;
+      }
+
       let isMulti;
       if (
          (ctx.problemIndex === 0 || ctx.isPrevMulti) &&
@@ -733,7 +741,7 @@ export class ForumSession {
          const problem = makeProblem({
             // Keep the raw statement (choices still attached); the resolve pass
             // extracts/strips choices once the test's kind is known.
-            statement: isMulti[j].trim(),
+            statement: CleanupText.cleanProblem(isMulti[j]),
             postId: item.post_data.post_id,
             topicId: item.post_data.topic_id,
             n: j + ctx.problemIndex,
@@ -985,11 +993,9 @@ export class ForumSession {
       // The non-MCQ kind for a computational test is always numeric here (proof
       // contests never reach this pass).
       const otherKind = "numeric";
-      const decision = CleanupText.decideTestKind(
-         mcqCount,
-         otherCount,
-         otherKind,
-      );
+      const decision = CleanupText.preserveMixedPracticeAnswerKinds(test.name)
+         ? { mixed: true, kind: null }
+         : CleanupText.decideTestKind(mcqCount, otherCount, otherKind);
 
       for (const p of all) {
          const kind = decision.mixed

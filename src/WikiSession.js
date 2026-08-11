@@ -197,6 +197,10 @@ export class WikiSession {
             } catch {
                 rendered = null;
             }
+            // Choice extraction understands the shared `[asy]...[/asy]` form.
+            // Convert raw wiki blocks before splitting A–E so a diagram that
+            // starts on the line after its label remains the choice value.
+            statementSrc = CleanupText.toWikiAsyLinks(statementSrc, rendered);
         }
 
         // MCQ choices, pulled out of the statement before cleaning.

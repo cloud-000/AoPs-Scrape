@@ -82,12 +82,19 @@ function refreshChoices(db) {
          WHERE id = ?`,
     );
 
-    const refreshTier = (statement, choicesJson, answerIndex, answer) => {
+    const refreshTier = (
+        statement,
+        choicesJson,
+        answerIndex,
+        answer,
+        cleanStatement = (value) => value,
+    ) => {
         if (statement == null) {
             return { statement, choicesJson, answerIndex, changed: false };
         }
+        const normalizedStatement = cleanStatement(statement);
         const stored = choicesJson ? JSON.parse(choicesJson) : null;
-        const extracted = CleanupText.extractChoices(statement);
+        const extracted = CleanupText.extractChoices(normalizedStatement);
         // A previous parser may have persisted only part of a malformed block
         // or left spacing macros in an otherwise complete array. Prefer a newly
         // recovered sequence when it is at least as complete; otherwise keep
@@ -97,9 +104,17 @@ function refreshChoices(db) {
                 ? extracted
                 : stored;
         if (!choices?.length) {
-            return { statement, choicesJson, answerIndex, changed: false };
+            return {
+                statement: normalizedStatement,
+                choicesJson,
+                answerIndex,
+                changed: normalizedStatement !== statement,
+            };
         }
-        const cleaned = CleanupText.cleanChoices(statement, choices).trim();
+        const cleaned = CleanupText.cleanChoices(
+            normalizedStatement,
+            choices,
+        ).trim();
         const resolvedIndex = CleanupText.choiceIndexOfAnswer(answer, choices);
         const nextIndex = resolvedIndex >= 0 ? resolvedIndex : (answerIndex ?? -1);
         const nextChoicesJson = JSON.stringify(choices);
@@ -127,6 +142,7 @@ function refreshChoices(db) {
                 p.aops_choices,
                 p.aops_answer_index,
                 p.aops_answer,
+                CleanupText.cleanProblem,
             );
             if (!wiki.changed && !aops.changed) continue;
 

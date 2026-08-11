@@ -84,6 +84,40 @@ describe("mixed-markup structural audit", () => {
         });
         expect(ruleIds(solution)).not.toContain("content.solution_or_answer_section");
     });
+
+    test("accepts BBCode attributes with whitespace around the equals sign", () => {
+        const findings = auditText("[hide = Note]Keep this note.[/hide]", {
+            entityType: "problem_statement",
+            source: "aops",
+        });
+        expect(ruleIds(findings)).not.toContain("bbcode.unclosed_tag");
+        expect(ruleIds(findings)).not.toContain("bbcode.unmatched_close");
+        expect(ruleIds(findings)).not.toContain("bbcode.mismatched_close");
+    });
+
+    test("does not flag standalone or scripted operators as trailing", () => {
+        const findings = auditText(
+            "Use $+$ and $\\cdot$. Let $A^+$, $C^*$, and $R^+$ be labels.",
+            { entityType: "problem_statement", source: "aops" },
+        );
+        expect(ruleIds(findings)).not.toContain("latex.trailing_operator");
+        expect(
+            ruleIds(
+                auditText("Compute $x+$.", {
+                    entityType: "problem_statement",
+                    source: "aops",
+                }),
+            ),
+        ).toContain("latex.trailing_operator");
+    });
+
+    test("distinguishes literal choice text and case from presentation labels", () => {
+        const literal = auditText(String.raw`\text{A}`, {
+            entityType: "answer_choice",
+            source: "aops",
+        });
+        expect(ruleIds(literal)).not.toContain("choice.embedded_label");
+    });
 });
 
 describe("database audit and reports", () => {
@@ -169,6 +203,20 @@ describe("database audit and reports", () => {
         expect(report.summary.totalAuditedTexts).toBe(1);
         expect(report.summary.auditedByEntity).toEqual({ solution: 1 });
         expect(report.findings).toEqual([]);
+        db.close();
+    });
+
+    test("does not merge case-distinct choices during duplicate detection", () => {
+        const { db } = fixtureDatabase();
+        db.run(
+            "UPDATE problems SET aops_choices = ?, aops_answer_index = 0, aops_answer = 'A' WHERE id = 1",
+            [JSON.stringify(["m", "M", "other"])],
+        );
+        const report = auditDatabase(db, {
+            entities: new Set(["choices"]),
+            sources: new Set(["aops"]),
+        });
+        expect(ruleIds(report.findings)).not.toContain("choice.duplicate_value");
         db.close();
     });
 });
