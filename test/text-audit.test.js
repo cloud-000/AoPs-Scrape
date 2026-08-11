@@ -219,4 +219,45 @@ describe("database audit and reports", () => {
         expect(ruleIds(report.findings)).not.toContain("choice.duplicate_value");
         db.close();
     });
+
+    test("distinguishes composite visual choices from missing textual choices", () => {
+        const { db } = fixtureDatabase();
+        const visual = String.raw`Which graph is correct?
+[asy]
+label("$\textbf{(A)}$", (0,0));
+label("$\textbf{(B)}$", (1,0));
+label("$\textbf{(C)}$", (2,0));
+label("$\textbf{(D)}$", (3,0));
+label("$\textbf{(E)}$", (4,0));
+[/asy]`;
+        db.run(
+            "UPDATE problems SET aops_statement = ?, aops_choices = ?, aops_answer_index = 0, aops_answer = 'A' WHERE id = 1",
+            [visual, JSON.stringify(["", "", "", "", ""])],
+        );
+        const visualReport = auditDatabase(db, {
+            entities: new Set(["choices"]),
+            sources: new Set(["aops"]),
+        });
+        expect(ruleIds(visualReport.findings)).toEqual(["choice.visual_only"]);
+        expect(visualReport.summary.auditedByEntity.answer_choice).toBe(5);
+
+        db.run(
+            "UPDATE problems SET aops_statement = ?, aops_choices = ? WHERE id = 1",
+            [
+                "What is the area of the shaded figure? [asy]draw(unitsquare);[/asy]",
+                JSON.stringify([]),
+            ],
+        );
+        const missingReport = auditDatabase(db, {
+            entities: new Set(["choices"]),
+            sources: new Set(["aops"]),
+        });
+        expect(ruleIds(missingReport.findings)).toContain(
+            "choice.unexpected_count",
+        );
+        expect(ruleIds(missingReport.findings)).not.toContain(
+            "choice.visual_only",
+        );
+        db.close();
+    });
 });

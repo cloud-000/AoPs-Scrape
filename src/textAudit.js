@@ -659,6 +659,31 @@ function addDirectFinding(state, text, base, ruleId, severity, message, offset =
     });
 }
 
+// Some MCQs publish all answer options inside one image or Asymptote program,
+// so there is no honest standalone text value to put in each choice cell. Keep
+// this deliberately narrower than "statement contains a diagram": a normal
+// problem diagram can coexist with genuinely missing textual choices. Require
+// visual media plus either explicit A-E presentation labels or a question that
+// specifically asks the reader to select a visual object.
+function hasVisualOnlyChoices(statement) {
+    if (typeof statement !== "string") return false;
+    const hasVisualMedia =
+        /\[(?:asy(?:=[^\]]*)?|img)\]|<asy\b|\bFile:/i.test(statement);
+    if (!hasVisualMedia) return false;
+
+    const labels = new Set();
+    const labelPattern =
+        /\\(?:textbf|text|textrm|mathrm|mathbf|hbox)\s*\{\s*\(\s*([A-E])\s*\)|label\s*\(\s*["']\$?(?:\\textbf\s*\{)?\s*\(\s*([A-E])\s*\)/gi;
+    for (const match of statement.matchAll(labelPattern)) {
+        labels.add(match[1] ?? match[2]);
+    }
+    if (labels.size >= 4) return true;
+
+    return /\bwhich\b[^?\n]{0,160}\b(?:figure|figures|graph|graphs|histogram|histograms|diagram|diagrams|pattern|patterns|image|images|position|positions|sequence|sequences|shape|shapes|view|views|cylinder|cylinders|cone|cones)\b/i.test(
+        statement,
+    );
+}
+
 function auditChoiceTier(state, row, source, statement, choicesJson, answerIndex, answer) {
     const metadata = metadataForProblem(row);
     const collectionBase = {
@@ -723,6 +748,35 @@ function auditChoiceTier(state, row, source, statement, choicesJson, answerIndex
         );
         return;
     }
+
+    const allChoicesEmpty =
+        choices.length >= 3 &&
+        choices.every((choice) => String(choice ?? "").trim() === "");
+    if (
+        (choices.length === 0 || allChoicesEmpty) &&
+        hasVisualOnlyChoices(statement)
+    ) {
+        // Preserve audited-unit counts for an existing all-empty A-E array,
+        // while reporting the condition once at the collection level.
+        choices.forEach((_, choiceIndex) => {
+            addAuditedText(
+                state,
+                `answer_choice:${row.problem_id}:${source}:${choiceIndex}`,
+                "answer_choice",
+                source,
+            );
+        });
+        addDirectFinding(
+            state,
+            statement,
+            collectionBase,
+            "choice.visual_only",
+            "warning",
+            "Answer choices are presented only as a composite visual; no deterministic per-choice values were extracted.",
+        );
+        return;
+    }
+
     if (choices.length < 3 || choices.length > 5) {
         addDirectFinding(
             state,
