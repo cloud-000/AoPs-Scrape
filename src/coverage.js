@@ -57,7 +57,6 @@ export const SERIES_RESPONSE_KIND_DECLARATIONS = Object.freeze({
     "AMC 8": "mcq",
     "AMC 10": "mcq",
     "AMC 12": "mcq",
-    "AMC 12/AHSME": "mcq",
 });
 
 export function responseKindForSeries(seriesName) {
@@ -152,7 +151,9 @@ export function readProblemCoverage(testPath, where = testPath) {
     const out = {};
     for (const [key, entry] of Object.entries(result.value)) {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-            console.warn(`  invalid coverage entry in ${where} #${key}, ignoring`);
+            console.warn(
+                `  invalid coverage entry in ${where} #${key}, ignoring`,
+            );
             out[key] = {
                 response_kind: undefined,
                 answer_status: undefined,
@@ -198,15 +199,11 @@ export function resolveCoverage({
     rawIsComputational = false,
 } = {}) {
     const responseKind = overrideResponseKind ?? declarationResponseKind;
-    const claimedAnswerStatus =
-        overrideAnswerStatus ?? declarationAnswerStatus;
+    const claimedAnswerStatus = overrideAnswerStatus ?? declarationAnswerStatus;
 
     return {
         responseKind,
         answerStatus: claimedAnswerStatus ?? (hasAnswer ? "known" : null),
-        isComputational: isComputationalFor(
-            rawIsComputational,
-            responseKind,
-        ),
+        isComputational: isComputationalFor(rawIsComputational, responseKind),
     };
 }

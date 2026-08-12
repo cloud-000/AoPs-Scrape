@@ -5,7 +5,7 @@ import { ApiMethod, ForumSession } from "../src/ForumSession.js";
 import { WikiSession } from "../src/WikiSession.js";
 import { ResponseCache } from "../src/ResponseCache.js";
 import { CONTEST_IDS } from "../contest_id.js";
-import { CLIBarManager, CLICount } from "./progress.js";
+import { createScrapeProgress, formatDuration } from "./progress.js";
 import {
     initDB,
     upsertScrapeResults,
@@ -55,7 +55,6 @@ async function promptConfirm(options) {
 
 const command = process.argv[2];
 
-let loader = new CLIBarManager();
 let ALL_CONTESTS;
 async function main() {
     ALL_CONTESTS = [
@@ -75,18 +74,15 @@ async function main() {
                 user["user-id"],
                 user["session-id"],
                 user["headers"] || null,
-                () => {
-                    if (loader.bars[0]) loader.bars[0].count++;
-                },
             );
-            session.debug = false;
-            let id = await autoSearch("Enter id: ", ALL_CONTESTS);
-            const selectedContest = ALL_CONTESTS.find(
-                (c) => c.id === id || c.id === Number(id) || c.name.toLowerCase() === String(id).toLowerCase(),
+            // ForumSession.log() also dumps every forum item, so it stays off
+            // unless asked for; retry/challenge warnings bypass it via onEvent.
+            session.debug = hasArgFlag("debug") || hasArgFlag("verbose");
+            const progress = attachProgress(session);
+            const { contest: selectedContest, id } = await autoSearch(
+                "Enter id: ",
+                ALL_CONTESTS,
             );
-            if (selectedContest) {
-                id = selectedContest.id;
-            }
 
             session.enableStickyAnswerKey = true;
 
@@ -107,21 +103,27 @@ async function main() {
                 break;
             }
             // Collect any interactive input (e.g. picking one test out of a
-            // series) BEFORE the loader starts — its 300ms re-render otherwise
+            // series) BEFORE the progress region starts — its repaint otherwise
             // paints over these prompts. `gather` returning null signals a bail.
             const methodArgs = await method.gather(session, id);
             if (methodArgs === null) {
                 console.log("Exiting");
                 break;
             }
-            const loaderInterval = startCounter();
+            progress.start();
             let startTime = Date.now();
-            data = await method.run(session, id, methodArgs);
+            try {
+                data = await method.run(session, id, methodArgs);
+            } finally {
+                // Always tear the region down, or a thrown error prints into
+                // the live block and gets erased by the pending repaint.
+                progress.stop();
+            }
             let elapsedTime = Date.now() - startTime;
-            await stopCounter(loaderInterval);
             console.log(
-                `Collected ${data.count} problems in ${elapsedTime}ms from ${id}`,
+                `Collected ${data.count} problems in ${formatDuration(elapsedTime)} from ${id}`,
             );
+            reportProgress(progress);
             if (!hasArgFlag("yes") && (await promptConfirm({ message: "Log Data?", default: false }))) {
                 console.log(data);
             }
@@ -155,14 +157,15 @@ async function main() {
                 user["user-id"],
                 user["session-id"],
                 user["headers"] || null,
-                () => {
-                    if (loader.bars[0]) loader.bars[0].count++;
-                },
             );
-            session.debug = false;
-            let id = await autoSearch("Enter id: ", WIKI_CONTESTS);
-            const contest = WIKI_CONTESTS.find(
-                (c) => c.id === id || c.id === Number(id) || c.name.toLowerCase() === String(id).toLowerCase(),
+            // Unlike ForumSession, every WikiSession.log() is a real anomaly
+            // (answer-key disagreement, missing choices), so keep them on — they
+            // now land in scrollback instead of under the progress region.
+            session.debug = true;
+            const progress = attachProgress(session);
+            const { contest, id } = await autoSearch(
+                "Enter id: ",
+                WIKI_CONTESTS,
             );
             if (!contest) {
                 console.log(
@@ -172,8 +175,8 @@ async function main() {
             }
 
             let method = await getWikiMethod();
-            // Collect all interactive input (variant/year/page) BEFORE the loader
-            // starts — its 300ms re-render otherwise paints over these prompts.
+            // Collect all interactive input (variant/year/page) BEFORE the
+            // progress region starts — its repaint otherwise paints over these prompts.
             const methodArgs = await method.gather(contest);
             if (
                 hasArgFlag("cache") ||
@@ -190,11 +193,15 @@ async function main() {
                 console.log("Exiting");
                 break;
             }
-            const loaderInterval = startCounter();
+            progress.start();
             let startTime = Date.now();
-            const tests = await method.run(session, contest, methodArgs);
+            let tests;
+            try {
+                tests = await method.run(session, contest, methodArgs);
+            } finally {
+                progress.stop();
+            }
             let elapsedTime = Date.now() - startTime;
-            await stopCounter(loaderInterval);
             if (tests === null) break; // debug method already handled output/exit
 
             data = {
@@ -204,8 +211,9 @@ async function main() {
             };
             const total = tests.reduce((s, t) => s + (t.count ?? 0), 0);
             console.log(
-                `Collected ${total} problems across ${tests.length} tests in ${elapsedTime}ms from ${contest.name}`,
+                `Collected ${total} problems across ${tests.length} tests in ${formatDuration(elapsedTime)} from ${contest.name}`,
             );
+            reportProgress(progress);
             if (!hasArgFlag("yes") && (await promptConfirm({ message: "Log Data?", default: false }))) {
                 console.log(JSON.stringify(data, null, 2));
             }
@@ -484,8 +492,8 @@ async function main() {
         default:
             console.log(
                 "Available commands:\n" +
-                "  scrape [--series=NAME|--contest=ID] [--yes|-y] [--cache] [--user=NAME] [--method=all|test|forum|topic] [--dump[=file]]\n" +
-                "  wiki [--series=NAME|--contest=ID] [--yes|-y] [--cache] [--user=NAME] [--method=whole|single|debug] [--dump[=file]]\n" +
+                "  scrape [--series=NAME|--contest=ID] [--yes|-y] [--cache] [--user=NAME] [--method=all|test|forum|topic] [--dump[=file]] [--debug] [--no-counter]\n" +
+                "  wiki [--series=NAME|--contest=ID] [--yes|-y] [--cache] [--user=NAME] [--method=whole|single|debug] [--dump[=file]] [--debug] [--no-counter]\n" +
                 "  import [file]\n" +
                 "  import-pdf [dir] [--series=a,b] [--test=x,y] [--all]\n" +
                 "  link-duplicates [dir] [--series=a,b]\n" +
@@ -565,27 +573,29 @@ function parseDumpFlag() {
     return flag.includes("=") ? flag.split("=")[1] || "raw.json" : "raw.json";
 }
 
-async function sleep(ms) {
-    await new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Builds the live progress display for a scrape/wiki run and binds `session` to
+ * it. The region is disabled (log lines still print, nothing is repainted) for
+ * --no-counter, non-TTY stdout, and non-interactive runs; --debug/--verbose adds
+ * a line per request, which is the fastest way to tell a throttled run from a
+ * stalled one.
+ */
+function attachProgress(session) {
+    const enabled =
+        !process.argv.includes("--no-counter") &&
+        Boolean(process.stdout.isTTY) &&
+        !hasArgFlag("yes");
+    const progress = createScrapeProgress({
+        enabled,
+        verbose: hasArgFlag("debug") || hasArgFlag("verbose"),
+    });
+    progress.attach(session);
+    return progress;
 }
 
-// Starts the live "Problems Collected" counter unless --no-counter was passed.
-// Returns the interval handle (or null) to pass back to stopCounter().
-function startCounter() {
-    if (process.argv.includes("--no-counter") || !process.stdout.isTTY || hasArgFlag("yes")) return null;
-    loader.add(new CLICount("Problems Collected:"));
-    loader.start();
-    return setInterval(() => {
-        loader.calculate();
-        loader.render();
-    }, 300);
-}
-
-async function stopCounter(interval) {
-    if (!interval) return;
-    clearInterval(interval);
-    await sleep(100);
-    loader.clear();
+/** Prints the request accounting a run produced, if any. */
+function reportProgress(progress) {
+    for (const line of progress.summary()) console.log(line);
 }
 
 async function getUser(message = "Select user") {
@@ -608,7 +618,7 @@ async function getUser(message = "Select user") {
 
 // Forum scrape methods. Each option value is `{ gather, run }`, mirroring the
 // wiki path: `gather(session, id)` collects any interactive input and MUST run
-// before the progress loader starts (its 300ms re-render otherwise clobbers the
+// before the progress region starts (its repaint otherwise clobbers the
 // prompt); returning null signals a bail. `run(session, id, args)` does the
 // fetching and returns the scrape result to upsert.
 async function getMethod(contest, message = "Select method") {
@@ -710,7 +720,7 @@ async function getMethod(contest, message = "Select method") {
 
 // Wiki scrape methods. Each option value is `{ gather, run }`: `gather(contest)`
 // collects any interactive input (variant, year, page title) and MUST run before
-// the progress loader starts, otherwise its 300ms re-render clobbers the prompt.
+// the progress region starts, otherwise its repaint clobbers the prompt.
 // `run(session, contest, args)` does the fetching and returns an array of
 // ScrapedTest objects (or null for the debug method, which logs and skips the DB).
 async function getWikiMethod(message = "Select method") {
@@ -719,14 +729,15 @@ async function getWikiMethod(message = "Select method") {
             name: "Single contest-year",
             value: {
                 gather: async (contest) => {
-                    const variantArg = getArgFlag("variant");
                     const yearArg = getArgFlag("year");
-                    const variant = variantArg ?? (await pickVariant(contest));
+                    const variant = await pickVariant(contest);
                     const year = yearArg ?? (await input({ message: "Year:" }));
                     return { variant, year };
                 },
                 run: async (session, _contest, { variant, year }) => [
-                    await session.getContest(variant, year),
+                    await session.getContest(variant.page, year, {
+                        testName: variant.testName,
+                    }),
                 ],
             },
             description: "One variant + year, e.g. 2021 AMC 10A",
@@ -737,22 +748,25 @@ async function getWikiMethod(message = "Select method") {
                 gather: async () => ({}),
                 run: async (session, contest) => {
                     const tests = [];
-                    for (const entry of contest.wiki.variants) {
-                        const variant = variantName(entry);
+                    for (const variant of resolveWikiVariants(contest)) {
                         // A variant may narrow the contest's year range to the
-                        // years it actually ran (see wikiVariantYears).
-                        const [start, end] = wikiVariantYears(contest, entry);
+                        // years it actually ran (see resolveWikiVariant).
+                        const [start, end] = variant.years;
                         for (let year = start; year <= end; year++) {
                             try {
                                 const t = await session.getContest(
-                                    variant,
+                                    variant.page,
                                     year,
+                                    { testName: variant.testName },
                                 );
                                 if (t && t.count > 0) tests.push(t);
                             } catch (e) {
-                                console.log(
-                                    `\nSkipped ${year} ${variant}: ${e.message}`,
-                                );
+                                // Routed as an event so the live status region
+                                // places it in scrollback; a bare console.log
+                                // here is erased by the next repaint.
+                                session._emit("warn", {
+                                    message: `Skipped ${year} ${variant.page}: ${e.message}`,
+                                });
                             }
                         }
                     }
@@ -796,32 +810,74 @@ async function getWikiMethod(message = "Select method") {
     });
 }
 
-// A wiki variant is either a bare page-title base ("AMC 12A") or, when it only
-// ran for part of the contest's year range, `{ name, years }`. The 2021 Fall
-// AMC and the 2002 AMC P administrations are one-off page families: sweeping
-// them across the whole 2002-2026 range would be ~100 requests that can only
-// 404, so they carry their own years.
-function variantName(entry) {
-    return typeof entry === "string" ? entry : entry.name;
+/**
+ * Normalizes one `wiki.variants` entry into `{ page, testName, years }`.
+ *
+ * An entry is either a bare page-title base ("AMC 12A") or an object that
+ * overrides some axis of it:
+ *
+ * - `years` — the variant only ran for part of the contest's range. The 2021
+ *   Fall AMC and the 2002 AMC P administrations are one-off page families:
+ *   sweeping them across the whole range would be ~100 requests that can only
+ *   404.
+ * - `testName` — the wiki publishes the contest under a title the forum does
+ *   not use, so the test must be *stored* under a different base than it is
+ *   *fetched* under. AHSME is the motivating case (fetched as "1950 AHSME",
+ *   stored as "1950 AMC 12"); see WikiSession.getContest for why conflating the
+ *   two both breaks the merge and mis-types the contest.
+ *
+ * `testName` defaults to the page base, so every other variant is unchanged.
+ */
+function resolveWikiVariant(contest, entry) {
+    if (typeof entry === "string") {
+        return { page: entry, testName: entry, years: contest.wiki.years };
+    }
+    return {
+        page: entry.name,
+        testName: entry.testName ?? entry.name,
+        years: entry.years ?? contest.wiki.years,
+    };
 }
 
-function wikiVariantYears(contest, entry) {
-    if (typeof entry !== "string" && entry?.years) return entry.years;
-    return contest.wiki.years;
+function resolveWikiVariants(contest) {
+    return (contest.wiki?.variants ?? [contest.name]).map((entry) =>
+        resolveWikiVariant(contest, entry),
+    );
 }
 
+/**
+ * Resolves which variant to scrape, as a descriptor rather than a bare string —
+ * a string would drop `testName` and silently reintroduce the AHSME bug.
+ */
 async function pickVariant(contest) {
-    const variants = (contest.wiki?.variants ?? [contest.name]).map(variantName);
-    if (variants.length === 1) return variants[0];
+    const variants = resolveWikiVariants(contest);
     const variantArg = getArgFlag("variant");
-    if (variantArg && variants.includes(variantArg)) return variantArg;
+    if (variantArg) {
+        // A listed --variant must resolve to its entry so `testName`/`years`
+        // survive; an unlisted one is still honored as an ad-hoc page base.
+        return (
+            variants.find((v) => v.page === variantArg) ??
+            resolveWikiVariant(contest, variantArg)
+        );
+    }
+    if (variants.length === 1) return variants[0];
     if (hasArgFlag("yes") || !process.stdin.isTTY) return variants[0];
     return await select({
         message: "Which variant?",
-        choices: variants.map((v) => ({ name: v, value: v })),
+        choices: variants.map((v) => ({ name: v.page, value: v })),
     });
 }
 
+/**
+ * Prompts for a contest and returns `{ contest, id }` — the resolved registry
+ * entry (null for an ad-hoc id the user typed) alongside its id.
+ *
+ * It deliberately returns the entry itself rather than just an id. Returning an
+ * id forced every caller into an `id → find()` round trip, and `find` returns
+ * the *first* match: when two registry entries shared an id (AHSME and AMC 12
+ * both sat on category 3415), picking either one always resolved to whichever
+ * was listed first, silently scraping the wrong contest.
+ */
 async function autoSearch(message = "Search", choices = []) {
     const contestArg = getArgFlag("contest") ?? getArgFlag("series") ?? getArgFlag("id");
     if (contestArg) {
@@ -830,10 +886,11 @@ async function autoSearch(message = "Search", choices = []) {
                 item.id.toString() === contestArg ||
                 item.name.toLowerCase() === contestArg.toLowerCase(),
         );
-        if (found) return found.id;
-        return contestArg;
+        return found
+            ? { contest: found, id: found.id }
+            : { contest: null, id: contestArg };
     }
-    return await search({
+    const selection = await search({
         message,
         source: async (input = "") => {
             input = input.trim();
@@ -848,7 +905,7 @@ async function autoSearch(message = "Search", choices = []) {
                         item.type === "forum"
                             ? `[forum] [${item.name}] ${item.id}`
                             : `[${item.name}] ${item.id}`,
-                    value: item.id,
+                    value: item,
                 }));
             if (input.length > 0) {
                 matches.push({ name: `Use custom: ${input}`, value: input });
@@ -856,6 +913,10 @@ async function autoSearch(message = "Search", choices = []) {
             return matches;
         },
     });
+    // A registry entry is an object; "Use custom: …" yields the raw string.
+    return typeof selection === "object"
+        ? { contest: selection, id: selection.id }
+        : { contest: null, id: selection };
 }
 
 try {

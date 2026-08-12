@@ -141,6 +141,21 @@ export class ForumSession {
       }
    }
 
+   /**
+    * A short human label for an ajax payload ("fetch_topic 12345"), used in
+    * progress events and retry messages. The forum API has no page titles, so
+    * this reconstructs the closest equivalent from the payload's own fields.
+    */
+   static describePayload(bodyInput) {
+      const first = (v) => (Array.isArray(v) ? v[0] : v);
+      const a = first(bodyInput?.a) ?? "request";
+      const id =
+         first(bodyInput?.topic_id) ??
+         first(bodyInput?.category_id) ??
+         first(bodyInput?.parent_category_id);
+      return id != null ? `${a} ${id}` : String(a);
+   }
+
    static inferType(name, returnNull = false, explicitType = null) {
       if (explicitType && TYPES[explicitType]) return TYPES[explicitType];
 
@@ -194,16 +209,56 @@ export class ForumSession {
       this.enableStickyAnswerKey = false;
       this.requestDelay = [100, 250];
       this.cache = null;
+      // See WikiSession for the rationale: the CLI redirects `logger` into its
+      // live status region (a bare console.log would be erased by the next
+      // repaint), and `onEvent` carries machine-readable progress for the UI.
+      this.logger = (message) => console.log(message);
+      this.onEvent = () => {};
+      this.resetStats();
+   }
+
+   resetStats() {
+      this.stats = {
+         requests: 0,
+         cacheHits: 0,
+         networkRequests: 0,
+         networkMs: 0,
+         slowest: 0,
+         missing: 0,
+         retries: 0,
+         challenges: 0,
+      };
+      return this.stats;
+   }
+
+   /** Mean network latency in ms, or null before any uncached request. */
+   get averageNetworkMs() {
+      const { networkRequests, networkMs } = this.stats;
+      return networkRequests > 0 ? networkMs / networkRequests : null;
    }
 
    log(message) {
       if (this.debug) {
-         console.log(message);
+         this.logger(message);
+      }
+   }
+
+   /** Mirrors WikiSession._emit; see its doc comment for the event vocabulary. */
+   _emit(type, payload = {}) {
+      try {
+         this.onEvent({ type, ...payload });
+      } catch {
+         /* a broken listener must not abort the run */
       }
    }
 
    async sendRequest(bodyInput) {
+      const label = ForumSession.describePayload(bodyInput);
+      this.stats.requests++;
+
       if (this.cache && this.cache.has(bodyInput)) {
+         this.stats.cacheHits++;
+         this._emit("request", { page: label, cached: true, ms: 0 });
          return await this.cache.get(bodyInput);
       }
 
@@ -233,6 +288,7 @@ export class ForumSession {
 
       const MAX_RETRIES = 3;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+         const startedAt = performance.now();
          const response = await fetch(
             "https://artofproblemsolving.com/m/community/ajax.php",
             {
@@ -241,35 +297,62 @@ export class ForumSession {
             },
          );
          const text = await response.text();
+         const elapsed = performance.now() - startedAt;
+         this.stats.networkRequests++;
+         this.stats.networkMs += elapsed;
+         this.stats.slowest = Math.max(this.stats.slowest, elapsed);
+
          if (text.includes("challenges.cloudflare.com")) {
+            this.stats.challenges++;
             if (attempt === MAX_RETRIES) {
                throw new Error(
                   "Cloudflare challenge page returned after all retries. If this keeps happening, copy fresh headers from your browser's DevTools and update .env.js.",
                );
             }
-            const delay = 5000 * (attempt + 1);
-            console.log(
-               `\nCloudflare challenge (attempt ${attempt + 1}/${MAX_RETRIES + 1}), waiting ${delay / 1000}s...`,
+            const delayMs = 5000 * (attempt + 1);
+            this.stats.retries++;
+            this._emit("retry", {
+               page: label,
+               kind: "cloudflare",
+               attempt: attempt + 1,
+               delayMs,
+            });
+            // Routed through log(), not console.log, so the CLI's status region
+            // can place it in scrollback instead of painting over it.
+            this.log(
+               `Cloudflare challenge on ${label} (attempt ${attempt + 1}/${MAX_RETRIES + 1}, HTTP ${response.status}), waiting ${delayMs / 1000}s...`,
             );
-            await new Promise((r) => setTimeout(r, delay));
+            await new Promise((r) => setTimeout(r, delayMs));
             continue;
          }
          try {
             const parsed = JSON.parse(text);
             if (this.cache) await this.cache.set(bodyInput, parsed);
+            this._emit("request", {
+               page: label,
+               cached: false,
+               ms: elapsed,
+            });
             return parsed;
          } catch (e) {
             if (attempt === MAX_RETRIES) {
-               console.error(
-                  `\nFailed to parse JSON after ${MAX_RETRIES + 1} attempts. Response: ${text.slice(0, 500)}`,
+               this.log(
+                  `Failed to parse JSON for ${label} after ${MAX_RETRIES + 1} attempts (HTTP ${response.status}). Response: ${text.slice(0, 500)}`,
                );
                throw e;
             }
-            const delay = 1000 * 2 ** attempt;
-            console.log(
-               `\nJSON parse failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${delay}ms...`,
+            const delayMs = 1000 * 2 ** attempt;
+            this.stats.retries++;
+            this._emit("retry", {
+               page: label,
+               kind: "json",
+               attempt: attempt + 1,
+               delayMs,
+            });
+            this.log(
+               `JSON parse failed for ${label} (attempt ${attempt + 1}/${MAX_RETRIES + 1}, HTTP ${response.status}), retrying in ${delayMs}ms...`,
             );
-            await new Promise((r) => setTimeout(r, delay));
+            await new Promise((r) => setTimeout(r, delayMs));
          }
       }
    }

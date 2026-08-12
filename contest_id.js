@@ -77,8 +77,12 @@ export const CONTEST_IDS = {
             is_official: true,
             wiki: {
                 variants: [
-                    "AMC 10A",
-                    "AMC 10B",
+                    // The A/B split began in 2002. Before that the AMC 10 was a
+                    // single administration published under an unsuffixed title,
+                    // so these must NOT inherit the contest-level range — every
+                    // "2000 AMC 10A Problems/Problem k" request can only 404.
+                    { name: "AMC 10A", years: [2002, 2025] },
+                    { name: "AMC 10B", years: [2002, 2025] },
                     // 2021 ran a second, full administration in the fall, which
                     // the wiki publishes as its own page family ("2021 Fall AMC
                     // 10B Problems/Problem 2"). Without these the fall tests get
@@ -87,8 +91,10 @@ export const CONTEST_IDS = {
                     { name: "Fall AMC 10B", years: [2021, 2021] },
                     // 2002 had a third "P" (practice) administration.
                     { name: "AMC 10P", years: [2002, 2002] },
+                    // Pre-split years: one test per year, no A/B suffix.
+                    { name: "AMC 10", years: [2000, 2001] },
                 ],
-                years: [2002, 2025],
+                years: [2000, 2025],
             },
         },
         {
@@ -97,15 +103,26 @@ export const CONTEST_IDS = {
             is_official: true,
             wiki: {
                 variants: [
-                    "AMC 12A",
-                    "AMC 12B",
-                    // See the AMC 10 note above: 2021's fall administration and
-                    // 2002's "P" are separate wiki page families.
+                    // The AMC 12 was the AHSME until 2000. The wiki publishes
+                    // those years under the old name ("1950 AHSME Problems"),
+                    // but the forum — and so the DB — stores them as
+                    // "1950 AMC 12", hence `testName`. Without it the rows never
+                    // merge onto the forum's, and `inferType("1950 AHSME")`
+                    // returns null, scraping an MCQ contest as an untyped one.
+                    { name: "AHSME", years: [1950, 1999], testName: "AMC 12" },
+                    // See the AMC 10 note above: the A/B split began in 2002, so
+                    // these carry their own start year rather than inheriting
+                    // the contest-level range down into the unsuffixed era.
+                    { name: "AMC 12A", years: [2002, 2025] },
+                    { name: "AMC 12B", years: [2002, 2025] },
+                    // 2021's fall administration and 2002's "P" are separate
+                    // wiki page families.
                     { name: "Fall AMC 12A", years: [2021, 2021] },
                     { name: "Fall AMC 12B", years: [2021, 2021] },
                     { name: "AMC 12P", years: [2002, 2002] },
+                    { name: "AMC 12", years: [2000, 2001] },
                 ],
-                years: [2002, 2025],
+                years: [1950, 2025],
             },
         },
         {

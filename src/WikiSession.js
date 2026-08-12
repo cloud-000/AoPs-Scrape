@@ -36,18 +36,77 @@ export class WikiSession {
         this.onProblemAdd = onProblemAdd ?? (() => {});
         this.requestDelay = [100, 250];
         this.cache = null;
+        // Where log() writes. The CLI points this at its live status region so
+        // messages land in scrollback instead of being erased by the next
+        // repaint; leaving it as console.log keeps the class usable standalone.
+        this.logger = (message) => console.log(message);
+        // Structured lifecycle hook, called with the event objects documented on
+        // `_emit`. Distinct from `logger`: this is machine-readable progress for
+        // a UI, not prose. Never let a consumer's throw abort a scrape.
+        this.onEvent = () => {};
+        // Counters for the end-of-run summary; see `resetStats` for the shape.
+        this.resetStats();
+    }
+
+    resetStats() {
+        this.stats = {
+            requests: 0, // logical fetches, cached or not
+            cacheHits: 0,
+            networkRequests: 0,
+            networkMs: 0, // wall time in fetch(), excluding the politeness delay
+            slowest: 0,
+            missing: 0, // API replied "missingtitle" (a 404 page)
+            retries: 0,
+            challenges: 0, // Cloudflare / 403 interstitials
+        };
+        return this.stats;
+    }
+
+    /** Mean network latency in ms, or null before any uncached request. */
+    get averageNetworkMs() {
+        const { networkRequests, networkMs } = this.stats;
+        return networkRequests > 0 ? networkMs / networkRequests : null;
     }
 
     log(message) {
-        if (this.debug) console.log(message);
+        if (this.debug) this.logger(message);
+    }
+
+    /**
+     * Emits a progress event. Event `type` is one of:
+     *   request  { page, cached, ms, missing }  a wiki API call completed
+     *   retry    { page, kind, attempt, delayMs } a call is being retried
+     *   test     { name, phase: "start"|"done", count } a contest-year boundary
+     *   problem  { name, index, total, page }   a problem page was accepted
+     *   warn     { message }                    a non-fatal anomaly
+     * Consumer errors are swallowed so instrumentation can never break a scrape.
+     */
+    _emit(type, payload = {}) {
+        try {
+            this.onEvent({ type, ...payload });
+        } catch {
+            /* a broken listener must not abort the run */
+        }
     }
 
     // Low-level GET to the wiki API. `params` is a plain object of query params
     // and doubles as the ResponseCache key. Mirrors ForumSession.sendRequest's
     // retry structure.
     async _get(params) {
+        const page = params.page ?? "(unknown page)";
+        this.stats.requests++;
+
         if (this.cache && this.cache.has(params)) {
-            return await this.cache.get(params);
+            const cached = await this.cache.get(params);
+            this.stats.cacheHits++;
+            if (cached?.error?.code === "missingtitle") this.stats.missing++;
+            this._emit("request", {
+                page,
+                cached: true,
+                ms: 0,
+                missing: cached?.error?.code === "missingtitle",
+            });
+            return cached;
         }
 
         const url = `${WIKI_API}?${new URLSearchParams(params)}`;
@@ -67,40 +126,69 @@ export class WikiSession {
 
         const MAX_RETRIES = 3;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            const startedAt = performance.now();
             const response = await fetch(url, init);
             const text = await response.text();
+            const elapsed = performance.now() - startedAt;
+            this.stats.networkRequests++;
+            this.stats.networkMs += elapsed;
+            this.stats.slowest = Math.max(this.stats.slowest, elapsed);
+
             const isChallenge =
                 text.includes("challenges.cloudflare.com") ||
                 (response.status === 403 && !text.trimStart().startsWith("{"));
             if (isChallenge) {
+                this.stats.challenges++;
                 if (attempt === MAX_RETRIES) {
                     throw new Error(
                         "Cloudflare challenge / 403 from the wiki after all retries. Copy fresh headers from your browser's DevTools and update .env.js.",
                     );
                 }
-                const delay = 5000 * (attempt + 1);
+                const delayMs = 5000 * (attempt + 1);
+                this.stats.retries++;
+                this._emit("retry", {
+                    page,
+                    kind: "cloudflare",
+                    attempt: attempt + 1,
+                    delayMs,
+                });
                 this.log(
-                    `\nCloudflare challenge (attempt ${attempt + 1}/${MAX_RETRIES + 1}), waiting ${delay / 1000}s...`,
+                    `Cloudflare challenge on "${page}" (attempt ${attempt + 1}/${MAX_RETRIES + 1}, HTTP ${response.status}), waiting ${delayMs / 1000}s...`,
                 );
-                await new Promise((r) => setTimeout(r, delay));
+                await new Promise((r) => setTimeout(r, delayMs));
                 continue;
             }
             try {
                 const parsed = JSON.parse(text);
                 if (this.cache) await this.cache.set(params, parsed);
+                const missing = parsed?.error?.code === "missingtitle";
+                if (missing) this.stats.missing++;
+                this._emit("request", {
+                    page,
+                    cached: false,
+                    ms: elapsed,
+                    missing,
+                });
                 return parsed;
             } catch (e) {
                 if (attempt === MAX_RETRIES) {
-                    console.error(
-                        `\nFailed to parse wiki JSON after ${MAX_RETRIES + 1} attempts. Response: ${text.slice(0, 500)}`,
+                    this.log(
+                        `Failed to parse wiki JSON for "${page}" after ${MAX_RETRIES + 1} attempts (HTTP ${response.status}). Response: ${text.slice(0, 500)}`,
                     );
                     throw e;
                 }
-                const delay = 1000 * 2 ** attempt;
+                const delayMs = 1000 * 2 ** attempt;
+                this.stats.retries++;
+                this._emit("retry", {
+                    page,
+                    kind: "json",
+                    attempt: attempt + 1,
+                    delayMs,
+                });
                 this.log(
-                    `\nJSON parse failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${delay}ms...`,
+                    `JSON parse failed for "${page}" (attempt ${attempt + 1}/${MAX_RETRIES + 1}, HTTP ${response.status}), retrying in ${delayMs}ms...`,
                 );
-                await new Promise((r) => setTimeout(r, delay));
+                await new Promise((r) => setTimeout(r, delayMs));
             }
         }
     }
@@ -227,7 +315,7 @@ export class WikiSession {
                 statementSrc = CleanupText.cleanChoices(statementSrc);
             } else {
                 this.log(
-                    `\n⚠️  ${page}: expected MCQ choices but found ${extracted.length}; leaving the source statement intact.`,
+                    `⚠️  ${page}: expected MCQ choices but found ${extracted.length}; leaving the source statement intact.`,
                 );
             }
         }
@@ -330,49 +418,76 @@ export class WikiSession {
         return s.replace(/\s+/g, "");
     }
 
-    // Assembles a full test for one contest variant + year (e.g. "AMC 10A",
-    // 2021). `name` must match the forum's normalized category name so the
-    // natural key (series, name, year) merges wiki rows onto forum rows.
-    async getContest(titleBase, year) {
-        let actualTitleBase = titleBase;
-        if (year < 2000 && (titleBase === "AIME I" || titleBase === "AIME II")) {
-            if (titleBase === "AIME II") return null;
-            actualTitleBase = "AIME";
+    /**
+     * Assembles a full test for one contest variant + year (e.g. "AMC 10A",
+     * 2021).
+     *
+     * Two distinct titles are in play, and conflating them is a bug:
+     *
+     * - `pageBase` addresses the **wiki**, e.g. "AHSME" → the page family
+     *   "1950 AHSME Problems/Problem 3".
+     * - `testName` (defaulting to `pageBase`) is what the test is **stored** as,
+     *   and must match the forum's normalized category name so the natural key
+     *   (series, name, year) merges wiki rows onto the forum rows rather than
+     *   creating a parallel copy.
+     *
+     * They differ only where the wiki publishes a contest under a name the forum
+     * does not use. AHSME is the case that motivated the split: the forum stores
+     * those years as "1950 AMC 12", so `{ pageBase: "AHSME", testName: "AMC 12" }`.
+     * The stored name also drives type inference — `inferType("1950 AHSME")` is
+     * `null` (→ UNKNOWN → not computational, no choices, statements left with
+     * their A–E options glued on), while `inferType("1950 AMC 12")` correctly
+     * yields an MCQ contest.
+     */
+    async getContest(pageBase, year, { testName = null } = {}) {
+        let actualPageBase = pageBase;
+        let actualTestBase = testName ?? pageBase;
+        if (year < 2000 && (pageBase === "AIME I" || pageBase === "AIME II")) {
+            if (pageBase === "AIME II") return null;
+            actualPageBase = "AIME";
+            // Only when the caller did not name one explicitly: a pre-2000 AIME
+            // was a single administration published (and stored) as plain "AIME".
+            if (testName == null) actualTestBase = "AIME";
         }
-        const name = `${year} ${actualTitleBase}`;
-        // Resolve metadata from the title the test is actually published under,
-        // not the variant we asked for: a pre-2000 AIME was a single
-        // administration, so fetching it as the "AIME I" variant must not stamp
-        // it format = "I" alongside the genuine 2000+ AIME I tests.
-        const metadata = wikiTestMetadata(actualTitleBase);
+        const pageTitle = `${year} ${actualPageBase}`;
+        const name = `${year} ${actualTestBase}`;
+        // Resolve metadata from the title the test is actually stored under, not
+        // the variant we asked for: a pre-2000 AIME was a single administration,
+        // so fetching it as the "AIME I" variant must not stamp it format = "I"
+        // alongside the genuine 2000+ AIME I tests.
+        const metadata = wikiTestMetadata(actualTestBase);
         const type = ForumSession.inferType(name, true) ?? TYPES.UNKNOWN;
         const computational = type.computational ?? false;
         const hasChoices = type.choices ?? false;
+
+        this._emit("test", { name, pageTitle, phase: "start" });
 
         // Discover the problem count from the aggregate "… Problems" page.
         const defaultN = hasChoices ? 25 : 15;
         let N = defaultN;
         try {
-            const agg = await this.parse(`${name} Problems`, { wikitext: true });
+            const agg = await this.parse(`${pageTitle} Problems`, {
+                wikitext: true,
+            });
             const nums = [...agg.matchAll(/==\s*Problem\s+(\d+)\s*==/gi)].map(
                 (m) => Number(m[1]),
             );
             if (nums.length) N = Math.max(...nums);
         } catch (e) {
             this.log(
-                `\n(no aggregate Problems page for "${name}", defaulting to ${defaultN} problems)`,
+                `(no aggregate Problems page for "${pageTitle}", defaulting to ${defaultN} problems)`,
             );
         }
 
         // Optional answer-key fallback for problems whose solution has no \boxed.
         let key = {};
         try {
-            const keyText = await this.parse(`${name} Answer Key`, {
+            const keyText = await this.parse(`${pageTitle} Answer Key`, {
                 wikitext: true,
             });
             key = CleanupText.parseAnswerKey(
                 WikiSession._wikiListToNumbered(keyText),
-                name,
+                pageTitle,
             );
         } catch {
             key = {};
@@ -380,12 +495,16 @@ export class WikiSession {
 
         const problems = [];
         for (let k = 1; k <= N; k++) {
+            const page = `${pageTitle} Problems/Problem ${k}`;
+            // Emitted before the fetch so a stalled or throttled request shows
+            // up as "currently on problem k", not as silence.
+            this._emit("problem", { name, pageTitle, index: k, total: N, page });
             let problem;
             try {
-                problem = await this.getProblemPage(
-                    `${name} Problems/Problem ${k}`,
-                    { computational, choices: hasChoices },
-                );
+                problem = await this.getProblemPage(page, {
+                    computational,
+                    choices: hasChoices,
+                });
             } catch (e) {
                 if (e.code === "missingtitle") continue;
                 throw e;
@@ -410,7 +529,7 @@ export class WikiSession {
                 } else if (boxed !== keyed) {
                     // Mismatch: the key is authoritative — overwrite and warn.
                     this.log(
-                        `\n⚠️  ${name} Problem ${k}: boxed answer "${problem.answerValue}" disagrees with Answer Key "${resolved.answerValue}"; using the key.`,
+                        `⚠️  ${pageTitle} Problem ${k}: boxed answer "${problem.answerValue}" disagrees with Answer Key "${resolved.answerValue}"; using the key.`,
                     );
                     problem.answerValue = resolved.answerValue;
                     problem.answerIndex = resolved.answerIndex;
@@ -421,6 +540,13 @@ export class WikiSession {
             problems.push(problem);
             this.onProblemAdd(problem);
         }
+
+        this._emit("test", {
+            name,
+            pageTitle,
+            phase: "done",
+            count: problems.length,
+        });
 
         return {
             id: null,

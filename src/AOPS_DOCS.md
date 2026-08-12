@@ -193,10 +193,26 @@ new ForumSession(loggedIn, userId, sessionId, headers = null, onProblemAdd = nul
 **Notable instance fields:**
 
 - `requestDelay: [min, max]` — random delay range in ms added before each request (default `[100, 250]`). Increase if hitting rate limits.
-- `debug: boolean` — logs raw API responses to stdout when true.
+- `debug: boolean` — logs raw API responses when true. Chatty (it dumps every forum item), so the CLI leaves it off unless `--debug`/`--verbose` is passed.
+- `logger: (message) => void` — where `log()` writes (default `console.log`). The CLI points this at its live status region; a bare `console.log` issued while that region is painting is erased by the next repaint, so **all diagnostic output must go through `log()`**, never `console.log` directly.
+- `onEvent: (event) => void` — structured progress hook, separate from `logger` (machine-readable, not prose). Consumer exceptions are swallowed so instrumentation can never abort a scrape. Event shapes:
+
+  | `type` | Payload | Emitted when |
+  |---|---|---|
+  | `request` | `{ page, cached, ms }` | An ajax call completed (`page` is `describePayload`'s label, e.g. `fetch_topic 12345`) |
+  | `retry` | `{ page, kind: "cloudflare"\|"json", attempt, delayMs }` | A call is about to be retried after backoff |
+  | `warn` | `{ message }` | A non-fatal anomaly the caller wants surfaced |
+
+- `stats` — request accounting for the end-of-run summary: `requests`, `cacheHits`, `networkRequests`, `networkMs`, `slowest`, `missing`, `retries`, `challenges`. `resetStats()` clears it; the `averageNetworkMs` getter derives mean latency (`null` before any uncached request). This is what distinguishes a throttled run from a hung one — see `createScrapeProgress` in `cli/progress.js`.
 - `_permissionDenied: boolean` — set to true when `E_NO_PERMISSION` is returned; causes `searchTopicForAnswer` to short-circuit for the rest of the current `getTest` call.
 - `enableStickyAnswerKey: boolean` — when true, `getTest` will attempt to find a stickied answer-key post in the parent forum and apply it. Should only be true for unofficial/user-made contests. Default `false`.
 - `_currentForumCategoryId: number | null` — cached forum category ID populated during `searchTopicForSolutions`; consumed and reset by `getTest`.
+
+---
+
+### `ForumSession.describePayload(bodyInput)` *(static)*
+
+Returns a short human label for an ajax payload (`"fetch_topic 12345"`), reconstructed from the payload's own `a` / `*_id` fields — the forum API has no page titles. Used in `request`/`retry` events and retry messages so progress output can name what it is waiting on.
 
 ---
 
