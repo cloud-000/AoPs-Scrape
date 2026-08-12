@@ -58,6 +58,7 @@ import {
     chmmcSeasonMetadata,
     chmmcFormatMetadata,
     farmlFormatMetadata,
+    omoSeasonMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
@@ -388,6 +389,36 @@ export const SERIES_CONFIG = {
                 sectionName: null,
                 ...sea,
                 ...fmt,
+            };
+        },
+    },
+    omo: {
+        seriesName: "OMO",
+        isOfficial: true,
+        isComputational: true,
+        // "2014_spring" -> "2014 OMO Spring"; "2012_fall" -> "2012 OMO Fall".
+        // One OCR folder is one contest, and the season is the only axis: each
+        // OMO is a single undivided round of numeric-answer problems, so
+        // `format` stays NULL (and topicPolicy keeps the per-statement
+        // heuristic, there being no round whose subject could be declared).
+        //
+        // The folder year is the year the contest was ADMINISTERED, matching the
+        // packet headers ("September/October 2012 — Fall OMO 2012-2013",
+        // "January 2013 — Winter OMO 2012-2013"), not the school year those
+        // headers span. The January contests are 50 problems, Fall/Spring 30;
+        // that is not encoded anywhere because nothing keys off it.
+        parseTest(folder) {
+            const [yearStr, season, ...extra] = folder.split("_");
+            const year = Number(yearStr);
+            if (!Number.isInteger(year) || extra.length > 0) return null;
+            const sea = omoSeasonMetadata(season);
+            if (!sea.division) return null;
+            return {
+                name: `${year} OMO ${sea.division}`,
+                year,
+                section: -1,
+                sectionName: null,
+                ...sea,
             };
         },
     },

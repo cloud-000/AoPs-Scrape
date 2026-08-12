@@ -1229,6 +1229,15 @@ export class CleanupText {
         // suffix fixes run first so the anchored folder rules below see "for"
         // and no "Problems". The ^…$ folder rules only fire on the bare category
         // name — the year-prefixed per-test names never match them.
+        // The Online Math Open: AoPS names the series category "Online Math Open
+        // Problems" and each year's category "<year> Online Math Open Problems",
+        // with the two contests of that year as its sections ("Winter"/"Fall"
+        // through 2013, "Spring"/"Fall" after). One unanchored rule covers both,
+        // since the series name is the per-year name without its year: the
+        // sections then materialize as "<year> OMO <Season>", which is exactly
+        // what pdfImport's `omo` config names them, so PDF and forum rows merge
+        // on the (series, name, year) key instead of forking into two series.
+        [/\bOnline Math Open Problems\b/gi, "OMO"],
         [/Math Prize For Girls/g, "Math Prize for Girls"],
         [/(Math Prize for Girls)\s+Problems\b/gi, "$1"],
         [/^\s*Math Prize for Girls Olympiad\s*$/i, "MPFG Olympiad"],

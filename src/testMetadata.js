@@ -178,6 +178,16 @@ const CHMMC_FORMATS = new Map([
     ],
 ]);
 
+// OMO administrations (the "which division" axis). The contest ran a Fall and a
+// January "Winter" edition through 2013, then moved the second one to April and
+// renamed it Spring; both spellings are live, so both are registered. OMO has no
+// format axis — each contest is a single undivided round.
+const OMO_SEASONS = new Map([
+    ["winter", { label: "Winter", order: 10 }],
+    ["spring", { label: "Spring", order: 20 }],
+    ["fall", { label: "Fall", order: 30 }],
+]);
+
 // MPFG splits into two distinct contest types under one umbrella series family.
 // The type is the "which division" axis, so it maps to `division`. No format.
 const MPFG_CONTESTS = new Map([
@@ -368,6 +378,16 @@ export function sectionTestMetadata(type, sectionName) {
     );
     if (division) return { ...emptyTestMetadata(), ...division };
 
+    // A season label is an administration, which is the division axis — an OMO
+    // year category carries its two contests as "Winter"/"Fall" (through 2013)
+    // or "Spring"/"Fall" sections. Resolved from the same registry the PDF
+    // importer uses, so a scraped row and a PDF-imported one cannot disagree on
+    // the label or its order. This only decides a row the PDF import never
+    // touched: where both sources cover a test, the scrape passes the identical
+    // value onto a row that already has it.
+    const season = fromEntry("division", OMO_SEASONS.get(label.toLowerCase()));
+    if (season) return { ...emptyTestMetadata(), ...season };
+
     if (type === "AIME") {
         const format = fromEntry(
             "format",
@@ -530,6 +550,15 @@ export function chmmcSeasonMetadata(token) {
 // CHMMC round is the "which format" axis. Returns only format fields.
 export function chmmcFormatMetadata(token) {
     return fromEntry("format", CHMMC_FORMATS.get(token?.toLowerCase())) ?? {};
+}
+
+// OMO administration (Winter/Spring/Fall) is the "which division" axis, and the
+// only axis OMO has. Full base + division.
+export function omoSeasonMetadata(token) {
+    return {
+        ...emptyTestMetadata(),
+        ...(fromEntry("division", OMO_SEASONS.get(token?.toLowerCase())) ?? {}),
+    };
 }
 
 // FARML event is the "which format" axis. Returns only format fields.

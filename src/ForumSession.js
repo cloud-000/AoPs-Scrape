@@ -162,6 +162,17 @@ export class ForumSession {
       if (name.includes("OMMC")) {
          return name.includes("final") ? TYPES.AMO : TYPES.COMPUTE;
       }
+      // The Online Math Open is numeric-answer computational, but neither of its
+      // spellings survives the heuristics below. The normalized "2014 OMO" hits
+      // the `includes("MO")` olympiad rule and would scrape as a proof test — no
+      // answer extraction at all, and is_computational upserted as 0 over the
+      // PDF import's 1. The raw "2014 Online Math Open Problems" matches nothing
+      // and falls through to UNKNOWN, whose null `computational` upserts as 0
+      // just the same. Both spellings are checked because this runs on whatever
+      // normalizeContestName produced.
+      if (/\bOMO\b/.test(name) || name.includes("Online Math Open")) {
+         return TYPES.COMPUTE;
+      }
       if (name.includes("Solstice Math Olympiad")) return TYPES.COMPUTE;
       if (name.includes("CUBRMC")) return TYPES.COMPUTE;
       if (name.includes("RML")) return TYPES.ARML;
