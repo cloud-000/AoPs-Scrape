@@ -57,6 +57,7 @@ import {
     cmimcFormatMetadata,
     chmmcSeasonMetadata,
     chmmcFormatMetadata,
+    farmlFormatMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
@@ -390,7 +391,84 @@ export const SERIES_CONFIG = {
             };
         },
     },
+    farml: {
+        seriesName: "FARML",
+        // A mock ARML (the 2018 packet's own footnote: "F for Fake"), so the
+        // series sits with the other mocks. Its solutions are still written by
+        // the contest author and shipped in the packet, so they auto-accept —
+        // the two facts diverge here, which is why they are separate keys.
+        isOfficial: false,
+        solutionsOfficial: true,
+        isComputational: true,
+        // "2024" -> the 2024 packet; "2016_team"/"2016_indy"/"2016_relay" are
+        // the 2016 packet OCR'd as three folders. All of them carry the SAME
+        // global problem numbering (2016_indy is keyed 11-20), so the year is
+        // the only thing the folder name has to yield — which round a problem
+        // belongs to comes from its number, via splitTests below.
+        parseTest(folder) {
+            const year = Number(folder.split("_")[0]);
+            if (!Number.isInteger(year)) return null;
+            return {
+                name: `${year} FARML`,
+                year,
+                section: -1,
+                sectionName: null,
+            };
+        },
+        splitTests(folder) {
+            const base = this.parseTest(folder);
+            if (base == null) return null;
+            return FARML_ROUNDS.map((round) => ({
+                meta: {
+                    ...base,
+                    name: `${base.year} FARML ${farmlFormatMetadata(round.token).format}`,
+                    ...farmlFormatMetadata(round.token),
+                },
+                offset: round.from - 1,
+                owns: (key) => {
+                    const num = Number(key);
+                    return (
+                        Number.isInteger(num) &&
+                        num >= round.from &&
+                        num <= round.to
+                    );
+                },
+                coverageForKey: round.coverageForKey,
+            }));
+        },
+    },
 };
+
+// FARML's events, keyed by the packet's global problem numbering (verified
+// stable across 2016-2026): T1-T10 -> 1-10, I1-I10 -> 11-20, R1/1-R2/3 ->
+// 21-26, Tiebreaker 1/2 -> 27-28. Each round's problems are renumbered from its
+// own `from`, so Individual's I1 lands on n = 0 like any other test's first
+// problem. The tiebreaker round is open-ended because some years print one and
+// some print two.
+const FARML_RELAY_FIRST = 21;
+const FARML_RELAY_CHAIN = 3;
+const FARML_ROUNDS = [
+    { token: "team", from: 1, to: 10 },
+    { token: "individual", from: 11, to: 20 },
+    {
+        token: "relay",
+        from: FARML_RELAY_FIRST,
+        to: 26,
+        // Every relay problem but the head of its chain begins "Let T = TNYWR"
+        // — its answer depends on the previous link's, which a problem served
+        // on its own does not have. That is a structural fact about the round
+        // (positions 2 and 3 of each 3-problem chain), NOT something to detect
+        // in the statement: the 2023 OCR lost the TNYWR prefix on #22, which
+        // still reads "$\sec A = T$" and is just as unanswerable alone.
+        // The answer stays (it is correct, and answer_status resolves to
+        // `known`); `interactive` is what tells a grader to skip it.
+        coverageForKey(key) {
+            const chainPosition = (Number(key) - FARML_RELAY_FIRST) % FARML_RELAY_CHAIN;
+            return chainPosition === 0 ? null : { response_kind: "interactive" };
+        },
+    },
+    { token: "tiebreaker", from: 27, to: Infinity },
+];
 
 // Confidence policy for auto-linking duplicate groups (matches the plan):
 //   similarity >= 1.0            -> auto-accept
@@ -540,8 +618,8 @@ export function importPdfProblems(db, outDir, options = {}) {
                 const testPath = join(seriesPath, testFolder);
                 if (!isDir(testPath)) continue;
 
-                const meta = cfg.parseTest(testFolder);
-                if (meta == null) {
+                const folderMeta = cfg.parseTest(testFolder);
+                if (folderMeta == null) {
                     console.warn(
                         `  skip unsupported test: ${seriesFolder}/${testFolder}`,
                     );
@@ -569,244 +647,68 @@ export function importPdfProblems(db, outDir, options = {}) {
                 const profileFile = readTestProfile(testPath, where);
                 const coverageFile = readProblemCoverage(testPath, where);
 
-                const seriesName = meta.seriesName ?? cfg.seriesName;
-                // Series default, overridable per test where a single series
-                // mixes formats (e.g. MPFG: computational Math Prize vs.
-                // proof-based Olympiad). Mirrors the seriesName override above.
-                // This stays the RAW config value. The coverage-aware value is
-                // derived at read time by isComputationalFor(), so a later
-                // AoPS re-scrape writing its own guess here cannot regress it.
-                const isComputational =
-                    meta.isComputational ?? cfg.isComputational;
-                let seriesId = seriesIds.get(seriesName);
-                if (seriesId == null) {
-                    seriesId = upsertSeries(db, seriesName, -1, cfg.isOfficial);
-                    seriesIds.set(seriesName, seriesId);
-                    summary.series++;
-                }
+                // An OCR folder is normally one test. A series whose packet
+                // bundles several rounds under one cover (FARML) supplies
+                // `splitTests`, slicing the folder's problem numbering into one
+                // group per round; `wholeFolderGroup` is the identity slice
+                // every other series gets, so one import path serves both.
+                const groups = cfg.splitTests?.(testFolder) ?? [
+                    wholeFolderGroup(folderMeta),
+                ];
 
-                const testId = upsertTest(
-                    db,
-                    {
-                        aopsCategoryId: null,
-                        name: meta.name,
-                        section: meta.section ?? -1,
-                        sectionName: meta.sectionName ?? null,
-                        year: meta.year ?? null,
-                        division: meta.division,
-                        divisionOrder: meta.divisionOrder,
-                        format: meta.format,
-                        formatOrder: meta.formatOrder,
-                        type: null,
+                for (const group of groups) {
+                    const meta = group.meta;
+                    // A round can be absent from a packet (FARML's second
+                    // tiebreaker in a 27-problem year) and the 2016 folders each
+                    // hold one round's slice, so most groups are empty for most
+                    // folders. Skip them instead of materializing a test row
+                    // with nothing in it.
+                    const ownsAny =
+                        Object.keys(problems).some((key) => group.owns(key)) ||
+                        Object.keys(answers).some((key) => group.owns(key));
+                    if (!ownsAny) continue;
+
+                    const seriesName = meta.seriesName ?? cfg.seriesName;
+                    // Series default, overridable per test where a single series
+                    // mixes formats (e.g. MPFG: computational Math Prize vs.
+                    // proof-based Olympiad). Mirrors the seriesName override
+                    // above. This stays the RAW config value. The coverage-aware
+                    // value is derived at read time by isComputationalFor(), so a
+                    // later AoPS re-scrape writing its own guess here cannot
+                    // regress it.
+                    const isComputational =
+                        meta.isComputational ?? cfg.isComputational;
+                    let seriesId = seriesIds.get(seriesName);
+                    if (seriesId == null) {
+                        seriesId = upsertSeries(
+                            db,
+                            seriesName,
+                            -1,
+                            cfg.isOfficial,
+                        );
+                        seriesIds.set(seriesName, seriesId);
+                        summary.series++;
+                    }
+
+                    const counts = importTestGroup(db, {
+                        cfg,
+                        group,
+                        where,
+                        problems,
+                        answers,
+                        solutions,
+                        profileFile,
+                        coverageFile,
+                        seriesId,
                         isComputational,
-                        // Only pass these when a profile was actually read —
-                        // upsertTest keys off presence, so an absent profile
-                        // must leave any existing value alone rather than
-                        // asserting NULL over it.
-                        ...(profileFile.state === "present" &&
-                        profileFile.value.response_kind !== undefined
-                            ? {
-                                  responseKind:
-                                      profileFile.value.response_kind,
-                              }
-                            : {}),
-                        ...(profileFile.state === "present" &&
-                        profileFile.value.answer_status !== undefined
-                            ? {
-                                  answerStatus:
-                                      profileFile.value.answer_status,
-                              }
-                            : {}),
-                        // Section structure is scraper-owned; PDF import must
-                        // not rewrite section/section_name on an existing row.
-                        updateSection: false,
-                    },
-                    seriesId,
-                );
-                summary.tests++;
-
-                // Resolve against state after the profile upsert. This matters
-                // when the current file is absent/invalid: its stored declaration
-                // remains authoritative for answer retraction.
-                const declaration = db
-                    .query(
-                        `SELECT response_kind, answer_status FROM tests WHERE id = ?`,
-                    )
-                    .get(testId);
-                const existingCoverageByN = new Map(
-                    db
-                        .query(
-                            `SELECT n, coverage_response_kind, coverage_answer_status
-                             FROM problems WHERE test_id = ? AND section = -1`,
-                        )
-                        .all(testId)
-                        .map((row) => [row.n, row]),
-                );
-
-                // Coverage keys are the OCR's 1-based numbers, same as
-                // `problems`/`answers`, so they index by `key` not `n`.
-                const coverageFor = (key, n) => {
-                    const existingCoverage = existingCoverageByN.get(n);
-                    const snapshotEntry =
-                        coverageFile.state === "present"
-                            ? coverageFile.value[key]
-                            : undefined;
-                    const responseKind = coverageSnapshotField({
-                        file: coverageFile,
-                        entry: snapshotEntry,
-                        field: "response_kind",
-                        existingValue:
-                            existingCoverage?.coverage_response_kind,
                     });
-                    const answerStatus = coverageSnapshotField({
-                        file: coverageFile,
-                        entry: snapshotEntry,
-                        field: "answer_status",
-                        existingValue:
-                            existingCoverage?.coverage_answer_status,
-                    });
-                    const resolved = resolveCoverage({
-                        overrideResponseKind: responseKind.value,
-                        declarationResponseKind:
-                            declaration?.response_kind ?? null,
-                        overrideAnswerStatus: answerStatus.value,
-                        declarationAnswerStatus:
-                            declaration?.answer_status ?? null,
-                        rawIsComputational: isComputational,
-                    });
-                    return {
-                        // Stored on the override tier only: NULL here means no
-                        // source named this problem, never "it inherited the
-                        // test's declaration".
-                        ...(responseKind.update
-                            ? { coverage_response_kind: responseKind.value }
-                            : {}),
-                        ...(answerStatus.update
-                            ? { coverage_answer_status: answerStatus.value }
-                            : {}),
-                        // Clearing a stale answer must follow the RESOLVED
-                        // verdict, since the claim usually lives on the test
-                        // row (a proof profile) rather than the override.
-                        answerNotApplicable:
-                            resolved.answerStatus === "not_applicable",
-                    };
-                };
 
-                let count = 0;
-                const problemIdByN = new Map(); // n -> problem id, for attaching solutions
-                for (const key of Object.keys(problems)) {
-                    const n = ocrKeyToN(
-                        key,
-                        "problem",
-                        `${seriesFolder}/${testFolder}`,
-                    );
-                    if (n === null) continue;
-                    const problemId = upsertPdfProblem(
-                        db,
-                        {
-                            n,
-                            statement: normalizePdfStatement(problems[key]),
-                            answer: answers[key] ?? null,
-                            source: `${seriesFolder}/${testFolder}`,
-                            is_computational: isComputational,
-                            ...coverageFor(key, n),
-                        },
-                        testId,
-                    );
-                    problemIdByN.set(n, problemId);
-                    count++;
+                    summary.tests++;
+                    summary.problems += counts.problems;
+                    summary.answersOnly += counts.answersOnly;
+                    summary.droppedAnswers += counts.droppedAnswers;
+                    summary.solutions += counts.solutions;
                 }
-
-                // An answer key covers the whole test, so it routinely names
-                // problems the OCR dropped a statement for. Those answers are
-                // still good, and another tier (usually an AoPS scrape) has
-                // often already supplied the statement, so apply them to the
-                // existing row instead of letting them fall on the floor.
-                // Update-only: with no statement there is nothing to insert.
-                let answerOnly = 0;
-                const orphanedAnswers = [];
-                for (const key of Object.keys(answers)) {
-                    if (key in problems) continue;
-                    const answer = answers[key];
-                    if (answer == null || answer === "") continue;
-                    const n = ocrKeyToN(
-                        key,
-                        "answer",
-                        `${seriesFolder}/${testFolder}`,
-                    );
-                    if (n === null) continue;
-                    const problemId = upsertPdfAnswerOnly(
-                        db,
-                        {
-                            n,
-                            answer,
-                            source: `${seriesFolder}/${testFolder}`,
-                            is_computational: isComputational,
-                            ...coverageFor(key, n),
-                        },
-                        testId,
-                    );
-                    if (problemId == null) {
-                        orphanedAnswers.push(key);
-                        continue;
-                    }
-                    problemIdByN.set(n, problemId);
-                    answerOnly++;
-                }
-                if (answerOnly > 0) {
-                    console.warn(
-                        `  ${meta.name}: applied ${answerOnly} answer(s) with no OCR statement — problems.json is missing them, check the OCR`,
-                    );
-                }
-                if (orphanedAnswers.length > 0) {
-                    console.warn(
-                        `  ${meta.name}: dropped ${orphanedAnswers.length} answer(s) with no statement from any source (problems ${orphanedAnswers.join(", ")}) — re-run the OCR for this test`,
-                    );
-                }
-
-                // Attach OCR'd solutions to the problems just upserted. Keys are
-                // 1-based like problems; each value is an array of solution
-                // strings. Dedup (exact + near) is handled downstream by
-                // upsertSolutionCandidate / classifySolutions.
-                let solCount = 0;
-                for (const key of Object.keys(solutions)) {
-                    const n = ocrKeyToN(
-                        key,
-                        "solution",
-                        `${seriesFolder}/${testFolder}`,
-                    );
-                    if (n === null) continue;
-                    const problemId = problemIdByN.get(n);
-                    if (problemId == null) continue; // solution with no matching problem
-                    const list = solutions[key];
-                    if (!Array.isArray(list)) continue;
-                    for (const solStr of list) {
-                        if (typeof solStr !== "string" || !solStr.trim())
-                            continue;
-                        upsertSolutionCandidate(db, {
-                            problemId,
-                            source: "import",
-                            content: solStr,
-                            content_format: "markdown_latex",
-                            // Official contests auto-accept; others enter as
-                            // candidates for the classifier to score-gate.
-                            is_official: cfg.isOfficial,
-                            // sourceKey omitted -> getSourceKey falls back to
-                            // `import:<contentHash>`, deduping identical source
-                            // rows and making re-import idempotent.
-                        });
-                        solCount++;
-                    }
-                }
-
-                summary.problems += count;
-                summary.answersOnly += answerOnly;
-                summary.droppedAnswers += orphanedAnswers.length;
-                summary.solutions += solCount;
-                console.log(
-                    `  ${meta.name}: ${count} problems, ${solCount} solutions` +
-                        (answerOnly > 0 ? `, ${answerOnly} answers-only` : ""),
-                );
             }
         }
     })();
@@ -814,12 +716,276 @@ export function importPdfProblems(db, outDir, options = {}) {
     return summary;
 }
 
+// The identity slice: one OCR folder is one test, keeping the folder's own
+// 1-based problem numbering. Used for every series that does not define
+// `splitTests`.
+function wholeFolderGroup(meta) {
+    return { meta, offset: 0, owns: () => true, coverageForKey: null };
+}
+
+// Imports one test's worth of an OCR folder: the whole folder for most series,
+// one round of a bundled packet for a `splitTests` series. `group.owns(key)`
+// selects the OCR keys that belong to this test and `group.offset` shifts them
+// onto its own 0-based `n`, so a round that starts at the packet's problem 11
+// still stores its first problem as n = 0.
+//
+// Returns the counts the caller folds into the run summary.
+function importTestGroup(db, ctx) {
+    const {
+        cfg,
+        group,
+        where,
+        problems,
+        answers,
+        solutions,
+        profileFile,
+        coverageFile,
+        seriesId,
+        isComputational,
+    } = ctx;
+    const meta = group.meta;
+
+    const testId = upsertTest(
+        db,
+        {
+            aopsCategoryId: null,
+            name: meta.name,
+            section: meta.section ?? -1,
+            sectionName: meta.sectionName ?? null,
+            year: meta.year ?? null,
+            division: meta.division,
+            divisionOrder: meta.divisionOrder,
+            format: meta.format,
+            formatOrder: meta.formatOrder,
+            type: null,
+            isComputational,
+            // Only pass these when a profile was actually read — upsertTest keys
+            // off presence, so an absent profile must leave any existing value
+            // alone rather than asserting NULL over it.
+            ...(profileFile.state === "present" &&
+            profileFile.value.response_kind !== undefined
+                ? { responseKind: profileFile.value.response_kind }
+                : {}),
+            ...(profileFile.state === "present" &&
+            profileFile.value.answer_status !== undefined
+                ? { answerStatus: profileFile.value.answer_status }
+                : {}),
+            // Section structure is scraper-owned; PDF import must not rewrite
+            // section/section_name on an existing row.
+            updateSection: false,
+        },
+        seriesId,
+    );
+
+    // Resolve against state after the profile upsert. This matters when the
+    // current file is absent/invalid: its stored declaration remains
+    // authoritative for answer retraction.
+    const declaration = db
+        .query(`SELECT response_kind, answer_status FROM tests WHERE id = ?`)
+        .get(testId);
+    const existingCoverageByN = new Map(
+        db
+            .query(
+                `SELECT n, coverage_response_kind, coverage_answer_status
+                 FROM problems WHERE test_id = ? AND section = -1`,
+            )
+            .all(testId)
+            .map((row) => [row.n, row]),
+    );
+
+    // The OCR key -> this test's 0-based n. Non-numeric keys warn and drop.
+    const nFor = (key, kind) => {
+        const n = ocrKeyToN(key, kind, where);
+        return n === null ? null : n - group.offset;
+    };
+
+    // Coverage keys are the OCR's 1-based numbers, same as `problems`/`answers`,
+    // so they index by `key` not `n`.
+    const coverageFor = (key, n) => {
+        const existingCoverage = existingCoverageByN.get(n);
+        const snapshotEntry =
+            coverageFile.state === "present"
+                ? coverageFile.value[key]
+                : undefined;
+        const responseKind = coverageSnapshotField({
+            file: coverageFile,
+            entry: snapshotEntry,
+            field: "response_kind",
+            existingValue: existingCoverage?.coverage_response_kind,
+        });
+        const answerStatus = coverageSnapshotField({
+            file: coverageFile,
+            entry: snapshotEntry,
+            field: "answer_status",
+            existingValue: existingCoverage?.coverage_answer_status,
+        });
+        // A structural declaration (a FARML relay link, whose statement depends
+        // on the previous link's answer) is a property of the round, known from
+        // the problem's position in the packet. It applies only where the OCR
+        // folder's coverage file says nothing: that file is a claim about this
+        // specific problem and outranks a rule about its round.
+        const structural = group.coverageForKey?.(key) ?? null;
+        for (const [field, resolved] of [
+            ["response_kind", responseKind],
+            ["answer_status", answerStatus],
+        ]) {
+            if (resolved.value == null && structural?.[field] != null) {
+                resolved.value = structural[field];
+                resolved.update = true;
+            }
+        }
+        const resolvedCoverage = resolveCoverage({
+            overrideResponseKind: responseKind.value,
+            declarationResponseKind: declaration?.response_kind ?? null,
+            overrideAnswerStatus: answerStatus.value,
+            declarationAnswerStatus: declaration?.answer_status ?? null,
+            rawIsComputational: isComputational,
+        });
+        return {
+            // Stored on the override tier only: NULL here means no source named
+            // this problem, never "it inherited the test's declaration".
+            ...(responseKind.update
+                ? { coverage_response_kind: responseKind.value }
+                : {}),
+            ...(answerStatus.update
+                ? { coverage_answer_status: answerStatus.value }
+                : {}),
+            // Clearing a stale answer must follow the RESOLVED verdict, since
+            // the claim usually lives on the test row (a proof profile) rather
+            // than the override.
+            answerNotApplicable:
+                resolvedCoverage.answerStatus === "not_applicable",
+        };
+    };
+
+    let count = 0;
+    const problemIdByN = new Map(); // n -> problem id, for attaching solutions
+    for (const key of Object.keys(problems)) {
+        if (!group.owns(key)) continue;
+        const n = nFor(key, "problem");
+        if (n === null) continue;
+        const problemId = upsertPdfProblem(
+            db,
+            {
+                n,
+                statement: normalizePdfStatement(problems[key]),
+                answer: answers[key] ?? null,
+                source: where,
+                is_computational: isComputational,
+                ...coverageFor(key, n),
+            },
+            testId,
+        );
+        problemIdByN.set(n, problemId);
+        count++;
+    }
+
+    // An answer key covers the whole test, so it routinely names problems the
+    // OCR dropped a statement for. Those answers are still good, and another
+    // tier (usually an AoPS scrape) has often already supplied the statement, so
+    // apply them to the existing row instead of letting them fall on the floor.
+    // Update-only: with no statement there is nothing to insert.
+    let answerOnly = 0;
+    const orphanedAnswers = [];
+    for (const key of Object.keys(answers)) {
+        if (!group.owns(key)) continue;
+        if (key in problems) continue;
+        const answer = answers[key];
+        if (answer == null || answer === "") continue;
+        const n = nFor(key, "answer");
+        if (n === null) continue;
+        const problemId = upsertPdfAnswerOnly(
+            db,
+            {
+                n,
+                answer,
+                source: where,
+                is_computational: isComputational,
+                ...coverageFor(key, n),
+            },
+            testId,
+        );
+        if (problemId == null) {
+            orphanedAnswers.push(key);
+            continue;
+        }
+        problemIdByN.set(n, problemId);
+        answerOnly++;
+    }
+    if (answerOnly > 0) {
+        console.warn(
+            `  ${meta.name}: applied ${answerOnly} answer(s) with no OCR statement — problems.json is missing them, check the OCR`,
+        );
+    }
+    if (orphanedAnswers.length > 0) {
+        console.warn(
+            `  ${meta.name}: dropped ${orphanedAnswers.length} answer(s) with no statement from any source (problems ${orphanedAnswers.join(", ")}) — re-run the OCR for this test`,
+        );
+    }
+
+    // Attach OCR'd solutions to the problems just upserted. Keys are 1-based
+    // like problems; each value is an array of solution strings. Dedup (exact +
+    // near) is handled downstream by upsertSolutionCandidate / classifySolutions.
+    let solCount = 0;
+    for (const key of Object.keys(solutions)) {
+        if (!group.owns(key)) continue;
+        const n = nFor(key, "solution");
+        if (n === null) continue;
+        const problemId = problemIdByN.get(n);
+        if (problemId == null) continue; // solution with no matching problem
+        const list = solutions[key];
+        if (!Array.isArray(list)) continue;
+        for (const solStr of list) {
+            if (typeof solStr !== "string" || !solStr.trim()) continue;
+            upsertSolutionCandidate(db, {
+                problemId,
+                source: "import",
+                content: solStr,
+                content_format: "markdown_latex",
+                // Contests whose packet ships author-written solutions
+                // auto-accept; others enter as candidates for the classifier to
+                // score-gate. Defaults to the series' own official flag, which a
+                // series overrides where the two diverge (FARML: a mock contest,
+                // but its solutions are the author's).
+                is_official: cfg.solutionsOfficial ?? cfg.isOfficial,
+                // sourceKey omitted -> getSourceKey falls back to
+                // `import:<contentHash>`, deduping identical source rows and
+                // making re-import idempotent.
+            });
+            solCount++;
+        }
+    }
+
+    console.log(
+        `  ${meta.name}: ${count} problems, ${solCount} solutions` +
+            (answerOnly > 0 ? `, ${answerOnly} answers-only` : ""),
+    );
+
+    return {
+        problems: count,
+        answersOnly: answerOnly,
+        droppedAnswers: orphanedAnswers.length,
+        solutions: solCount,
+    };
+}
+
 // Resolve a comp-OCR duplicates.json member { test, problem } to an existing
 // problems.id. Returns null (no error) when the member's series/test/problem row
 // hasn't been imported yet — dup linking is additive and can run after imports.
 function resolveDuplicateMember(db, cfg, seriesIdCache, member) {
-    const meta = cfg.parseTest(member.test);
-    if (meta == null) return null;
+    const folderMeta = cfg.parseTest(member.test);
+    if (folderMeta == null) return null;
+    // A duplicates.json member names an OCR folder plus a problem number. For a
+    // series whose folder holds several rounds, the number is what picks the
+    // test, so route it through the same groups the import used — otherwise this
+    // resolves the folder-level name, which is not a row that exists.
+    const group = cfg.splitTests
+        ? cfg
+              .splitTests(member.test)
+              ?.find((g) => g.owns(String(member.problem)))
+        : wholeFolderGroup(folderMeta);
+    if (group == null) return null;
+    const meta = group.meta;
     const seriesName = meta.seriesName ?? cfg.seriesName;
     let seriesId = seriesIdCache.get(seriesName);
     if (seriesId === undefined) {
@@ -840,7 +1006,7 @@ function resolveDuplicateMember(db, cfg, seriesIdCache, member) {
     if (testId == null) return null;
     const n = ocrKeyToN(member.problem, "duplicate", member.test);
     if (n === null) return null;
-    return resolveProblemId(db, { testId, n });
+    return resolveProblemId(db, { testId, n: n - group.offset });
 }
 
 // Ingests comp-OCR `duplicates.json` files (out/<series>/duplicates.json) into

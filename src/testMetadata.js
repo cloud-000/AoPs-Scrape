@@ -290,6 +290,20 @@ const SMT_FORMATS = new Map([
     ["treelay", { label: "Tree Relay", order: 150 }],
 ]);
 
+// FARML events (the "which format" axis). FARML publishes one packet per year
+// holding every event, so unlike the other series these tokens are not folder
+// names — they are produced by the importer's problem-number router (see
+// FARML_ROUNDS in pdfImport.js). The two relay chains (R1/x, R2/x) are one
+// event administered twice, so they share the "Relay" label rather than
+// splitting a six-problem round across two tests. Every event is mixed-topic,
+// so none declares a subject.
+const FARML_FORMATS = new Map([
+    ["team", { label: "Team", order: 10 }],
+    ["individual", { label: "Individual", order: 20 }],
+    ["relay", { label: "Relay", order: 30 }],
+    ["tiebreaker", { label: "Tiebreaker", order: 40 }],
+]);
+
 export function emptyTestMetadata() {
     return {
         division: null,
@@ -518,6 +532,11 @@ export function chmmcFormatMetadata(token) {
     return fromEntry("format", CHMMC_FORMATS.get(token?.toLowerCase())) ?? {};
 }
 
+// FARML event is the "which format" axis. Returns only format fields.
+export function farmlFormatMetadata(token) {
+    return fromEntry("format", FARML_FORMATS.get(token?.toLowerCase())) ?? {};
+}
+
 // Mandelbrot division: "N"/"R" (individual National/Regional) or "team" (Team
 // Play). Returns the full base + division fields; the round is a separate format.
 export function mandelbrotDivisionMetadata(token) {
@@ -597,6 +616,7 @@ const FORMAT_REGISTRIES = [
     SMT_FORMATS,
     CMIMC_FORMATS,
     CHMMC_FORMATS,
+    FARML_FORMATS,
 ];
 
 // A round's declared subject is keyed by its *label*, not its token, because the
