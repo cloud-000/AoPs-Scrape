@@ -826,6 +826,60 @@ export class CleanupText {
         });
     }
 
+    // Some MCQs render every option inside one composite image / Asymptote
+    // program. There is then no standalone value that extractChoices can
+    // honestly split out, but the choices still have useful identities: their
+    // presentation letters. Return those letters without removing the visual
+    // from the statement.
+    //
+    // Explicit parenthesized labels inside the visual determine the count when
+    // available. A caller that already knows the problem is MCQ may supply a
+    // fallback count for image-only sources whose pixels (and therefore their
+    // labels) are opaque to the text parser. The prompt must still describe a
+    // visual selection, so an ordinary problem diagram is not mistaken for the
+    // answer choices.
+    static extractVisualChoiceLabels(input, { fallbackCount = null } = {}) {
+        if (typeof input !== "string" || !input) return [];
+
+        const hasVisualMedia =
+            /\[asy(?:=[^\]]*)?\]|\[img(?:=[^\]]*)?\]|<asy\b|<img\b|\bFile\s*:/i.test(
+                input,
+            );
+        if (!hasVisualMedia) return [];
+
+        const labels = new Set();
+        const styledLabel =
+            /\\(?:textbf|text|textrm|mathrm|mathbf|hbox)\s*\{\s*\(\s*([A-E])\s*\)/gi;
+        const asyLabel =
+            /\blabel\s*\([^\n;]{0,160}?["'][^"'\n]{0,80}?\(\s*([A-E])\s*\)/gi;
+        for (const pattern of [styledLabel, asyLabel]) {
+            for (const match of input.matchAll(pattern)) labels.add(match[1]);
+        }
+
+        let explicitCount = 0;
+        while (labels.has("ABCDE"[explicitCount])) explicitCount++;
+        if (explicitCount >= 3) {
+            return [..."ABCDE".slice(0, explicitCount)];
+        }
+
+        const asksForVisualChoice =
+            /\bwhich\b[^?\n]{0,180}\b(?:figure|figures|graph|graphs|histogram|histograms|diagram|diagrams|pattern|patterns|image|images|position|positions|sequence|sequences|shape|shapes|view|views|cylinder|cylinders|cone|cones)\b/i.test(
+                input,
+            ) ||
+            /\bwhat\s+is\b[^?\n]{0,100}\b(?:resulting|final)\s+(?:figure|graph|diagram|pattern|image|position|shape|view)\b/i.test(
+                input,
+            );
+        if (
+            asksForVisualChoice &&
+            Number.isInteger(fallbackCount) &&
+            fallbackCount >= 3 &&
+            fallbackCount <= 5
+        ) {
+            return [..."ABCDE".slice(0, fallbackCount)];
+        }
+        return [];
+    }
+
     // Once a choice block is found, remove presentation tokens that opened the
     // block immediately before its (A) marker. Slicing at the marker alone
     // strands prefixes such as `\[`, `${{`, `$\displaystyle`, or

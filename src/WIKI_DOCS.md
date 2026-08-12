@@ -347,10 +347,11 @@ Problems are built with the shared `makeProblem()` factory (exported from
 2. Statement = the `== Problem ==` section (or the lead). `CleanupText.normalizeWikiMath`
    converts `<math>…</math>`/`<cmath>…</cmath>` to `$…$`/`$$…$$` so the forum-oriented
    `extractChoices` / `cleanChoices` / `getBoxed` apply unchanged.
-3. MCQ (`choices` true): `extractChoices` pulls current `\textbf{(A)}…` options and
+3. MCQ (`choices` true): `extractChoices` pulls current `\textbf{(A)}…` options,
    historical `\text{(A)}`, `\mathrm{(A)}`, `\textrm{(A)}`, `(\mathrm{A})`, and
-   malformed `\textbf{A}`
-   variants; `cleanChoices` removes them from the statement; the answer is picked by
+   malformed `\textbf{A}` variants; `cleanChoices` removes them from the statement.
+   `extractVisualChoiceLabels` instead represents composite image/Asymptote-only
+   options as `A`–`E` while retaining that visual in the problem statement. The answer is picked by
    `CleanupText.selectBoxedAnswer`
    across **all** solution sections (not just the first box), which for MCQ keeps only a box
    that is a valid choice and prefers a sole/last box over an intermediate one, then mapped to

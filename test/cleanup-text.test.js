@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { CleanupText } from "../src/CleanupText.js";
+import { ForumSession, makeProblem } from "../src/ForumSession.js";
 import { WikiSession } from "../src/WikiSession.js";
 
 describe("answer-choice extraction", () => {
@@ -108,6 +109,63 @@ draw((0,0)--(3,3));
         expect(choices).toHaveLength(3);
         expect(choices.every((choice) => choice.endsWith("[/asy]"))).toBe(true);
         expect(choices[0]).toContain('label("}", (0,0));');
+    });
+
+    test("synthesizes letter identities for one composite visual-choice block", () => {
+        const source = String.raw`Which graph is correct?
+[asy=https://example.test/choices.png]
+label("$\textbf{(A)}$", (0,0));
+label("$\textbf{(B)}$", (1,0));
+label("$\textbf{(C)}$", (2,0));
+label("$\textbf{(D)}$", (3,0));
+label("$\textbf{(E)}$", (4,0));
+[/asy]`;
+
+        expect(CleanupText.extractChoices(source)).toEqual([]);
+        expect(CleanupText.extractVisualChoiceLabels(source)).toEqual([
+            "A",
+            "B",
+            "C",
+            "D",
+            "E",
+        ]);
+    });
+
+    test("uses a known MCQ count only for a visual-selection prompt", () => {
+        expect(
+            CleanupText.extractVisualChoiceLabels(
+                "Which histogram displays the data? [img]choices.png[/img]",
+                { fallbackCount: 5 },
+            ),
+        ).toEqual(["A", "B", "C", "D", "E"]);
+        expect(
+            CleanupText.extractVisualChoiceLabels(
+                "What is the area of the shaded figure? [asy]draw(unitsquare);[/asy]",
+                { fallbackCount: 5 },
+            ),
+        ).toEqual([]);
+    });
+
+    test("keeps a composite visual in the statement when resolving its answer", () => {
+        const statement = String.raw`Which graph is correct?
+[asy]
+label("(A)", (0,0)); label("(B)", (1,0)); label("(C)", (2,0));
+label("(D)", (3,0)); label("(E)", (4,0));
+[/asy]`;
+        const problem = makeProblem({
+            statement,
+            n: 0,
+            _answerPosts: [String.raw`\boxed{D}`],
+        });
+        const session = new ForumSession(false, null, null);
+        session.debug = false;
+
+        session._resolveProblemAnswer(problem, "mcq");
+
+        expect(problem.choices).toEqual(["A", "B", "C", "D", "E"]);
+        expect(problem.answerIndex).toBe(3);
+        expect(problem.answerValue).toBe("D");
+        expect(problem.statement).toBe(statement);
     });
 
     test("extracts malformed labels from a display choice table", () => {
@@ -387,5 +445,37 @@ The answer is <math>\boxed{A}</math>.`;
             "[asy]draw((0,0)--(3,0));[/asy]",
         ]);
         expect(problem.statement).toBe("Which diagram?");
+    });
+
+    test("keeps a composite wiki choice visual and synthesizes A-E", async () => {
+        const raw = String.raw`==Problem==
+Which graph is correct?
+<asy>
+label("$\textbf{(A)}$", (0,0));
+label("$\textbf{(B)}$", (1,0));
+label("$\textbf{(C)}$", (2,0));
+label("$\textbf{(D)}$", (3,0));
+label("$\textbf{(E)}$", (4,0));
+</asy>
+==Solution==
+The answer is <math>\boxed{C}</math>.`;
+        class FixtureWikiSession extends WikiSession {
+            async parse(_page, { wikitext = false } = {}) {
+                if (wikitext) return raw;
+                throw new Error("render unavailable");
+            }
+        }
+
+        const problem = await new FixtureWikiSession(
+            true,
+            1,
+            "fixture",
+        ).getProblemPage("Fixture Problems/Problem 1");
+
+        expect(problem.choices).toEqual(["A", "B", "C", "D", "E"]);
+        expect(problem.answerIndex).toBe(2);
+        expect(problem.answerValue).toBe("C");
+        expect(problem.statement).toContain("[asy]");
+        expect(problem.statement).toContain(String.raw`\textbf{(E)}`);
     });
 });

@@ -986,7 +986,11 @@ export class ForumSession {
 
       // Detect MCQ-ness structurally, independent of the (possibly wrong) prior.
       for (const p of all) {
-         p._hasChoices = CleanupText.extractChoices(p.statement).length >= 3;
+         const extracted = CleanupText.extractChoices(p.statement);
+         const visual = CleanupText.extractVisualChoiceLabels(p.statement, {
+            fallbackCount: type.answerKind === "mcq" ? 5 : null,
+         });
+         p._hasChoices = extracted.length >= 3 || visual.length >= 3;
       }
       const mcqCount = all.filter((p) => p._hasChoices).length;
       const otherCount = all.length - mcqCount;
@@ -1013,8 +1017,25 @@ export class ForumSession {
    _resolveProblemAnswer(problem, kind) {
       const posts = problem._answerPosts ?? [];
       if (kind === "mcq") {
-         problem.choices = CleanupText.extractChoices(problem.statement);
-         problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+         const extracted = CleanupText.extractChoices(problem.statement);
+         const hasChoiceValues =
+            extracted.length >= 3 &&
+            extracted.every((choice) => String(choice ?? "").trim() !== "");
+         const visualChoices = hasChoiceValues
+            ? []
+            : CleanupText.extractVisualChoiceLabels(problem.statement, {
+                 fallbackCount:
+                    extracted.length >= 3 && extracted.length <= 5
+                       ? extracted.length
+                       : 5,
+              });
+         const visualOnly = visualChoices.length >= 3;
+         problem.choices = visualOnly ? visualChoices : extracted;
+         // A composite choice visual is part of the usable statement. It must
+         // not be removed merely because its A-E identities were synthesized.
+         if (!visualOnly) {
+            problem.statement = CleanupText.cleanChoices(problem.statement).trim();
+         }
          if (problem.choices.length < 3) {
             this.log(
                `  ⚠️  Problem ${problem.n + 1}: test resolved as MCQ but only ${problem.choices.length} choice(s) were extractable`,

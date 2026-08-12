@@ -357,6 +357,18 @@ label("$\textbf{(E)}$", (4,0));
         expect(visualReport.summary.auditedByEntity.answer_choice).toBe(5);
 
         db.run(
+            "UPDATE problems SET aops_choices = ? WHERE id = 1",
+            [JSON.stringify(["", "", "", "", "none of these"])],
+        );
+        const partialVisualReport = auditDatabase(db, {
+            entities: new Set(["choices"]),
+            sources: new Set(["aops"]),
+        });
+        expect(ruleIds(partialVisualReport.findings)).toEqual([
+            "choice.visual_only",
+        ]);
+
+        db.run(
             "UPDATE problems SET aops_statement = ?, aops_choices = ? WHERE id = 1",
             [
                 "What is the area of the shaded figure? [asy]draw(unitsquare);[/asy]",

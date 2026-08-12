@@ -207,7 +207,22 @@ export class WikiSession {
         let choiceList = null;
         if (computational && choices) {
             const extracted = CleanupText.extractChoices(statementSrc);
-            if (extracted.length >= 3) {
+            const hasChoiceValues =
+                extracted.length >= 3 &&
+                extracted.every((choice) => String(choice ?? "").trim() !== "");
+            const visualChoices = hasChoiceValues
+                ? []
+                : CleanupText.extractVisualChoiceLabels(statementSrc, {
+                      fallbackCount:
+                          extracted.length >= 3 && extracted.length <= 5
+                              ? extracted.length
+                              : 5,
+                  });
+            if (visualChoices.length >= 3) {
+                // Keep the composite visual in the statement and expose only
+                // its A-E identities as the machine-readable choice values.
+                choiceList = visualChoices;
+            } else if (extracted.length >= 3) {
                 choiceList = extracted;
                 statementSrc = CleanupText.cleanChoices(statementSrc);
             } else {

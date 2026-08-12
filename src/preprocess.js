@@ -99,10 +99,14 @@ function refreshChoices(db) {
     console.log("Step 2: Re-extracting MCQ choices / cleaning statements...");
     const problems = db
         .query(
-            `SELECT id, verified, pdf_statement,
-                    wiki_statement, wiki_choices, wiki_answer_index, wiki_answer,
-                    aops_statement, aops_choices, aops_answer_index, aops_answer
+            `SELECT problems.id, problems.verified, problems.pdf_statement,
+                    problems.wiki_statement, problems.wiki_choices,
+                    problems.wiki_answer_index, problems.wiki_answer,
+                    problems.aops_statement, problems.aops_choices,
+                    problems.aops_answer_index, problems.aops_answer,
+                    t.response_kind AS test_response_kind
              FROM problems
+             JOIN tests t ON t.id = problems.test_id
              WHERE wiki_statement IS NOT NULL OR aops_statement IS NOT NULL`,
         )
         .all();
@@ -131,6 +135,7 @@ function refreshChoices(db) {
         answerIndex,
         answer,
         cleanStatement = (value) => value,
+        testResponseKind = null,
     ) => {
         if (statement == null) {
             return { statement, choicesJson, answerIndex, changed: false };
@@ -142,10 +147,29 @@ function refreshChoices(db) {
         // or left spacing macros in an otherwise complete array. Prefer a newly
         // recovered sequence when it is at least as complete; otherwise keep
         // stored choices when the already-cleaned statement no longer has them.
-        const choices =
+        const candidate =
             extracted.length >= (stored?.length ?? 0) && extracted.length > 0
                 ? extracted
                 : stored;
+        const hasChoiceValues =
+            Array.isArray(candidate) &&
+            candidate.length >= 3 &&
+            candidate.every((choice) => String(choice ?? "").trim() !== "");
+        const fallbackCount =
+            Array.isArray(candidate) &&
+            candidate.length >= 3 &&
+            candidate.length <= 5
+                ? candidate.length
+                : testResponseKind === "mcq" || choicesJson != null
+                  ? 5
+                  : null;
+        const visualChoices = hasChoiceValues
+            ? []
+            : CleanupText.extractVisualChoiceLabels(normalizedStatement, {
+                  fallbackCount,
+              });
+        const visualOnly = visualChoices.length >= 3;
+        const choices = visualOnly ? visualChoices : candidate;
         if (!choices?.length) {
             return {
                 statement: normalizedStatement,
@@ -154,10 +178,9 @@ function refreshChoices(db) {
                 changed: normalizedStatement !== statement,
             };
         }
-        const cleaned = CleanupText.cleanChoices(
-            normalizedStatement,
-            choices,
-        ).trim();
+        const cleaned = visualOnly
+            ? normalizedStatement.trim()
+            : CleanupText.cleanChoices(normalizedStatement, choices).trim();
         const resolvedIndex = CleanupText.choiceIndexOfAnswer(answer, choices);
         const nextIndex = resolvedIndex >= 0 ? resolvedIndex : (answerIndex ?? -1);
         const nextChoicesJson = JSON.stringify(choices);
@@ -179,6 +202,8 @@ function refreshChoices(db) {
                 p.wiki_choices,
                 p.wiki_answer_index,
                 p.wiki_answer,
+                (value) => value,
+                p.test_response_kind,
             );
             const aops = refreshTier(
                 p.aops_statement,
@@ -186,6 +211,7 @@ function refreshChoices(db) {
                 p.aops_answer_index,
                 p.aops_answer,
                 CleanupText.cleanProblem,
+                p.test_response_kind,
             );
             if (!wiki.changed && !aops.changed) continue;
 

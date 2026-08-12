@@ -883,21 +883,10 @@ function addDirectFinding(state, text, base, ruleId, severity, message, offset =
 // visual media plus either explicit A-E presentation labels or a question that
 // specifically asks the reader to select a visual object.
 function hasVisualOnlyChoices(statement) {
-    if (typeof statement !== "string") return false;
-    const hasVisualMedia =
-        /\[(?:asy(?:=[^\]]*)?|img)\]|<asy\b|\bFile:/i.test(statement);
-    if (!hasVisualMedia) return false;
-
-    const labels = new Set();
-    const labelPattern =
-        /\\(?:textbf|text|textrm|mathrm|mathbf|hbox)\s*\{\s*\(\s*([A-E])\s*\)|label\s*\(\s*["']\$?(?:\\textbf\s*\{)?\s*\(\s*([A-E])\s*\)/gi;
-    for (const match of statement.matchAll(labelPattern)) {
-        labels.add(match[1] ?? match[2]);
-    }
-    if (labels.size >= 4) return true;
-
-    return /\bwhich\b[^?\n]{0,160}\b(?:figure|figures|graph|graphs|histogram|histograms|diagram|diagrams|pattern|patterns|image|images|position|positions|sequence|sequences|shape|shapes|view|views|cylinder|cylinders|cone|cones)\b/i.test(
-        statement,
+    return (
+        CleanupText.extractVisualChoiceLabels(statement, {
+            fallbackCount: 5,
+        }).length >= 3
     );
 }
 
@@ -966,14 +955,14 @@ function auditChoiceTier(state, row, source, statement, choicesJson, answerIndex
         return;
     }
 
-    const allChoicesEmpty =
+    const hasEmptyChoice =
         choices.length >= 3 &&
-        choices.every((choice) => String(choice ?? "").trim() === "");
+        choices.some((choice) => String(choice ?? "").trim() === "");
     if (
-        (choices.length === 0 || allChoicesEmpty) &&
+        (choices.length === 0 || hasEmptyChoice) &&
         hasVisualOnlyChoices(statement)
     ) {
-        // Preserve audited-unit counts for an existing all-empty A-E array,
+        // Preserve audited-unit counts for an existing incomplete A-E array,
         // while reporting the condition once at the collection level.
         choices.forEach((_, choiceIndex) => {
             addAuditedText(
@@ -989,7 +978,7 @@ function auditChoiceTier(state, row, source, statement, choicesJson, answerIndex
             collectionBase,
             "choice.visual_only",
             "warning",
-            "Answer choices are presented only as a composite visual; no deterministic per-choice values were extracted.",
+            "Answer choices are presented only as a composite visual; run preprocess to store A-E choice identities while retaining the visual.",
         );
         return;
     }
