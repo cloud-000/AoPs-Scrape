@@ -259,7 +259,9 @@ Heuristically maps a category/test name to a contest type from `TYPES`.
 
 The single low-level fetch call. Adds auth fields, applies the random delay, posts to `ajax.php`, and returns parsed JSON. Retries up to 3 times on Cloudflare challenge pages (with exponential backoff) and on JSON parse failures.
 
-If `session.cache` is set (a `ResponseCache` instance, see `src/ResponseCache.js`), `sendRequest` first checks the cache: on a hit it returns the cached response immediately, skipping the network call and the request delay entirely. On a miss it performs the fetch as normal and writes the parsed response to the cache before returning. Cache keys are derived deterministically from `bodyInput` (the payload, which excludes user-specific auth fields), so cached responses are user-independent. The cache is opt-in via the "Use response cache?" prompt in the `scrape` command and stored as plain JSON files under `./response_cache`.
+If `session.cache` is set (a `ResponseCache` instance, see `src/ResponseCache.js`), `sendRequest` checks it only when that instance's read-through behavior is enabled: on a hit it returns the archived response immediately, skipping the network call and request delay. Cache keys are derived deterministically from `bodyInput` (the payload, which excludes user-specific auth fields), so archived responses are user-independent. The CLI always installs a response-cache instance for forum scrapes. `--cache` (or the prompt) enables read-through reuse; `--no-cache` forces fresh network reads.
+
+Successful `fetch_topic` network responses are write-through archived under `./response_cache` regardless of the read-through setting, because they are the durable source corpus for LLM review. Each `topic_<id>.json` has a `topic_<id>.meta.json` sidecar containing its SHA-256 content hash and fetch timestamp, and writes use an atomic rename. Other response types are written only when read-through caching is enabled. No authentication fields or headers enter these files.
 
 **Input:**
 

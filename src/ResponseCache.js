@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync } from "fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "path";
 
 /**
@@ -10,8 +11,9 @@ import { join } from "path";
  * inspectable and reusable across runs.
  */
 export class ResponseCache {
-    constructor(cacheDir = "./response_cache") {
+    constructor(cacheDir = "./response_cache", { readEnabled = true } = {}) {
         this.cacheDir = cacheDir;
+        this.readEnabled = readEnabled;
         if (!existsSync(this.cacheDir)) {
             mkdirSync(this.cacheDir, { recursive: true });
         }
@@ -54,6 +56,19 @@ export class ResponseCache {
         return join(this.cacheDir, this._key(bodyInput));
     }
 
+    _isTopic(bodyInput) {
+        const action = Array.isArray(bodyInput.a) ? bodyInput.a[0] : bodyInput.a;
+        return action === "fetch_topic";
+    }
+
+    _metadataPath(bodyInput) {
+        return this._path(bodyInput).replace(/\.json$/, ".meta.json");
+    }
+
+    canRead(bodyInput) {
+        return this.readEnabled && this.has(bodyInput);
+    }
+
     has(bodyInput) {
         return existsSync(this._path(bodyInput));
     }
@@ -62,7 +77,37 @@ export class ResponseCache {
         return await Bun.file(this._path(bodyInput)).json();
     }
 
-    async set(bodyInput, data) {
-        await Bun.write(this._path(bodyInput), JSON.stringify(data));
+    async set(bodyInput, data, { fetchedAt = new Date().toISOString() } = {}) {
+        // Topic responses are the durable LLM corpus and are always archived.
+        // Other response types remain an opt-in performance cache.
+        if (!this.readEnabled && !this._isTopic(bodyInput)) return false;
+
+        const json = JSON.stringify(data);
+        const path = this._path(bodyInput);
+        const tempPath = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        await Bun.write(tempPath, json);
+        renameSync(tempPath, path);
+
+        if (this._isTopic(bodyInput)) {
+            const metadata = {
+                content_hash: createHash("sha256").update(json).digest("hex"),
+                fetched_at: fetchedAt,
+            };
+            const metadataPath = this._metadataPath(bodyInput);
+            const metadataTemp = `${metadataPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+            await Bun.write(metadataTemp, JSON.stringify(metadata, null, 2));
+            renameSync(metadataTemp, metadataPath);
+        }
+        return true;
+    }
+
+    async getTopic(topicId) {
+        const payload = { a: "fetch_topic", topic_id: topicId };
+        if (!this.has(payload)) return null;
+        const response = await this.get(payload);
+        let metadata = null;
+        const metadataPath = this._metadataPath(payload);
+        if (existsSync(metadataPath)) metadata = await Bun.file(metadataPath).json();
+        return { response, metadata };
     }
 }

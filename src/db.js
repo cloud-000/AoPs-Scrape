@@ -211,6 +211,60 @@ CREATE INDEX IF NOT EXISTS idx_solution_sources_solution
 CREATE INDEX IF NOT EXISTS idx_solution_sources_aops_post
   ON solution_sources (aops_post_id) WHERE aops_post_id IS NOT NULL;
 
+-- LLM output is review state, not a source tier. The immutable proposal keeps
+-- the grounded model interpretation; accepted values are promoted through the
+-- normal solution tables and linked back by llm_materializations.
+CREATE TABLE IF NOT EXISTS llm_proposals (
+  id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+  problem_id                INTEGER NOT NULL REFERENCES problems(id),
+  operation                 TEXT NOT NULL,
+  operation_version         TEXT NOT NULL,
+  request_key               TEXT NOT NULL,
+  source_kind               TEXT NOT NULL,
+  source_key                TEXT NOT NULL,
+  source_content_hash       TEXT NOT NULL,
+  result_index              INTEGER NOT NULL DEFAULT 0,
+  proposal_json             TEXT NOT NULL,
+  validation_json           TEXT NOT NULL,
+  reviewer_approved_value   TEXT,
+  review_status             TEXT NOT NULL DEFAULT 'candidate'
+                                CHECK (review_status IN ('candidate', 'needs_review', 'accepted', 'rejected')),
+  currency_status           TEXT NOT NULL DEFAULT 'current'
+                                CHECK (currency_status IN ('current', 'stale', 'superseded')),
+  superseded_by_proposal_id INTEGER REFERENCES llm_proposals(id),
+  status_source             TEXT NOT NULL DEFAULT 'auto'
+                                CHECK (status_source IN ('auto', 'manual')),
+  reviewed_by               TEXT,
+  reviewed_at               TEXT,
+  review_notes              TEXT,
+  created_at                TEXT DEFAULT (datetime('now')),
+  updated_at                TEXT DEFAULT (datetime('now')),
+  UNIQUE(problem_id, operation, operation_version, request_key, result_index)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_proposals_request_key
+  ON llm_proposals (request_key);
+CREATE INDEX IF NOT EXISTS idx_llm_proposals_review_currency
+  ON llm_proposals (review_status, currency_status);
+CREATE INDEX IF NOT EXISTS idx_llm_proposals_problem_operation
+  ON llm_proposals (problem_id, operation);
+CREATE INDEX IF NOT EXISTS idx_llm_proposals_source
+  ON llm_proposals (source_kind, source_key);
+
+CREATE TABLE IF NOT EXISTS llm_materializations (
+  id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+  proposal_id                INTEGER NOT NULL UNIQUE REFERENCES llm_proposals(id),
+  request_key                TEXT NOT NULL,
+  method                     TEXT NOT NULL,
+  entity_type                TEXT NOT NULL,
+  entity_id                  INTEGER NOT NULL,
+  materialized_value_hash    TEXT NOT NULL,
+  materialization_version    TEXT NOT NULL,
+  created_at                 TEXT DEFAULT (datetime('now')),
+  UNIQUE(entity_type, entity_id, proposal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_materializations_entity
+  ON llm_materializations (entity_type, entity_id);
+
 CREATE TABLE IF NOT EXISTS oly_potential_solutions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   problem_id  INTEGER NOT NULL REFERENCES problems(id) UNIQUE,
@@ -321,11 +375,11 @@ CREATE TABLE IF NOT EXISTS production_problems (
 const SOLUTION_CLASSIFIER_VERSION = "solution-classifier-v1";
 const KNOWN_SOLUTION_USER_IDS = new Set((SOLUTIONS_USERS ?? []).map((u) => u.id));
 
-function hashText(text) {
+export function hashText(text) {
     return createHash("sha256").update(text ?? "").digest("hex");
 }
 
-function normalizeSolutionContent(content) {
+export function normalizeSolutionContent(content) {
     return String(content ?? "")
         .replace(/\r\n/g, "\n")
         .replace(/\[hide(?:=[^\]]*)?\]/gi, "")
@@ -639,6 +693,227 @@ export function upsertSolutionCandidate(db, input) {
     }
 
     return solution.id;
+}
+
+export function createLLMProposal(db, input) {
+    return db.transaction(() => {
+        const existing = db
+            .query(
+                `SELECT * FROM llm_proposals
+                 WHERE problem_id = ? AND operation = ? AND operation_version = ?
+                   AND request_key = ? AND result_index = ?`,
+            )
+            .get(
+                input.problemId,
+                input.operation,
+                input.operationVersion,
+                input.requestKey,
+                input.resultIndex ?? 0,
+            );
+        if (existing) return existing;
+
+        db.run(
+            `INSERT INTO llm_proposals (
+                problem_id, operation, operation_version, request_key,
+                source_kind, source_key, source_content_hash, result_index,
+                proposal_json, validation_json, review_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                input.problemId,
+                input.operation,
+                input.operationVersion,
+                input.requestKey,
+                input.sourceKind,
+                input.sourceKey,
+                input.sourceContentHash,
+                input.resultIndex ?? 0,
+                JSON.stringify(input.proposal),
+                JSON.stringify(input.validation),
+                input.reviewStatus ?? "needs_review",
+            ],
+        );
+        const proposal = db
+            .query(`SELECT * FROM llm_proposals WHERE rowid = last_insert_rowid()`)
+            .get();
+
+        // Freshness is separate from review. Historical manual decisions remain
+        // intact, while earlier automatic candidates are explicitly superseded.
+        db.run(
+            `UPDATE llm_proposals SET
+                currency_status = CASE
+                    WHEN status_source = 'manual' THEN 'stale'
+                    ELSE 'superseded'
+                END,
+                superseded_by_proposal_id = CASE
+                    WHEN status_source = 'manual' THEN superseded_by_proposal_id
+                    ELSE ?
+                END,
+                updated_at = datetime('now')
+             WHERE problem_id = ? AND operation = ?
+               AND source_kind = ? AND source_key = ?
+               AND id <> ? AND currency_status = 'current'`,
+            [
+                proposal.id,
+                input.problemId,
+                input.operation,
+                input.sourceKind,
+                input.sourceKey,
+                proposal.id,
+            ],
+        );
+        return proposal;
+    })();
+}
+
+export function rejectLLMProposal(
+    db,
+    proposalId,
+    { reviewer = "cli", notes = null } = {},
+) {
+    return db.transaction(() => {
+        const proposal = db
+            .query(`SELECT * FROM llm_proposals WHERE id = ?`)
+            .get(proposalId);
+        if (!proposal) throw new Error(`LLM proposal ${proposalId} does not exist`);
+        if (proposal.review_status === "accepted") {
+            throw new Error(`Accepted proposal ${proposalId} cannot be rejected`);
+        }
+        db.run(
+            `UPDATE llm_proposals SET
+                review_status = 'rejected', status_source = 'manual',
+                reviewed_by = COALESCE(reviewed_by, ?),
+                reviewed_at = COALESCE(reviewed_at, datetime('now')),
+                review_notes = COALESCE(?, review_notes),
+                updated_at = datetime('now')
+             WHERE id = ?`,
+            [reviewer, notes, proposalId],
+        );
+        return db.query(`SELECT * FROM llm_proposals WHERE id = ?`).get(proposalId);
+    })();
+}
+
+export function acceptLLMProposal(
+    db,
+    proposalId,
+    { approvedValue = null, reviewer = "cli", notes = null } = {},
+) {
+    return db.transaction(() => {
+        const already = db
+            .query(`SELECT * FROM llm_materializations WHERE proposal_id = ?`)
+            .get(proposalId);
+        if (already) return already;
+
+        const proposalRow = db
+            .query(`SELECT * FROM llm_proposals WHERE id = ?`)
+            .get(proposalId);
+        if (!proposalRow) throw new Error(`LLM proposal ${proposalId} does not exist`);
+        if (proposalRow.operation !== "extract_solution_from_post") {
+            throw new Error(`Unsupported materialization operation: ${proposalRow.operation}`);
+        }
+        if (proposalRow.currency_status !== "current") {
+            throw new Error(`Proposal ${proposalId} is ${proposalRow.currency_status}, not current`);
+        }
+        if (proposalRow.review_status === "rejected") {
+            throw new Error(`Rejected proposal ${proposalId} cannot be accepted`);
+        }
+
+        const proposal = JSON.parse(proposalRow.proposal_json);
+        const content = String(approvedValue ?? proposal.extracted_content ?? "").trim();
+        if (!content) throw new Error(`Proposal ${proposalId} has no materializable solution`);
+        const source = proposal.source ?? {};
+        const postId = source.post_id;
+        if (postId == null) throw new Error(`Proposal ${proposalId} has no AoPS post id`);
+        const sourceKey = `post:${postId}`;
+
+        const attached = db
+            .query(
+                `SELECT ss.solution_id, s.status_source
+                 FROM solution_sources ss
+                 JOIN solutions s ON s.id = ss.solution_id
+                 WHERE ss.problem_id = ? AND ss.source = 'aops' AND ss.source_key = ?`,
+            )
+            .get(proposalRow.problem_id, sourceKey);
+        const normalizedHash = hashText(normalizeSolutionContent(content));
+        const target = db
+            .query(`SELECT id FROM solutions WHERE problem_id = ? AND normalized_hash = ?`)
+            .get(proposalRow.problem_id, normalizedHash);
+        if (
+            attached &&
+            attached.status_source === "manual" &&
+            attached.solution_id !== target?.id
+        ) {
+            throw new Error(
+                `AoPS source ${sourceKey} is attached to a manually reviewed solution`,
+            );
+        }
+
+        const oldSolutionId = attached?.solution_id ?? null;
+        const solutionId = upsertSolutionCandidate(db, {
+            problemId: proposalRow.problem_id,
+            source: "aops",
+            sourceKey,
+            content,
+            content_format: "latex_bbcode",
+            raw_content: source.raw_content,
+            source_url: source.source_url,
+            aops_topic_id: source.topic_id,
+            aops_post_id: postId,
+            aops_user_id: source.user_id,
+            aops_username: source.username,
+            posted_at: source.posted_at,
+            is_official: false,
+            status: "accepted",
+            status_source: "manual",
+        });
+        db.run(
+            `UPDATE solutions SET
+                content = ?, status = 'accepted', status_source = 'manual',
+                solution_type = ?, reviewed_by = ?, reviewed_at = datetime('now'),
+                review_notes = ?, duplicate_of_solution_id = NULL,
+                updated_at = datetime('now')
+             WHERE id = ?`,
+            [
+                content,
+                proposal.classification === "full_solution" ? "full" : "sketch",
+                reviewer,
+                notes,
+                solutionId,
+            ],
+        );
+        db.run(
+            `UPDATE solution_sources SET source_content_hash = ?, raw_content = ?
+             WHERE problem_id = ? AND source = 'aops' AND source_key = ?`,
+            [
+                proposalRow.source_content_hash,
+                source.raw_content,
+                proposalRow.problem_id,
+                sourceKey,
+            ],
+        );
+        if (oldSolutionId && oldSolutionId !== solutionId) {
+            markOrphanedAutoSolutionSuperseded(db, oldSolutionId);
+        }
+
+        const materializedHash = hashText(content);
+        db.run(
+            `INSERT INTO llm_materializations (
+                proposal_id, request_key, method, entity_type, entity_id,
+                materialized_value_hash, materialization_version
+             ) VALUES (?, ?, 'llm_extract', 'solution', ?, ?, '1')`,
+            [proposalId, proposalRow.request_key, solutionId, materializedHash],
+        );
+        db.run(
+            `UPDATE llm_proposals SET
+                reviewer_approved_value = ?, review_status = 'accepted',
+                status_source = 'manual', reviewed_by = ?, reviewed_at = datetime('now'),
+                review_notes = ?, updated_at = datetime('now')
+             WHERE id = ?`,
+            [content, reviewer, notes, proposalId],
+        );
+        return db
+            .query(`SELECT * FROM llm_materializations WHERE proposal_id = ?`)
+            .get(proposalId);
+    })();
 }
 
 export function classifySolutions(

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { confirm, select, search, checkbox, input } from "@inquirer/prompts";
-import { ENV, PDF_DATA_DIR } from "../.env.js";
+import * as ENV_CONFIG from "../.env.js";
 import { ApiMethod, ForumSession } from "../src/ForumSession.js";
 import { WikiSession } from "../src/WikiSession.js";
 import { ResponseCache } from "../src/ResponseCache.js";
@@ -19,6 +19,9 @@ import {
     exportRatingSeedsSQL,
 } from "../src/export.js";
 import { unlinkSync, existsSync } from "node:fs";
+
+const { ENV, PDF_DATA_DIR, MODEL_URL, MODEL_ID, MODEL_REVISION, MODEL_API_KEY } =
+    ENV_CONFIG;
 
 const DB_PATH = process.env.AOPS_DB_PATH ?? "./aops_problems.sqlite";
 
@@ -87,16 +90,22 @@ async function main() {
             session.enableStickyAnswerKey = true;
 
             let method = await getMethod(selectedContest);
-            if (
+            const useResponseCache =
                 hasArgFlag("cache") ||
                 (!hasArgFlag("no-cache") &&
                     (await promptConfirm({
                         message: "Use response cache?",
                         default: false,
-                    })))
-            ) {
-                session.cache = new ResponseCache("./response_cache");
+                    })));
+            session.cache = new ResponseCache("./response_cache", {
+                readEnabled: useResponseCache,
+            });
+            if (useResponseCache) {
                 console.log("Response cache enabled (./response_cache)");
+            } else {
+                console.log(
+                    "Response cache reads disabled; successful topic responses will still be archived.",
+                );
             }
             if (!(await promptConfirm({ message: `Confirm ${id}?` }))) {
                 console.log("Exiting");
@@ -441,6 +450,97 @@ async function main() {
             break;
         }
 
+        case "llm": {
+            const action = process.argv[3] ?? "plan";
+            const operation = getArgFlag("operation") ?? "extract_solution_from_post";
+            if (operation !== "extract_solution_from_post") {
+                throw new Error(`Unsupported first-slice LLM operation: ${operation}`);
+            }
+            const { OpenAICompatibleClient } = await import("../src/llm/client.js");
+            const {
+                listLLMProposals,
+                planLLMExtraction,
+                runLLMExtraction,
+                showLLMProposal,
+            } = await import("../src/llm/service.js");
+            const { acceptLLMProposal, rejectLLMProposal } = await import("../src/db.js");
+            const modelId = process.env.MODEL_ID ?? MODEL_ID;
+            const modelRevision = process.env.MODEL_REVISION ?? MODEL_REVISION ?? null;
+            const cachePath = process.env.LLM_CACHE_PATH ?? "./llm_cache.sqlite";
+            const limitFlag = getArgFlag("limit");
+            const options = {
+                cachePath,
+                responseCacheDir: process.env.RESPONSE_CACHE_DIR ?? "./response_cache",
+                modelId,
+                modelRevision,
+                maxTokens: Number(getArgFlag("max-tokens") ?? process.env.LLM_MAX_TOKENS ?? 32),
+                maxInputChars: Number(
+                    getArgFlag("max-input-chars") ?? process.env.LLM_MAX_INPUT_CHARS ?? 30000,
+                ),
+                seed: getArgFlag("seed") == null ? null : Number(getArgFlag("seed")),
+                limit: limitFlag == null ? null : Number(limitFlag),
+            };
+            const db = initDB(DB_PATH);
+            try {
+                if (action === "plan") {
+                    const plan = await planLLMExtraction(db, options);
+                    printLLMPlan(plan);
+                } else if (action === "run") {
+                    const modelURL = process.env.MODEL_URL ?? MODEL_URL;
+                    options.client = new OpenAICompatibleClient({
+                        modelURL,
+                        modelId,
+                        apiKey: process.env.MODEL_API_KEY ?? MODEL_API_KEY ?? null,
+                        timeoutMs: Number(
+                            getArgFlag("timeout-ms") ?? process.env.LLM_TIMEOUT_MS ?? 120000,
+                        ),
+                    });
+                    const result = await runLLMExtraction(db, options);
+                    printLLMPlan(result.plan);
+                    const counts = {};
+                    for (const row of result.results) {
+                        counts[row.status] = (counts[row.status] ?? 0) + 1;
+                    }
+                    console.log("Run results:", counts);
+                } else if (action === "proposals") {
+                    console.table(
+                        listLLMProposals(db, { status: getArgFlag("status") }).map((row) => ({
+                            id: row.id,
+                            problem: `${row.test_name} #${row.n + 1}`,
+                            source: row.source_key,
+                            review: row.review_status,
+                            currency: row.currency_status,
+                        })),
+                    );
+                } else if (action === "show") {
+                    const proposal = showLLMProposal(db, Number(process.argv[4]));
+                    if (!proposal) throw new Error(`LLM proposal ${process.argv[4]} does not exist`);
+                    console.log(JSON.stringify(proposal, null, 2));
+                } else if (action === "accept") {
+                    const valueFile = getArgFlag("value-file");
+                    const materialization = acceptLLMProposal(db, Number(process.argv[4]), {
+                        approvedValue: valueFile ? await Bun.file(valueFile).text() : null,
+                        reviewer: getArgFlag("reviewer") ?? process.env.USER ?? "cli",
+                        notes: getArgFlag("notes"),
+                    });
+                    console.log(
+                        `Accepted proposal ${process.argv[4]} as ${materialization.entity_type} ${materialization.entity_id}.`,
+                    );
+                } else if (action === "reject") {
+                    const proposal = rejectLLMProposal(db, Number(process.argv[4]), {
+                        reviewer: getArgFlag("reviewer") ?? process.env.USER ?? "cli",
+                        notes: getArgFlag("notes"),
+                    });
+                    console.log(`Rejected proposal ${proposal.id}.`);
+                } else {
+                    throw new Error(`Unknown llm action: ${action}`);
+                }
+            } finally {
+                db.close();
+            }
+            break;
+        }
+
         case "init-db": {
             const db = initDB(DB_PATH);
             db.close();
@@ -504,10 +604,37 @@ async function main() {
                 "  sync-export [file]\n" +
                 "  seed-ratings-export [file] [--overwrite-seeds]\n" +
                 "  audit [--entity=statements,choices,solutions,solution-sources] [--source=aops,wiki,pdf,import,manual,canonical] [--json=file] [--csv=file] [--no-json|--no-csv]\n" +
+                "  llm plan [--operation=extract_solution_from_post] [--limit=N]\n" +
+                "  llm run [--operation=extract_solution_from_post] [--limit=N] [--timeout-ms=N] [--max-tokens=N]\n" +
+                "  llm proposals [--status=needs_review]\n" +
+                "  llm show <proposal-id>\n" +
+                "  llm accept <proposal-id> [--value-file=file] [--reviewer=name] [--notes=text]\n" +
+                "  llm reject <proposal-id> [--reviewer=name] [--notes=text]\n" +
                 "  init-db\n" +
                 "  clear-db [--yes|-y]"
             );
             break;
+    }
+}
+
+function printLLMPlan(plan) {
+    const { summary } = plan;
+    const drifted = plan.entries.filter((entry) => entry.materializationDrift).length;
+    console.log(
+        `LLM plan (${plan.operation}): ${summary.candidates} candidates across ${summary.problems} problems; ` +
+            `${summary.trueCallsRequired} model calls; ~${summary.estimatedInputTokens} input tokens.`,
+    );
+    console.log("Dispositions:", summary.dispositions);
+    if (summary.omittedCandidates > 0) {
+        console.log(
+            `Limit: selected the first ${summary.candidates} of ${summary.totalCandidates} deterministic candidates; ${summary.omittedCandidates} omitted.`,
+        );
+    }
+    if (Object.keys(summary.skips).length) console.log("Skips:", summary.skips);
+    if (drifted) {
+        console.log(
+            `Materialization drift: ${drifted} accepted value(s) were edited after promotion; they remain materialized.`,
+        );
     }
 }
 

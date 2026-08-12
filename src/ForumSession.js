@@ -256,7 +256,7 @@ export class ForumSession {
       const label = ForumSession.describePayload(bodyInput);
       this.stats.requests++;
 
-      if (this.cache && this.cache.has(bodyInput)) {
+      if (this.cache && this.cache.canRead(bodyInput)) {
          this.stats.cacheHits++;
          this._emit("request", { page: label, cached: true, ms: 0 });
          return await this.cache.get(bodyInput);
