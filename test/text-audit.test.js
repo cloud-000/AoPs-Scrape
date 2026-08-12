@@ -12,6 +12,7 @@ import {
     cleanPdfDelimiterResidue,
     escapeLiteralCurrency,
     normalizePdfStatement,
+    normalizeSolutionText,
     writeAuditReports,
 } from "../src/textAudit.js";
 
@@ -386,5 +387,77 @@ label("$\textbf{(E)}$", (4,0));
             "choice.visual_only",
         );
         db.close();
+    });
+});
+
+describe("solution forum noise", () => {
+    const solutionContext = { entityType: "solution", source: "canonical" };
+    const rules = (text) => auditText(text, solutionContext).map((item) => item.ruleId);
+
+    test("names forum residue on canonical solution content", () => {
+        expect(rules('[hide="Solution"]Since $x=1$, done.[/hide]')).toContain(
+            "content.hide_wrapper",
+        );
+        expect(rules("[quote=a]earlier reply[/quote]\nSince $x=1$, done.")).toContain(
+            "content.quote_block",
+        );
+        expect(rules("Since $x=1$, done.\nThanks!")).toContain("content.greeting_or_signoff");
+        expect(rules("Since $x=1$, done.\nEdited by someone")).toContain(
+            "content.forum_attribution",
+        );
+        expect(rules("Since $x=1$, done.\n______\n")).toContain("content.signature_rule");
+        expect(rules("Since $x=1$, done.\n\n\n\nMore.")).toContain("content.excess_blank_lines");
+        expect(rules("Since $x=1$, done.")).toEqual([]);
+    });
+
+    test("does not flag forum residue on the documentary raw source", () => {
+        const post = '[hide="Solution"]Since $x=1$, done.[/hide]\nThanks!';
+        const rawRules = auditText(post, {
+            entityType: "solution_source",
+            source: "aops",
+        }).map((item) => item.ruleId);
+        expect(rawRules).not.toContain("content.hide_wrapper");
+        expect(rawRules).not.toContain("content.greeting_or_signoff");
+    });
+});
+
+describe("normalizeSolutionText", () => {
+    test("unwraps hide blocks, keeping only informative labels", () => {
+        expect(normalizeSolutionText('[hide="Solution"]Since $x=1$, done.[/hide]')).toBe(
+            "Since $x=1$, done.",
+        );
+        expect(normalizeSolutionText("[hide]Since $x=1$, done.[/hide]")).toBe(
+            "Since $x=1$, done.",
+        );
+        expect(normalizeSolutionText("[hide=Solution 2]Another way.[/hide]")).toBe(
+            "Solution 2\nAnother way.",
+        );
+        expect(normalizeSolutionText("[hide=Note]Careful here.[/hide]")).toBe(
+            "Note\nCareful here.",
+        );
+    });
+
+    test("removes only residue that is certainly not solution content", () => {
+        expect(normalizeSolutionText("Done.\nEdited by someone\nMore.")).toBe("Done.\nMore.");
+        expect(normalizeSolutionText("Click to reveal hidden text\nDone.")).toBe("Done.");
+        expect(normalizeSolutionText("Done.\n______\nsignature")).toBe("Done.\nsignature");
+        expect(normalizeSolutionText("Done.\n\n\n\n\nMore.")).toBe("Done.\n\nMore.");
+
+        // A dash rule directly under text is a Markdown setext heading, not a
+        // signature separator, so it survives.
+        expect(normalizeSolutionText("Answer\n-----\nDone.")).toBe("Answer\n-----\nDone.");
+        // Quoted replies and edit notes can carry mathematics; they are left for
+        // review rather than deleted by rule.
+        const ambiguous = "[quote=a]lemma[/quote]\nDone.\nEdit: fixed a sign error.";
+        expect(normalizeSolutionText(ambiguous)).toBe(ambiguous);
+    });
+
+    test("is idempotent and preserves mathematics", () => {
+        const messy = '[hide="Solution"]\nSince $x+1=8$, $x=\\boxed{7}$.\n\n\n\nEdited by bob\n[/hide]';
+        const once = normalizeSolutionText(messy);
+        expect(normalizeSolutionText(once)).toBe(once);
+        expect(once).toContain("$x+1=8$");
+        expect(once).toContain("\\boxed{7}");
+        expect(auditText(once, { entityType: "solution", source: "canonical" })).toEqual([]);
     });
 });

@@ -1,8 +1,11 @@
 # LLM processing and cache design
 
-This document records the proposed design for adding cached LLM processing to
-AoPs-Scrape. It is a design note only; none of the described commands or tables
-are implemented yet.
+This document records the design for cached LLM processing in AoPs-Scrape and is
+the canonical reference for its architecture, lifecycle, provenance rules, and
+operation index. The cache, planner, review lifecycle, and two operations
+(`extract_solution_from_post`, `repair_solution_format`) are implemented; the
+rest of the operation roadmap below is still a capability plan, not shipped
+commands or finalized prompt contracts.
 
 ## Responsibility
 
@@ -207,7 +210,145 @@ skip reasons such as `already_ingested`, `statement_post`, `empty`,
 All initial results are proposals requiring review. No first-version LLM result
 automatically changes statements, answers, solutions, or production output.
 
+## Second operation: solution format repair
+
+`repair_solution_format` cleans the *presentation* of a solution already held in
+`solutions`, preserving its mathematics and its provenance. It is deliberately
+neither extraction nor generation: extraction turns a raw post into a solution,
+generation writes mathematics, and this operation only edits how an existing
+solution reads.
+
+**Unit of work.** One canonical `solutions` row that has at least one
+`solution_sources` row. Raw, unclassified discussion replies are never input
+here — they belong to `extract_solution_from_post`.
+
+**Deterministic eligibility.** A solution is eligible only when the deterministic
+text audit complains about it. `repairSignals()` in
+`src/llm/repairSolutionFormat.js` is one line over `auditText(content, {
+entityType: 'solution', source: 'canonical' })`; there is no second, parallel
+notion of "noise" that the audit does not already know about.
+
+Forum residue is part of that audit, as the `content.*` rules described in
+CLAUDE.md, and `normalizeSolutionText` has already removed every instance of it
+that is safely removable before a row is ever planned (`upsertSolutionCandidate`
+at ingest, `preprocess` for backfill). So the model is only ever asked about
+defects determinism deliberately refused to touch — mainly quoted replies and
+`Edit:` notes, which can carry mathematics, plus genuine LaTeX/BBCode damage.
+On the current corpus that ordering is worth roughly 11.5k model calls: 15,387
+solutions carry an audit finding before `preprocess`, and 3,912 after it.
+
+Skip reasons reported by the planner: `no_source_provenance`, `duplicate`,
+`inactive_status`, `empty`, `manual_decision`, `no_repair_signal`, `too_large`,
+`manual_rejection`. `manual_decision` is what protects a human-curated solution
+(`solutions.status_source = 'manual'`) from being proposed over. Materialization
+is checked *before* the skip gates, so an already-repaired solution reports
+`materialized` rather than reading as an ordinary manual row.
+
+**Input snapshot.** Current canonical content and content format; every source's
+provenance and its complete `raw_content` (replaced by a
+`raw_identical_to_canonical` flag when it is byte-identical to the canonical
+content); the problem statement, choices, response kind, and known answer; test
+name and problem number; and the deterministic audit findings that made the row
+eligible.
+
+**Response contract** (`response_contract_version = 1`): one JSON object.
+
+```text
+replacement                     string   cleaned solution text
+change_summary                  string[] one short line per change (a bare string is accepted)
+removed_non_solution_content    string[] each removed fragment, verbatim
+mathematical_meaning_changed    boolean
+confidence                      number in [0, 1]
+```
+
+No `response_format` is sent to the endpoint. The parser accepts JSON-in-text —
+fenced blocks or surrounding prose — by scanning the first balanced `{...}`, per
+the local-server policy above. The schema still participates in cache identity.
+
+The prompt permits removing unrelated conversation, forum chatter, greetings,
+non-solution quotations, and formatting residue, and permits improving
+paragraphing, grammar, LaTeX, and explanatory flow. It forbids adding any
+mathematical argument, filling a gap, solving the problem, changing a claim or
+the answer, and inventing source content. A model that cannot clean the text
+without changing meaning is instructed to say so via
+`mathematical_meaning_changed`.
+
+**Validation.** A malformed response is `invalid` and may be retried. A
+well-formed response that fails a check is a *validated negative*: it caches as
+`valid_empty`, so the identical request is never re-sent, and a validator-version
+bump reparses the stored raw response instead of calling the model. Checks:
+
+- the replacement is nonempty;
+- `mathematical_meaning_changed = true` is rejected outright;
+- every `[asy]` block, `[img]` target, and Markdown image in the original is
+  still present;
+- every `\boxed{…}` value survives, and the known answer specifically survives
+  when it was deterministically present before;
+- re-running the audit introduces no new error-level rule ids;
+- the audit findings that made the row eligible strictly decrease (which also
+  rejects a no-op replacement).
+
+Before/after detail — finding counts, rule ids, new error rules, dropped
+references, the known-answer check, unverified claimed removals, and content
+hashes — is recorded on the interpretation and copied into the proposal's
+`validation_json` for the reviewer.
+
+**Materialization.** Nothing is ever accepted automatically. On
+`llm accept`, one transaction updates **only** `solutions.content` (and its
+`normalized_hash`) plus review metadata: `status = 'accepted'`,
+`status_source = 'manual'` so `preprocess` cannot classify over it.
+`solution_sources.raw_content` is deliberately untouched — the complete original
+documentary source is preserved, so a repair never rewrites history. The
+immutable model proposal stays in `proposal_json` while the value actually
+applied is stored separately in `reviewer_approved_value`, which is what makes
+`--value-file` reviewer edits first-class. An `llm_materializations` row records
+`method = 'llm_repair'`, the target solution, and the materialized value hash.
+
+The transaction refuses unsafe moves: a target solution whose current content no
+longer hashes to the proposal's `source_content_hash` (a manual edit or another
+accepted repair landed first — re-plan instead), and repaired content whose
+normalized hash would collide with a different solution row for the same problem
+(that is a merge, not a repair).
+
+Comparing the target's live hash against `materialized_value_hash` afterwards is
+what surfaces a later hand edit as materialization drift; the row stays
+`materialized` and is reported, never silently re-proposed.
+
 ## Planning and execution
+
+Operation dispatch is a registry, not a branch. `src/llm/operations.js` maps an
+operation name to a handler exposing `collect`, `interpret`, `buildProposal`,
+its four versions, and its inference defaults; `src/llm/service.js` owns
+everything shared (disposition resolution, `--limit`, the plan summary, and the
+cache/attempt/interpretation/proposal loop). `db.js` keys its materializers by
+operation name the same way. Adding an operation is one module plus one registry
+entry — never another arm in the runner.
+
+Every operation takes the same completion ceiling,
+`DEFAULT_MAX_OUTPUT_TOKENS` in `planning.js` (currently 128k), and that ceiling
+is deliberately not sized to the visible answer.
+
+The reason is reasoning models. The thinking tokens come out of the completion
+budget and are then stripped from the returned text, so the size of the answer
+tells you nothing about the budget it needs. Measured against this project's
+endpoint, `extract_solution_from_post` — whose entire output is one word like
+`discussion` — spent 75-471 completion tokens typically and 1940 at the top of
+the range. A budget sized to the word would truncate the model mid-thought and
+return nothing parseable. The shape of an answer is enforced by the prompt and
+the operation's parser (extraction rejects anything that is not exactly one
+label); starving the budget is not an enforcement mechanism and never was.
+
+`max_tokens` is inside `inference_parameters` and therefore inside the request
+key, so moving the ceiling orphans cached results. Set it once; use
+`--max-tokens` or `LLM_MAX_TOKENS` for a one-off experiment rather than editing
+the default. A local server may also reject a `max_tokens` above its own limit;
+that surfaces as a `provider_error` attempt, which is never cached as a success
+and is retried on the next run.
+
+Input size is a separate, deterministic gate: `defaultMaxInputChars` per
+operation (extraction 30k chars, repair 60k), reported as the `too_large` skip
+reason. That one *is* per operation, because it bounds the prompt rather than the
+reply.
 
 `llm plan` is a read-only dry run. For each operation it should:
 
@@ -246,12 +387,30 @@ recomputed initially rather than persisted.
 | `missing_source` | Report it; never fetch implicitly |
 | `blocked` | Report the reason |
 
+Most of that table is "do nothing", so the steady state of a re-run is that it
+creates nothing at all. The run summary must therefore report the dispositions it
+declined to act on, not just the ones it acted on: an empty result list plus a
+silent run reads as a failure, when it actually means every candidate already had
+a proposal, a materialization, or a cached empty result. `runLLMOperation`
+returns `summary.{statuses, noops, modelCalls, cacheReuse, acted}` for exactly
+that reason, and the CLI prints the `noops` breakdown with a plain-language cause.
+
+Note that `cache_hit` and `reparse` are *not* no-ops: they rebuild a missing
+proposal from the stored inference and are reported under `cacheReuse` with zero
+model calls. `proposal_exists` is the disposition that legitimately produces
+nothing.
+
+For the same reason the plan quotes `estimatedCallTokens` — the input size of the
+`miss` entries only — next to its model-call count. `estimatedInputTokens` still
+covers every selected candidate, but quoting it beside "0 model calls" implies
+tokens that will never be sent.
+
 Possible CLI shape:
 
 ```bash
-bun cli/index.js llm plan [--operation=extract_solution_from_post]
-bun cli/index.js llm run [--operation=extract_solution_from_post]
-bun cli/index.js llm proposals
+bun cli/index.js llm plan [--operation=extract_solution_from_post|repair_solution_format]
+bun cli/index.js llm run [--operation=extract_solution_from_post|repair_solution_format]
+bun cli/index.js llm proposals [--operation=…]
 bun cli/index.js llm show <proposal-id>
 bun cli/index.js llm accept <proposal-id>
 bun cli/index.js llm reject <proposal-id>
@@ -261,10 +420,11 @@ bun cli/index.js llm reparse
 ```
 
 Both `plan` and `run` accept `--limit=N`. The limit selects the first `N`
-eligible post candidates in the planner's deterministic problem/post order after
-all eligibility gates. The plan reports the full candidate count and how many
-were omitted. Passing the same limit to `plan` and `run` processes the same
-bounded batch; it never increases the number of model calls beyond `N`.
+eligible candidates in the planner's deterministic order after all eligibility
+gates — problem/post order for extraction, `solutions.id` order for repair. The
+plan reports the full candidate count and how many were omitted. Passing the
+same limit to `plan` and `run` processes the same bounded batch; it never
+increases the number of model calls beyond `N`.
 
 ## Proposal and provenance model
 
@@ -381,8 +541,8 @@ solution or proposal is materialized, run `preprocess`, `build`, and then
 ## Operation roadmap
 
 The cache, proposal, review, and materialization machinery is intended to
-support all of the operation families below. Only
-`extract_solution_from_post` belongs to the first implementation slice. The
+support all of the operation families below. `extract_solution_from_post` was
+the first implementation slice and `repair_solution_format` the second; the
 remaining operations are a capability roadmap, not implemented commands or
 finalized prompt contracts.
 
@@ -418,7 +578,7 @@ Planned operations include:
 ```text
 repair_problem_statement
 repair_problem_choices
-repair_solution_format
+repair_solution_format         implemented; see "Second operation" above
 ```
 
 These operations should normally be triggered by deterministic audit findings,
@@ -511,7 +671,8 @@ After the first vertical slice is stable, a reasonable order is:
 1. `extract_answer_from_solution`
 2. `extract_answer_from_post`
 3. `extract_correction_from_post`
-4. `repair_solution_format`
+4. `repair_solution_format` — done; taken ahead of 1–3, since the deterministic
+   audit already names the solutions that need it
 5. `repair_problem_statement`
 6. `repair_problem_choices`
 7. reconciliation and duplicate adjudication

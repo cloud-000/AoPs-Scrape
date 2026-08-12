@@ -452,15 +452,14 @@ async function main() {
 
         case "llm": {
             const action = process.argv[3] ?? "plan";
-            const operation = getArgFlag("operation") ?? "extract_solution_from_post";
-            if (operation !== "extract_solution_from_post") {
-                throw new Error(`Unsupported first-slice LLM operation: ${operation}`);
-            }
+            const { DEFAULT_OPERATION, getOperation } = await import("../src/llm/operations.js");
+            const operation = getArgFlag("operation") ?? DEFAULT_OPERATION;
+            const handler = getOperation(operation);
             const { OpenAICompatibleClient } = await import("../src/llm/client.js");
             const {
                 listLLMProposals,
-                planLLMExtraction,
-                runLLMExtraction,
+                planLLMOperation,
+                runLLMOperation,
                 showLLMProposal,
             } = await import("../src/llm/service.js");
             const { acceptLLMProposal, rejectLLMProposal } = await import("../src/db.js");
@@ -469,13 +468,22 @@ async function main() {
             const cachePath = process.env.LLM_CACHE_PATH ?? "./llm_cache.sqlite";
             const limitFlag = getArgFlag("limit");
             const options = {
+                operation,
                 cachePath,
                 responseCacheDir: process.env.RESPONSE_CACHE_DIR ?? "./response_cache",
                 modelId,
                 modelRevision,
-                maxTokens: Number(getArgFlag("max-tokens") ?? process.env.LLM_MAX_TOKENS ?? 32),
+                // Inference budgets are per operation: a one-label classifier and
+                // a full solution rewrite do not need the same ceiling.
+                maxTokens: Number(
+                    getArgFlag("max-tokens") ??
+                        process.env.LLM_MAX_TOKENS ??
+                        handler.defaultMaxTokens,
+                ),
                 maxInputChars: Number(
-                    getArgFlag("max-input-chars") ?? process.env.LLM_MAX_INPUT_CHARS ?? 30000,
+                    getArgFlag("max-input-chars") ??
+                        process.env.LLM_MAX_INPUT_CHARS ??
+                        handler.defaultMaxInputChars,
                 ),
                 seed: getArgFlag("seed") == null ? null : Number(getArgFlag("seed")),
                 limit: limitFlag == null ? null : Number(limitFlag),
@@ -483,7 +491,7 @@ async function main() {
             const db = initDB(DB_PATH);
             try {
                 if (action === "plan") {
-                    const plan = await planLLMExtraction(db, options);
+                    const plan = await planLLMOperation(db, options);
                     printLLMPlan(plan);
                 } else if (action === "run") {
                     const modelURL = process.env.MODEL_URL ?? MODEL_URL;
@@ -495,18 +503,18 @@ async function main() {
                             getArgFlag("timeout-ms") ?? process.env.LLM_TIMEOUT_MS ?? 120000,
                         ),
                     });
-                    const result = await runLLMExtraction(db, options);
+                    const result = await runLLMOperation(db, options);
                     printLLMPlan(result.plan);
-                    const counts = {};
-                    for (const row of result.results) {
-                        counts[row.status] = (counts[row.status] ?? 0) + 1;
-                    }
-                    console.log("Run results:", counts);
+                    printLLMRun(result);
                 } else if (action === "proposals") {
                     console.table(
-                        listLLMProposals(db, { status: getArgFlag("status") }).map((row) => ({
+                        listLLMProposals(db, {
+                            status: getArgFlag("status"),
+                            operation: getArgFlag("operation"),
+                        }).map((row) => ({
                             id: row.id,
                             problem: `${row.test_name} #${row.n + 1}`,
+                            operation: row.operation,
                             source: row.source_key,
                             review: row.review_status,
                             currency: row.currency_status,
@@ -604,9 +612,9 @@ async function main() {
                 "  sync-export [file]\n" +
                 "  seed-ratings-export [file] [--overwrite-seeds]\n" +
                 "  audit [--entity=statements,choices,solutions,solution-sources] [--source=aops,wiki,pdf,import,manual,canonical] [--json=file] [--csv=file] [--no-json|--no-csv]\n" +
-                "  llm plan [--operation=extract_solution_from_post] [--limit=N]\n" +
-                "  llm run [--operation=extract_solution_from_post] [--limit=N] [--timeout-ms=N] [--max-tokens=N]\n" +
-                "  llm proposals [--status=needs_review]\n" +
+                "  llm plan [--operation=extract_solution_from_post|repair_solution_format] [--limit=N]\n" +
+                "  llm run [--operation=...] [--limit=N] [--timeout-ms=N] [--max-tokens=N]\n" +
+                "  llm proposals [--status=needs_review] [--operation=...]\n" +
                 "  llm show <proposal-id>\n" +
                 "  llm accept <proposal-id> [--value-file=file] [--reviewer=name] [--notes=text]\n" +
                 "  llm reject <proposal-id> [--reviewer=name] [--notes=text]\n" +
@@ -617,12 +625,46 @@ async function main() {
     }
 }
 
+const RUN_NOOP_REASONS = {
+    proposal_exists: "already had a proposal awaiting review",
+    materialized: "already applied to the database",
+    valid_empty: "cached result found nothing usable",
+    blocked: "skipped by a deterministic gate",
+    missing_source: "required source is not archived",
+};
+
+function countList(counts) {
+    return Object.entries(counts)
+        .map(([key, value]) => `${value} ${key}`)
+        .join(", ");
+}
+
+function printLLMRun(result) {
+    const { statuses, noops, modelCalls, cacheReuse, acted } = result.summary;
+    console.log(
+        `Run: ${modelCalls} model call(s), ${cacheReuse} reused from cache, ` +
+            `${acted} entr(ies) acted on.`,
+    );
+    console.log(`  Results: ${acted ? countList(statuses) : "nothing created"}`);
+    if (Object.keys(noops).length) {
+        // Without this an all-cached rerun printed an empty object, which reads
+        // like a failure rather than "there was nothing left to do".
+        console.log("  No action needed:");
+        for (const [disposition, count] of Object.entries(noops)) {
+            const reason = RUN_NOOP_REASONS[disposition] ?? "no run behavior defined";
+            console.log(`    ${count} ${disposition} — ${reason}`);
+        }
+    }
+}
+
 function printLLMPlan(plan) {
     const { summary } = plan;
     const drifted = plan.entries.filter((entry) => entry.materializationDrift).length;
     console.log(
-        `LLM plan (${plan.operation}): ${summary.candidates} candidates across ${summary.problems} problems; ` +
-            `${summary.trueCallsRequired} model calls; ~${summary.estimatedInputTokens} input tokens.`,
+        `LLM plan (${plan.operation}): ${summary.candidates} candidates across ` +
+            `${summary.scanned ?? summary.problems} ${plan.scanUnit ?? "problems"}; ` +
+            `${summary.trueCallsRequired} model calls; ` +
+            `~${summary.estimatedCallTokens ?? summary.estimatedInputTokens} input tokens to send.`,
     );
     console.log("Dispositions:", summary.dispositions);
     if (summary.omittedCandidates > 0) {

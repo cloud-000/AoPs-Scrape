@@ -1,14 +1,10 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+// Operation-agnostic LLM lifecycle: plan (read-only), run, and proposal
+// listing/inspection. Operation-specific candidate selection, parsing, and
+// proposal shaping live behind the handler interface in operations.js.
 
-import { createLLMProposal, hashText } from "../db.js";
-import {
-    buildExtractionRequest,
-    EXTRACT_OPERATION,
-    extractionVersions,
-    interpretExtractionResponse,
-    OPERATION_VERSION,
-} from "./extractSolutionFromPost.js";
+import { createLLMProposal } from "../db.js";
+import { getOperation } from "./operations.js";
+import { increment } from "./planning.js";
 import {
     inspectCachedRequest,
     openLLMCache,
@@ -17,258 +13,69 @@ import {
     storeRequest,
 } from "./cache.js";
 
-const ADMINISTRATIVE = /^(?:\[?deleted\]?|\[?removed\]?|post deleted|reserved|bump)\.?$/i;
+function defaultCachePath(options) {
+    return options.cachePath ?? process.env.LLM_CACHE_PATH ?? "./llm_cache.sqlite";
+}
 
-function parseChoices(row) {
-    const raw = row.wiki_choices ?? row.aops_choices;
-    if (!raw) return null;
-    try {
-        return JSON.parse(raw);
-    } catch {
-        return null;
+/**
+ * Read-only dry run. Selects candidates deterministically, computes their
+ * request identity, inspects the cache and existing project state, and reports
+ * a disposition per candidate without contacting the model.
+ */
+export async function planLLMOperation(db, options = {}) {
+    const handler = getOperation(options.operation);
+    if (!options.modelId) {
+        throw new Error("MODEL_ID is required to compute LLM request identity");
     }
-}
-
-async function readTopicArchive(cacheDir, topicId) {
-    const path = join(cacheDir, `topic_${topicId}.json`);
-    if (!existsSync(path)) return null;
-    return await Bun.file(path).json();
-}
-
-function estimateTokens(request) {
-    return Math.ceil((request.systemPrompt.length + request.userPrompt.length) / 4);
-}
-
-function increment(object, key) {
-    object[key] = (object[key] ?? 0) + 1;
-}
-
-export async function planLLMExtraction(
-    db,
-    {
-        cachePath = process.env.LLM_CACHE_PATH ?? "./llm_cache.sqlite",
-        responseCacheDir = "./response_cache",
-        modelId,
-        modelRevision = null,
-        maxTokens = 32,
-        seed = null,
-        maxInputChars = 30_000,
-        limit = null,
-    },
-) {
-    if (!modelId) throw new Error("MODEL_ID is required to compute LLM request identity");
+    const limit = options.limit ?? null;
     if (limit != null && (!Number.isInteger(limit) || limit < 1)) {
         throw new Error("LLM limit must be a positive integer");
     }
-    const cache = openLLMCache(cachePath, { readOnly: true });
-    const versions = extractionVersions();
-    const rows = db
-        .query(
-            `SELECT p.id, p.n, p.statement, p.answer_value, p.aops_topic_id,
-                    p.aops_post_id, p.aops_choices, p.wiki_choices,
-                    COALESCE(p.coverage_response_kind, t.response_kind) AS response_kind,
-                    t.name AS test_name
-             FROM problems p JOIN tests t ON t.id = p.test_id
-             WHERE p.aops_topic_id IS NOT NULL
-             ORDER BY p.id`,
-        )
-        .all();
-    const topicCounts = new Map();
-    for (const row of rows) {
-        topicCounts.set(row.aops_topic_id, (topicCounts.get(row.aops_topic_id) ?? 0) + 1);
-    }
 
-    const entries = [];
-    const skips = {};
+    const versions = handler.versions();
+    const collected = await handler.collect(db, {
+        maxTokens: handler.defaultMaxTokens,
+        maxInputChars: handler.defaultMaxInputChars,
+        ...options,
+    });
+    const entries = collected.entries;
+
+    const cache = openLLMCache(defaultCachePath(options), { readOnly: true });
     try {
-        for (const row of rows) {
-            let archive;
-            try {
-                archive = await readTopicArchive(responseCacheDir, row.aops_topic_id);
-            } catch (error) {
-                entries.push({
-                    disposition: "blocked",
-                    reason: `invalid_topic_archive: ${error.message}`,
-                    problemId: row.id,
-                    topicId: row.aops_topic_id,
-                });
-                increment(skips, "invalid_topic_archive");
+        for (const entry of entries) {
+            if (entry.disposition || !entry.requestKey) continue;
+            const materialized = db
+                .query(
+                    `SELECT m.id FROM llm_materializations m
+                     JOIN llm_proposals p ON p.id = m.proposal_id
+                     WHERE p.problem_id = ? AND p.operation = ? AND p.request_key = ?
+                     LIMIT 1`,
+                )
+                .get(entry.problemId, handler.operation, entry.requestKey);
+            if (materialized) {
+                entry.disposition = "materialized";
                 continue;
             }
-            if (!archive) {
-                entries.push({
-                    disposition: "missing_source",
-                    reason: "missing_source",
-                    problemId: row.id,
-                    topicId: row.aops_topic_id,
-                });
-                increment(skips, "missing_source");
+            const proposal = db
+                .query(
+                    `SELECT id FROM llm_proposals
+                     WHERE problem_id = ? AND operation = ? AND operation_version = ?
+                       AND request_key = ? LIMIT 1`,
+                )
+                .get(entry.problemId, handler.operation, handler.operationVersion, entry.requestKey);
+            if (proposal) {
+                entry.disposition = "proposal_exists";
                 continue;
             }
-            if ((topicCounts.get(row.aops_topic_id) ?? 0) !== 1) {
-                entries.push({
-                    disposition: "blocked",
-                    reason: "ambiguous_problem_mapping",
-                    problemId: row.id,
-                    topicId: row.aops_topic_id,
-                });
-                increment(skips, "ambiguous_problem_mapping");
-                continue;
-            }
-
-            const posts = archive?.response?.topic?.posts_data;
-            if (!Array.isArray(posts)) {
-                entries.push({
-                    disposition: "blocked",
-                    reason: "invalid_topic_archive",
-                    problemId: row.id,
-                    topicId: row.aops_topic_id,
-                });
-                increment(skips, "invalid_topic_archive");
-                continue;
-            }
-            const ingestedPostIds = new Set(
-                db
-                    .query(
-                        `SELECT aops_post_id FROM solution_sources
-                         WHERE problem_id = ? AND aops_post_id IS NOT NULL`,
-                    )
-                    .all(row.id)
-                    .map((source) => source.aops_post_id),
-            );
-            const problem = {
-                statement: row.statement,
-                choices: parseChoices(row),
-                responseKind: row.response_kind,
-                answerValue: row.answer_value,
-                testName: row.test_name,
-                problemNumber: row.n + 1,
-            };
-
-            for (const post of posts) {
-                const base = {
-                    problemId: row.id,
-                    topicId: row.aops_topic_id,
-                    postId: post.post_id,
-                    problemNumber: row.n + 1,
-                };
-                let skipReason = null;
-                const rawPost = typeof post.post_canonical === "string" ? post.post_canonical : "";
-                const sourceContentHash = hashText(rawPost);
-                const priorMaterialization = db
-                    .query(
-                        `SELECT p.request_key, m.materialized_value_hash, s.content
-                         FROM llm_materializations m
-                         JOIN llm_proposals p ON p.id = m.proposal_id
-                         LEFT JOIN solutions s
-                           ON m.entity_type = 'solution' AND s.id = m.entity_id
-                         WHERE p.problem_id = ? AND p.operation = ?
-                           AND p.source_kind = 'aops_post' AND p.source_key = ?
-                           AND p.source_content_hash = ?
-                         LIMIT 1`,
-                    )
-                    .get(
-                        row.id,
-                        EXTRACT_OPERATION,
-                        `post:${post.post_id}`,
-                        sourceContentHash,
-                    );
-                if (priorMaterialization) {
-                    entries.push({
-                        ...base,
-                        disposition: "materialized",
-                        requestKey: priorMaterialization.request_key,
-                        materializationDrift:
-                            priorMaterialization.content != null &&
-                            hashText(priorMaterialization.content) !==
-                                priorMaterialization.materialized_value_hash,
-                    });
-                    continue;
-                }
-                if (post.post_type === "view_posts_text" || post.post_id === row.aops_post_id) {
-                    skipReason = "statement_post";
-                } else if (!rawPost.trim()) {
-                    skipReason = "empty";
-                } else if (post.deleted || ADMINISTRATIVE.test(rawPost.trim())) {
-                    skipReason = "administrative";
-                } else if (ingestedPostIds.has(post.post_id)) {
-                    skipReason = "already_ingested";
-                }
-                if (!skipReason) {
-                    const rejection = db
-                        .query(
-                            `SELECT id FROM llm_proposals
-                             WHERE problem_id = ? AND operation = ?
-                               AND source_kind = 'aops_post' AND source_key = ?
-                               AND source_content_hash = ?
-                               AND review_status = 'rejected' AND status_source = 'manual'
-                             LIMIT 1`,
-                        )
-                        .get(row.id, EXTRACT_OPERATION, `post:${post.post_id}`, sourceContentHash);
-                    if (rejection) skipReason = "manual_rejection";
-                }
-                if (skipReason) {
-                    entries.push({ ...base, disposition: "blocked", reason: skipReason });
-                    increment(skips, skipReason);
-                    continue;
-                }
-
-                const request = buildExtractionRequest(problem, post, {
-                    modelId,
-                    modelRevision,
-                    maxTokens,
-                    seed,
-                });
-                if (request.userPrompt.length + request.systemPrompt.length > maxInputChars) {
-                    entries.push({ ...base, disposition: "blocked", reason: "too_large" });
-                    increment(skips, "too_large");
-                    continue;
-                }
-                const inputTokens = estimateTokens(request);
-                const materialized = db
-                    .query(
-                        `SELECT m.id FROM llm_materializations m
-                         JOIN llm_proposals p ON p.id = m.proposal_id
-                         WHERE p.problem_id = ? AND p.operation = ? AND p.request_key = ?
-                         LIMIT 1`,
-                    )
-                    .get(row.id, EXTRACT_OPERATION, request.requestKey);
-                let disposition;
-                let cached = null;
-                if (materialized) {
-                    disposition = "materialized";
-                } else {
-                    const proposal = db
-                        .query(
-                            `SELECT id FROM llm_proposals
-                             WHERE problem_id = ? AND operation = ? AND operation_version = ?
-                               AND request_key = ? LIMIT 1`,
-                        )
-                        .get(row.id, EXTRACT_OPERATION, OPERATION_VERSION, request.requestKey);
-                    if (proposal) disposition = "proposal_exists";
-                    else {
-                        cached = inspectCachedRequest(cache, request.requestKey, versions);
-                        disposition = cached.disposition;
-                    }
-                }
-                entries.push({
-                    ...base,
-                    disposition,
-                    requestKey: request.requestKey,
-                    request,
-                    cached,
-                    inputTokens,
-                    sourceContentHash,
-                    rawPost,
-                    post,
-                    problem,
-                });
-            }
+            entry.cached = inspectCachedRequest(cache, entry.requestKey, versions);
+            entry.disposition = entry.cached.disposition;
         }
     } finally {
         cache?.close();
     }
 
+    // The limit applies to candidates only, after every eligibility gate, in the
+    // planner's deterministic order. Terminal entries stay in the report.
     const allCandidateEntries = entries.filter((entry) => entry.requestKey);
     const selectedCandidateEntries =
         limit == null ? allCandidateEntries : allCandidateEntries.slice(0, limit);
@@ -280,19 +87,31 @@ export async function planLLMExtraction(
     const dispositions = {};
     for (const entry of limitedEntries) increment(dispositions, entry.disposition);
     return {
-        operation: EXTRACT_OPERATION,
+        operation: handler.operation,
+        scanUnit: handler.scanUnit,
         entries: limitedEntries,
         summary: {
-            problems: rows.length,
+            // `problems` is the historical name for "units the planner scanned";
+            // `scanUnit` says what they actually are for this operation.
+            problems: collected.scanned,
+            scanned: collected.scanned,
             candidates: selectedCandidateEntries.length,
             totalCandidates: allCandidateEntries.length,
             omittedCandidates,
             limit,
             dispositions,
-            skips,
+            skips: collected.skips,
             trueCallsRequired: dispositions.miss ?? 0,
             estimatedInputTokens: selectedCandidateEntries.reduce(
                 (sum, entry) => sum + (entry.inputTokens ?? 0),
+                0,
+            ),
+            // Only the `miss` entries are actually sent, so this is the figure to
+            // quote next to the call count; estimatedInputTokens above covers
+            // every selected candidate including the ones already answered.
+            estimatedCallTokens: selectedCandidateEntries.reduce(
+                (sum, entry) =>
+                    entry.disposition === "miss" ? sum + (entry.inputTokens ?? 0) : sum,
                 0,
             ),
         },
@@ -310,57 +129,52 @@ function interpretationFromRow(row) {
     };
 }
 
-function createProposalForEntry(db, entry, interpretation) {
+function createProposalForEntry(db, handler, entry, interpretation) {
     if (!interpretation?.valid || !interpretation.usableCount) return null;
-    const proposal = {
-        ...interpretation.validated,
-        source: {
-            topic_id: entry.topicId,
-            post_id: entry.postId,
-            user_id: entry.post.poster_id ?? null,
-            username: entry.post.username ?? null,
-            posted_at: entry.post.post_time ?? null,
-            raw_content: entry.rawPost,
-            source_url: `https://artofproblemsolving.com/community/c${entry.topicId}p${entry.postId}`,
-        },
-    };
+    const { proposal, validation } = handler.buildProposal(entry, interpretation);
     return createLLMProposal(db, {
         problemId: entry.problemId,
-        operation: EXTRACT_OPERATION,
-        operationVersion: OPERATION_VERSION,
+        operation: handler.operation,
+        operationVersion: handler.operationVersion,
         requestKey: entry.requestKey,
-        sourceKind: "aops_post",
-        sourceKey: `post:${entry.postId}`,
+        sourceKind: entry.sourceKind,
+        sourceKey: entry.sourceKey,
         sourceContentHash: entry.sourceContentHash,
         resultIndex: 0,
         proposal,
-        validation: {
-            ...extractionVersions(),
-            exact_span_grounded: true,
-        },
+        validation,
         reviewStatus: "needs_review",
     });
 }
 
-export async function runLLMExtraction(db, options) {
-    const plan = await planLLMExtraction(db, options);
-    const cache = openLLMCache(options.cachePath ?? process.env.LLM_CACHE_PATH ?? "./llm_cache.sqlite");
-    const versions = extractionVersions();
+export async function runLLMOperation(db, options = {}) {
+    const handler = getOperation(options.operation);
+    const plan = await planLLMOperation(db, options);
+    const cache = openLLMCache(defaultCachePath(options));
+    const versions = handler.versions();
     const results = [];
+    // A run that creates nothing is the normal steady state: every candidate
+    // already had a proposal, a materialization, or a cached empty result. Those
+    // entries are counted here so the caller can say *why* nothing happened
+    // instead of reporting an empty object.
+    const noops = {};
+    let modelCalls = 0;
+    let cacheReuse = 0;
     try {
         for (const entry of plan.entries) {
-            if (!["cache_hit", "reparse", "miss"].includes(entry.disposition)) continue;
+            if (!["cache_hit", "reparse", "miss"].includes(entry.disposition)) {
+                increment(noops, entry.disposition);
+                continue;
+            }
+            if (entry.disposition === "miss") modelCalls++;
+            else cacheReuse++;
             let interpretation;
             let attempt;
             if (entry.disposition === "cache_hit") {
                 interpretation = interpretationFromRow(entry.cached.interpretation);
             } else if (entry.disposition === "reparse") {
                 attempt = entry.cached.attempt;
-                interpretation = interpretExtractionResponse(attempt.response_text, {
-                    problemNumber: entry.problemNumber,
-                    choices: entry.problem.choices,
-                    rawPost: entry.rawPost,
-                });
+                interpretation = handler.interpret(attempt.response_text, entry);
                 storeInterpretation(cache, entry.requestKey, attempt.id, versions, interpretation);
             } else {
                 storeRequest(cache, entry.request, entry.request);
@@ -374,14 +188,10 @@ export async function runLLMExtraction(db, options) {
                     results.push({ entry, status: response.status, error: response.errorMessage });
                     continue;
                 }
-                interpretation = interpretExtractionResponse(response.responseText, {
-                    problemNumber: entry.problemNumber,
-                    choices: entry.problem.choices,
-                    rawPost: entry.rawPost,
-                });
+                interpretation = handler.interpret(response.responseText, entry);
                 storeInterpretation(cache, entry.requestKey, attempt.id, versions, interpretation);
             }
-            const proposal = createProposalForEntry(db, entry, interpretation);
+            const proposal = createProposalForEntry(db, handler, entry, interpretation);
             results.push({
                 entry,
                 status: interpretation.valid
@@ -396,11 +206,36 @@ export async function runLLMExtraction(db, options) {
     } finally {
         cache.close();
     }
-    return { plan, results };
+    const statuses = {};
+    for (const row of results) increment(statuses, row.status);
+    return {
+        plan,
+        results,
+        summary: { statuses, noops, modelCalls, cacheReuse, acted: results.length },
+    };
 }
 
-export function listLLMProposals(db, { status = null } = {}) {
-    const where = status ? `WHERE p.review_status = ?` : "";
+// Backwards-compatible names for the first vertical slice.
+export function planLLMExtraction(db, options = {}) {
+    return planLLMOperation(db, { ...options, operation: options.operation ?? undefined });
+}
+
+export function runLLMExtraction(db, options = {}) {
+    return runLLMOperation(db, { ...options, operation: options.operation ?? undefined });
+}
+
+export function listLLMProposals(db, { status = null, operation = null } = {}) {
+    const conditions = [];
+    const parameters = [];
+    if (status) {
+        conditions.push("p.review_status = ?");
+        parameters.push(status);
+    }
+    if (operation) {
+        conditions.push("p.operation = ?");
+        parameters.push(operation);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     return db
         .query(
             `SELECT p.id, p.problem_id, p.operation, p.operation_version,
@@ -414,7 +249,7 @@ export function listLLMProposals(db, { status = null } = {}) {
              ${where}
              ORDER BY p.id DESC`,
         )
-        .all(...(status ? [status] : []));
+        .all(...parameters);
 }
 
 export function showLLMProposal(db, id) {

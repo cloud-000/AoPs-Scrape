@@ -343,6 +343,110 @@ export function normalizePdfStatement(value) {
     return escapeLiteralCurrency(cleanPdfDelimiterResidue(value));
 }
 
+// --- forum noise in canonical solution content -------------------------------
+//
+// A solution collected from a forum carries presentation that is not part of the
+// solution: hide wrappers, quoted replies, greetings, signatures. These rules
+// name that residue on `solutions.content` only. `solution_sources.raw_content`
+// is the documentary source and is *supposed* to look like a forum post, so it
+// is never audited for noise.
+//
+// The split below is the same one `normalizePdfStatement` makes: whatever can be
+// removed with certainty is removed by `normalizeSolutionText`, and only the
+// ambiguous remainder survives as a finding for review or LLM repair.
+
+// Removable with certainty. Each entry is [ruleId, regex, message].
+const SOLUTION_FIXABLE_NOISE = [
+    [
+        "content.hide_wrapper",
+        /\[hide\b[^\]]*\]|\[\/hide\]/i,
+        "Solution content is wrapped in forum [hide] tags.",
+    ],
+    [
+        "content.reveal_prompt",
+        /(?:^|\n)[ \t]*click to reveal hidden text[ \t]*(?=\n|$)/i,
+        "Solution content contains a rendered 'click to reveal' prompt.",
+    ],
+    [
+        "content.forum_attribution",
+        /(?:^|\n)[ \t]*(?:(?:edited|posted)\s+by\b[^\n]*|this post has been edited[^\n]*)(?=\n|$)/i,
+        "Solution content contains a forum edit/post attribution line.",
+    ],
+    [
+        "content.signature_rule",
+        /(?:^|\n)[ \t]*(?:_{5,}|-{5,})[ \t]*(?=\n|$)/,
+        "Solution content contains a horizontal rule that may be a forum signature separator.",
+    ],
+    [
+        "content.excess_blank_lines",
+        /\n[ \t]*\n[ \t]*\n/,
+        "Solution content contains runs of blank lines.",
+    ],
+];
+
+// Real noise, but not safely removable by rule. A quoted block can carry the
+// lemma the solution builds on, and an "Edit:" line can carry a correction, so
+// deleting either deterministically would risk destroying mathematics.
+const SOLUTION_REVIEW_NOISE = [
+    [
+        "content.quote_block",
+        /\[quote\b[^\]]*\]|\[\/quote\]/i,
+        "Solution content contains a quoted forum reply.",
+    ],
+    [
+        "content.greeting_or_signoff",
+        /(?:^|\n)[ \t]*(?:hi|hello|hey|thanks|thank you|thx|nice problem|good problem|bump|lol|oops|edit)\b[^\n]*/i,
+        "Solution content contains a greeting, sign-off, or edit note.",
+    ],
+];
+
+export const SOLUTION_NOISE_RULES = [...SOLUTION_FIXABLE_NOISE, ...SOLUTION_REVIEW_NOISE];
+
+// Labels that say nothing the surrounding text does not already say. Anything
+// else ("Solution 2", "Alternate Solution", "Note") is kept as a heading line so
+// unwrapping a [hide] block never silently drops which solution it was.
+const GENERIC_HIDE_LABEL =
+    /^(?:click\s+(?:here\s+)?(?:for|to\s+(?:see|reveal|view))\s+)?(?:my\s+|the\s+)?(?:solutions?|soln?s?|answers?|ans|hide|spoiler|hidden|hint)\b[\s.!:]*$/i;
+
+/**
+ * Remove forum presentation residue that can be removed with certainty.
+ *
+ * Idempotent, and deliberately narrow: quoted blocks and greeting/edit lines are
+ * left alone because removing them can destroy mathematics. This runs on
+ * `solutions.content` at ingest and again in `preprocess`; the documentary
+ * `solution_sources.raw_content` is never touched.
+ */
+export function normalizeSolutionText(value) {
+    let text = String(value ?? "").replace(/\r\n/g, "\n");
+
+    // [hide="Solution 2"] ... [/hide] -> keep the inner text, and keep an
+    // informative label as its own line.
+    text = text.replace(/\[hide(?:\s*=\s*("?)([^\]]*?)\1)?\]/gi, (_match, _quote, label) => {
+        const trimmed = String(label ?? "").trim();
+        if (!trimmed || GENERIC_HIDE_LABEL.test(trimmed)) return "";
+        return `\n${trimmed}\n`;
+    });
+    text = text.replace(/\[\/hide\]/gi, "");
+
+    // Whole-line removals take their own line ending with them, so two adjacent
+    // residue lines both go and a second pass changes nothing.
+    text = text.replace(/^[ \t]*click to reveal hidden text[ \t]*\n?/gim, "");
+    text = text.replace(
+        /^[ \t]*(?:(?:edited|posted)\s+by\b.*|this post has been edited.*)\n?/gim,
+        "",
+    );
+    // A rule of underscores is always a signature separator. A rule of dashes is
+    // only one when no text sits directly above it, since "text\n-----" is a
+    // Markdown setext heading.
+    text = text.replace(/^[ \t]*_{5,}[ \t]*\n?/gm, "");
+    text = text.replace(/(?<=^|\n[ \t]*\n)[ \t]*-{5,}[ \t]*(?:\n|$)/g, "");
+
+    return text
+        .replace(/[ \t]+(?=\n)/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
 function auditBbcode(text, original, findings, mathRegions = []) {
     const tag = /\[(\/?)\s*([a-z][a-z0-9]*)(?:\s*=[^\]]*)?\]/gi;
     const stack = [];
@@ -746,6 +850,14 @@ function auditResidue(text, context, findings) {
             /\[(?:quote|hide)\b[^\]]*\]|(?:^|\n)\s*(?:edited|posted)\s+by\b/i,
             "Problem statement contains forum-post markup or metadata.",
         ]);
+    }
+
+    // Canonical solution content only. raw_content is the documentary source and
+    // is expected to look like a forum post.
+    if (entityType === "solution") {
+        for (const [ruleId, regex, message] of SOLUTION_NOISE_RULES) {
+            checks.push([ruleId, "warning", regex, message]);
+        }
     }
 
     if (source === "wiki") {

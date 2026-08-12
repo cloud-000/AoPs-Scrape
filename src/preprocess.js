@@ -4,12 +4,15 @@ import { resolveTopic } from './topicPolicy.js';
 import {
     cleanPdfDelimiterResidue,
     normalizePdfStatement,
+    normalizeSolutionText,
 } from './textAudit.js';
 import { SOLUTIONS_USERS } from '../contest_id.js';
 import {
     classifySolutions,
-    resolveWikiRedirectLinks,
+    hashText,
     normalizeProblemLinks,
+    normalizeSolutionContent,
+    resolveWikiRedirectLinks,
 } from './db.js';
 
 /**
@@ -19,17 +22,19 @@ import {
  *
  * Responsibilities:
  * 1. Normalize deterministic PDF currency and delimiter residue
- * 2. Re-extract MCQ choices / clean statements on the source of truth
- * 3. Re-resolve every problem's acgn (test-declared subject, else inferACGN)
- * 4. Apply AUTO_TAGS and union into existing tags
- * 5. is_official detection for solution sources based on known organizers
- * 6. Re-apply solution classification rules to existing solutions
- * 7. Answer cross-check: log warnings where aops_answer != pdf_answer
+ * 2. Normalize deterministic forum residue in canonical solution content
+ * 3. Re-extract MCQ choices / clean statements on the source of truth
+ * 4. Re-resolve every problem's acgn (test-declared subject, else inferACGN)
+ * 5. Apply AUTO_TAGS and union into existing tags
+ * 6. is_official detection for solution sources based on known organizers
+ * 7. Re-apply solution classification rules to existing solutions
+ * 8. Answer cross-check: log warnings where aops_answer != pdf_answer
  */
 export async function runPreprocess(db) {
     console.log("Running pre-processing pipeline...\n");
 
     normalizePdfStatements(db);
+    normalizeSolutionTexts(db);
     await refreshChoices(db);
     await reclassifyAcgn(db);
     await retagProblems(db);
@@ -78,12 +83,57 @@ function normalizePdfStatements(db) {
     );
 }
 
+// Backfills the same forum-residue normalization that upsertSolutionCandidate
+// applies at ingest, so solutions collected before the normalizer existed catch
+// up. Manual rows are never touched, and solution_sources.raw_content keeps the
+// complete original in every case.
+function normalizeSolutionTexts(db) {
+    console.log("Step 2: Normalizing deterministic solution text...");
+    const rows = db
+        .query(
+            `SELECT id, problem_id, content FROM solutions
+              WHERE status_source <> 'manual'`,
+        )
+        .all();
+    const update = db.prepare(
+        `UPDATE solutions SET content = ?, normalized_hash = ?, updated_at = datetime('now')
+          WHERE id = ?`,
+    );
+    const collides = db.prepare(
+        `SELECT id FROM solutions
+          WHERE problem_id = ? AND normalized_hash = ? AND id <> ? LIMIT 1`,
+    );
+    let updated = 0;
+    let collisions = 0;
+
+    db.transaction(() => {
+        for (const row of rows) {
+            const normalized = normalizeSolutionText(row.content);
+            if (!normalized || normalized === row.content) continue;
+            // Stripping residue can make two rows identical. That is a duplicate
+            // for step 7 to judge, not something to merge here, so leave the row
+            // as it stands and report it.
+            const hash = hashText(normalizeSolutionContent(normalized));
+            if (collides.get(row.problem_id, hash, row.id)) {
+                collisions++;
+                continue;
+            }
+            update.run(normalized, hash, row.id);
+            updated++;
+        }
+    })();
+
+    console.log(
+        `  Updated ${updated} solution(s) (${collisions} left for duplicate review).`,
+    );
+}
+
 // Resolves any pending wiki redirects whose target is now imported and collapses
 // duplicate-link chains so every alias points directly at its ultimate canonical.
 // Both are idempotent and require no network.
 function normalizeDuplicateLinks(db) {
     console.log(
-        "Step 8: Resolving wiki redirects + normalizing duplicate links...",
+        "Step 9: Resolving wiki redirects + normalizing duplicate links...",
     );
     const r = resolveWikiRedirectLinks(db);
     const n = normalizeProblemLinks(db);
@@ -96,7 +146,7 @@ function normalizeDuplicateLinks(db) {
 // re-cleans any leftover appended answer-choice block. The resolved columns are
 // recomputed with the normal pdf > wiki > aops precedence.
 function refreshChoices(db) {
-    console.log("Step 2: Re-extracting MCQ choices / cleaning statements...");
+    console.log("Step 3: Re-extracting MCQ choices / cleaning statements...");
     const problems = db
         .query(
             `SELECT problems.id, problems.verified, problems.pdf_statement,
@@ -241,7 +291,7 @@ function refreshChoices(db) {
 }
 
 function reclassifyAcgn(db) {
-    console.log("Step 3: Re-inferring ACGN classification...");
+    console.log("Step 4: Re-inferring ACGN classification...");
     // Joined to tests because a test can declare its problems' subject outright
     // (a Calculus / Integration Bee round), in which case that declaration wins
     // over the keyword inference — see src/topicPolicy.js.
@@ -270,7 +320,7 @@ function reclassifyAcgn(db) {
 }
 
 function retagProblems(db) {
-    console.log("Step 4: Re-applying auto-tags (union with existing)...");
+    console.log("Step 5: Re-applying auto-tags (union with existing)...");
     const problems = db.query("SELECT id, statement, tags FROM problems WHERE statement IS NOT NULL").all();
     let updated = 0;
     const stmt = db.prepare("UPDATE problems SET tags = ? WHERE id = ?");
@@ -294,7 +344,7 @@ function retagProblems(db) {
 }
 
 function reclassifySolutions(db) {
-    console.log("Step 6: Re-classifying solution candidates...");
+    console.log("Step 7: Re-classifying solution candidates...");
     const result = classifySolutions(db);
     console.log(
         `  Classified ${result.updated} solution(s); marked ${result.duplicates} near-duplicate(s).`,
@@ -302,7 +352,7 @@ function reclassifySolutions(db) {
 }
 
 function detectOfficialSolutions(db) {
-    console.log("Step 5: Detecting official solution sources by known organizers...");
+    console.log("Step 6: Detecting official solution sources by known organizers...");
 
     if (!SOLUTIONS_USERS || SOLUTIONS_USERS.length === 0) {
         console.log("  No SOLUTIONS_USERS defined, skipping.");
@@ -341,7 +391,7 @@ function detectOfficialSolutions(db) {
 }
 
 function crossCheckAnswers(db) {
-    console.log("Step 7: Cross-checking AoPS vs PDF answers...");
+    console.log("Step 8: Cross-checking AoPS vs PDF answers...");
 
     const mismatches = db.query(`
         SELECT p.id, p.aops_answer, p.pdf_answer, t.name AS test_name, p.n

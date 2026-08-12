@@ -12,6 +12,7 @@ import {
     responseKindForSeries,
     resolveCoverage,
 } from "./coverage.js";
+import { normalizeSolutionText } from "./textAudit.js";
 import { SOLUTIONS_USERS } from "../contest_id.js";
 
 function sqlStringList(values) {
@@ -563,7 +564,15 @@ export function upsertSolutionCandidate(db, input) {
     if (!input?.problemId || !input.content) return null;
 
     const source = input.source ?? "manual";
-    const content = String(input.content).trim();
+    // Canonical content loses forum presentation residue on the way in, exactly
+    // as PDF statements do. Applying it here and in preprocess is what keeps a
+    // re-scrape from inserting a second row for the same solution; the complete
+    // original still lands in solution_sources.raw_content untouched. Reviewer-
+    // approved values opt out (`normalize: false`) so they materialize verbatim.
+    const content =
+        input.normalize === false
+            ? String(input.content).trim()
+            : normalizeSolutionText(input.content);
     if (!content) return null;
 
     const normalizedHash = hashText(normalizeSolutionContent(content));
@@ -792,6 +801,15 @@ export function rejectLLMProposal(
     })();
 }
 
+// Materializing an accepted proposal is per-operation domain work, so each
+// operation registers a materializer here rather than growing another branch in
+// acceptLLMProposal. Keyed by the operation name written on the proposal; the
+// names are literals so src/llm modules can keep importing this file.
+const LLM_MATERIALIZERS = {
+    extract_solution_from_post: materializeExtractedSolution,
+    repair_solution_format: materializeSolutionFormatRepair,
+};
+
 export function acceptLLMProposal(
     db,
     proposalId,
@@ -807,7 +825,8 @@ export function acceptLLMProposal(
             .query(`SELECT * FROM llm_proposals WHERE id = ?`)
             .get(proposalId);
         if (!proposalRow) throw new Error(`LLM proposal ${proposalId} does not exist`);
-        if (proposalRow.operation !== "extract_solution_from_post") {
+        const materialize = LLM_MATERIALIZERS[proposalRow.operation];
+        if (!materialize) {
             throw new Error(`Unsupported materialization operation: ${proposalRow.operation}`);
         }
         if (proposalRow.currency_status !== "current") {
@@ -816,104 +835,183 @@ export function acceptLLMProposal(
         if (proposalRow.review_status === "rejected") {
             throw new Error(`Rejected proposal ${proposalId} cannot be accepted`);
         }
-
-        const proposal = JSON.parse(proposalRow.proposal_json);
-        const content = String(approvedValue ?? proposal.extracted_content ?? "").trim();
-        if (!content) throw new Error(`Proposal ${proposalId} has no materializable solution`);
-        const source = proposal.source ?? {};
-        const postId = source.post_id;
-        if (postId == null) throw new Error(`Proposal ${proposalId} has no AoPS post id`);
-        const sourceKey = `post:${postId}`;
-
-        const attached = db
-            .query(
-                `SELECT ss.solution_id, s.status_source
-                 FROM solution_sources ss
-                 JOIN solutions s ON s.id = ss.solution_id
-                 WHERE ss.problem_id = ? AND ss.source = 'aops' AND ss.source_key = ?`,
-            )
-            .get(proposalRow.problem_id, sourceKey);
-        const normalizedHash = hashText(normalizeSolutionContent(content));
-        const target = db
-            .query(`SELECT id FROM solutions WHERE problem_id = ? AND normalized_hash = ?`)
-            .get(proposalRow.problem_id, normalizedHash);
-        if (
-            attached &&
-            attached.status_source === "manual" &&
-            attached.solution_id !== target?.id
-        ) {
-            throw new Error(
-                `AoPS source ${sourceKey} is attached to a manually reviewed solution`,
-            );
-        }
-
-        const oldSolutionId = attached?.solution_id ?? null;
-        const solutionId = upsertSolutionCandidate(db, {
-            problemId: proposalRow.problem_id,
-            source: "aops",
-            sourceKey,
-            content,
-            content_format: "latex_bbcode",
-            raw_content: source.raw_content,
-            source_url: source.source_url,
-            aops_topic_id: source.topic_id,
-            aops_post_id: postId,
-            aops_user_id: source.user_id,
-            aops_username: source.username,
-            posted_at: source.posted_at,
-            is_official: false,
-            status: "accepted",
-            status_source: "manual",
-        });
-        db.run(
-            `UPDATE solutions SET
-                content = ?, status = 'accepted', status_source = 'manual',
-                solution_type = ?, reviewed_by = ?, reviewed_at = datetime('now'),
-                review_notes = ?, duplicate_of_solution_id = NULL,
-                updated_at = datetime('now')
-             WHERE id = ?`,
-            [
-                content,
-                proposal.classification === "full_solution" ? "full" : "sketch",
-                reviewer,
-                notes,
-                solutionId,
-            ],
-        );
-        db.run(
-            `UPDATE solution_sources SET source_content_hash = ?, raw_content = ?
-             WHERE problem_id = ? AND source = 'aops' AND source_key = ?`,
-            [
-                proposalRow.source_content_hash,
-                source.raw_content,
-                proposalRow.problem_id,
-                sourceKey,
-            ],
-        );
-        if (oldSolutionId && oldSolutionId !== solutionId) {
-            markOrphanedAutoSolutionSuperseded(db, oldSolutionId);
-        }
-
-        const materializedHash = hashText(content);
-        db.run(
-            `INSERT INTO llm_materializations (
-                proposal_id, request_key, method, entity_type, entity_id,
-                materialized_value_hash, materialization_version
-             ) VALUES (?, ?, 'llm_extract', 'solution', ?, ?, '1')`,
-            [proposalId, proposalRow.request_key, solutionId, materializedHash],
-        );
-        db.run(
-            `UPDATE llm_proposals SET
-                reviewer_approved_value = ?, review_status = 'accepted',
-                status_source = 'manual', reviewed_by = ?, reviewed_at = datetime('now'),
-                review_notes = ?, updated_at = datetime('now')
-             WHERE id = ?`,
-            [content, reviewer, notes, proposalId],
-        );
-        return db
-            .query(`SELECT * FROM llm_materializations WHERE proposal_id = ?`)
-            .get(proposalId);
+        return materialize(db, proposalRow, { approvedValue, reviewer, notes });
     })();
+}
+
+function materializeExtractedSolution(db, proposalRow, { approvedValue, reviewer, notes }) {
+    const proposalId = proposalRow.id;
+    const proposal = JSON.parse(proposalRow.proposal_json);
+    const content = String(approvedValue ?? proposal.extracted_content ?? "").trim();
+    if (!content) throw new Error(`Proposal ${proposalId} has no materializable solution`);
+    const source = proposal.source ?? {};
+    const postId = source.post_id;
+    if (postId == null) throw new Error(`Proposal ${proposalId} has no AoPS post id`);
+    const sourceKey = `post:${postId}`;
+
+    const attached = db
+        .query(
+            `SELECT ss.solution_id, s.status_source
+             FROM solution_sources ss
+             JOIN solutions s ON s.id = ss.solution_id
+             WHERE ss.problem_id = ? AND ss.source = 'aops' AND ss.source_key = ?`,
+        )
+        .get(proposalRow.problem_id, sourceKey);
+    const normalizedHash = hashText(normalizeSolutionContent(content));
+    const target = db
+        .query(`SELECT id FROM solutions WHERE problem_id = ? AND normalized_hash = ?`)
+        .get(proposalRow.problem_id, normalizedHash);
+    if (
+        attached &&
+        attached.status_source === "manual" &&
+        attached.solution_id !== target?.id
+    ) {
+        throw new Error(
+            `AoPS source ${sourceKey} is attached to a manually reviewed solution`,
+        );
+    }
+
+    const oldSolutionId = attached?.solution_id ?? null;
+    const solutionId = upsertSolutionCandidate(db, {
+        problemId: proposalRow.problem_id,
+        source: "aops",
+        sourceKey,
+        content,
+        content_format: "latex_bbcode",
+        raw_content: source.raw_content,
+        source_url: source.source_url,
+        aops_topic_id: source.topic_id,
+        aops_post_id: postId,
+        aops_user_id: source.user_id,
+        aops_username: source.username,
+        posted_at: source.posted_at,
+        is_official: false,
+        status: "accepted",
+        status_source: "manual",
+        // A reviewer approved this exact text; it materializes verbatim.
+        normalize: false,
+    });
+    db.run(
+        `UPDATE solutions SET
+            content = ?, status = 'accepted', status_source = 'manual',
+            solution_type = ?, reviewed_by = ?, reviewed_at = datetime('now'),
+            review_notes = ?, duplicate_of_solution_id = NULL,
+            updated_at = datetime('now')
+         WHERE id = ?`,
+        [
+            content,
+            proposal.classification === "full_solution" ? "full" : "sketch",
+            reviewer,
+            notes,
+            solutionId,
+        ],
+    );
+    db.run(
+        `UPDATE solution_sources SET source_content_hash = ?, raw_content = ?
+         WHERE problem_id = ? AND source = 'aops' AND source_key = ?`,
+        [
+            proposalRow.source_content_hash,
+            source.raw_content,
+            proposalRow.problem_id,
+            sourceKey,
+        ],
+    );
+    if (oldSolutionId && oldSolutionId !== solutionId) {
+        markOrphanedAutoSolutionSuperseded(db, oldSolutionId);
+    }
+
+    const materializedHash = hashText(content);
+    db.run(
+        `INSERT INTO llm_materializations (
+            proposal_id, request_key, method, entity_type, entity_id,
+            materialized_value_hash, materialization_version
+         ) VALUES (?, ?, 'llm_extract', 'solution', ?, ?, '1')`,
+        [proposalId, proposalRow.request_key, solutionId, materializedHash],
+    );
+    db.run(
+        `UPDATE llm_proposals SET
+            reviewer_approved_value = ?, review_status = 'accepted',
+            status_source = 'manual', reviewed_by = ?, reviewed_at = datetime('now'),
+            review_notes = ?, updated_at = datetime('now')
+         WHERE id = ?`,
+        [content, reviewer, notes, proposalId],
+    );
+    return db
+        .query(`SELECT * FROM llm_materializations WHERE proposal_id = ?`)
+        .get(proposalId);
+}
+
+/**
+ * Materialize an accepted `repair_solution_format` proposal.
+ *
+ * This is a presentation-only promotion: it rewrites `solutions.content` and
+ * nothing else. `solution_sources.raw_content` keeps the complete original
+ * documentary source, so the repair never rewrites history, and the solution is
+ * marked `status_source = 'manual'` so `preprocess` cannot classify over it.
+ */
+function materializeSolutionFormatRepair(db, proposalRow, { approvedValue, reviewer, notes }) {
+    const proposalId = proposalRow.id;
+    const proposal = JSON.parse(proposalRow.proposal_json);
+    const solutionId = proposal.target?.solution_id;
+    if (solutionId == null) throw new Error(`Proposal ${proposalId} has no target solution`);
+
+    const content = String(approvedValue ?? proposal.replacement ?? "").trim();
+    if (!content) throw new Error(`Proposal ${proposalId} has no materializable solution`);
+
+    const solution = db.query(`SELECT * FROM solutions WHERE id = ?`).get(solutionId);
+    if (!solution) throw new Error(`Solution ${solutionId} no longer exists`);
+    if (solution.problem_id !== proposalRow.problem_id) {
+        throw new Error(`Solution ${solutionId} does not belong to problem ${proposalRow.problem_id}`);
+    }
+    // The proposal was written against an exact snapshot of this solution. If it
+    // has moved since — a manual edit, a re-classification, another accepted
+    // repair — promoting the stale replacement would silently discard that work.
+    if (hashText(solution.content) !== proposalRow.source_content_hash) {
+        throw new Error(
+            `Solution ${solutionId} changed after proposal ${proposalId} was created; re-plan before accepting`,
+        );
+    }
+
+    const normalizedHash = hashText(normalizeSolutionContent(content));
+    const collision = db
+        .query(
+            `SELECT id FROM solutions
+             WHERE problem_id = ? AND normalized_hash = ? AND id <> ?`,
+        )
+        .get(solution.problem_id, normalizedHash, solutionId);
+    if (collision) {
+        throw new Error(
+            `Repaired content for solution ${solutionId} collides with existing solution ${collision.id}`,
+        );
+    }
+
+    db.run(
+        `UPDATE solutions SET
+            content = ?, normalized_hash = ?, status = 'accepted', status_source = 'manual',
+            reviewed_by = ?, reviewed_at = datetime('now'), review_notes = ?,
+            duplicate_of_solution_id = NULL, updated_at = datetime('now')
+         WHERE id = ?`,
+        [content, normalizedHash, reviewer, notes, solutionId],
+    );
+
+    db.run(
+        `INSERT INTO llm_materializations (
+            proposal_id, request_key, method, entity_type, entity_id,
+            materialized_value_hash, materialization_version
+         ) VALUES (?, ?, 'llm_repair', 'solution', ?, ?, '1')`,
+        [proposalId, proposalRow.request_key, solutionId, hashText(content)],
+    );
+    db.run(
+        `UPDATE llm_proposals SET
+            reviewer_approved_value = ?, review_status = 'accepted',
+            status_source = 'manual', reviewed_by = ?, reviewed_at = datetime('now'),
+            review_notes = ?, updated_at = datetime('now')
+         WHERE id = ?`,
+        [content, reviewer, notes, proposalId],
+    );
+    return db
+        .query(`SELECT * FROM llm_materializations WHERE proposal_id = ?`)
+        .get(proposalId);
 }
 
 export function classifySolutions(
