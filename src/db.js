@@ -164,8 +164,12 @@ CREATE TABLE IF NOT EXISTS solutions (
                              CHECK (status IN ('candidate', 'accepted', 'needs_review', 'rejected', 'duplicate', 'superseded')),
   status_source            TEXT NOT NULL DEFAULT 'auto'
                              CHECK (status_source IN ('auto', 'manual')),
+  -- 'statement_echo' (the problem restating itself) and 'video' (a wiki Video
+  -- Solution section: a link and a credit line) are things a forum/wiki scrape
+  -- collects that are not written solutions. Naming them is what lets the
+  -- classifier act on each — see scoreSolutionContent.
   solution_type            TEXT NOT NULL DEFAULT 'unknown'
-                             CHECK (solution_type IN ('full', 'sketch', 'answer_only', 'discussion', 'unknown')),
+                             CHECK (solution_type IN ('full', 'sketch', 'answer_only', 'discussion', 'statement_echo', 'video', 'unknown')),
   quality_score            INTEGER NOT NULL DEFAULT 0 CHECK (quality_score BETWEEN 0 AND 100),
   quality_flags            TEXT,
   classifier_version       TEXT,
@@ -418,12 +422,25 @@ function summarizeSolutionSources(rows) {
         rows,
         hasWiki: rows.some((r) => r.source === "wiki"),
         hasManual: rows.some((r) => r.source === "manual"),
-        hasOfficialHint: rows.some((r) => r.is_official_hint),
+        // A *curated* source: the content was published somewhere that vouches
+        // for it (a wiki solution section, a hand-entered row, an official
+        // contest's own solution packet). Deliberately excludes a forum post
+        // whose only credential is its author — see `hasKnownSolutionUser`.
+        hasOfficialHint: rows.some(
+            (r) => r.is_official_hint && r.source !== "aops",
+        ),
+        // An author signal, not a source signal: these users write most of the
+        // good AoPS solutions, but they also post in the same threads as
+        // everyone else. It raises a post's score; it never vouches for it.
         hasKnownSolutionUser: rows.some((r) =>
             KNOWN_SOLUTION_USER_IDS.has(r.aops_user_id),
         ),
+        // Scoped the same way as `hasOfficialHint`, and for the same reason: an
+        // AoPS post gets no reliability at ingest, so any it carries was
+        // stamped on by the known-organizer pass and is an author signal.
         maxReliability: rows.reduce(
-            (max, r) => Math.max(max, r.reliability_hint ?? 0),
+            (max, r) =>
+                r.source === "aops" ? max : Math.max(max, r.reliability_hint ?? 0),
             0,
         ),
         bestSourcePriority: rows.reduce(
@@ -438,7 +455,17 @@ function summarizeSolutionSources(rows) {
     };
 }
 
-function scoreSolutionContent(content, sourceSummary) {
+/**
+ * Scores one solution's content.
+ *
+ * `statementPostId` is the problem's own `aops_post_id`. A solution sourced from
+ * that very post is the problem restating itself — see `searchTopicForSolutions`
+ * for how the statement gets in. This is tested structurally rather than by
+ * comparing text to the statement: a similarity threshold also fires on the PDF
+ * packets (HMMT team rounds, OMO) whose solutions legitimately quote the problem
+ * in full before solving it, and those are real solutions.
+ */
+function scoreSolutionContent(content, sourceSummary, statementPostId = null) {
     const normalized = normalizeSolutionContent(content);
     const flags = [];
     const reasons = [];
@@ -457,6 +484,49 @@ function scoreSolutionContent(content, sourceSummary) {
     const hasAnswerOnly =
         /^\\?boxed\s*\{[^}]+\}\.?$/i.test(normalized) ||
         (wordCount <= 8 && /\\boxed\s*\{/.test(content));
+    const echoesStatement =
+        statementPostId != null &&
+        sourceSummary.rows.some(
+            (r) => r.source === "aops" && r.aops_post_id === statementPostId,
+        );
+    // Substance is measured with quoted text removed, because a quote is someone
+    // else's post: a reply that quotes the whole problem and adds "lol" is a
+    // one-word reply, not a long one. Only the chatter test uses this — the
+    // score tiers still read the full content, so quoting a lemma and building
+    // on it is not penalized.
+    const bodyWordCount = normalizeSolutionContent(
+        String(content).replace(/\[quote(?:=[^\]]*)?\][\s\S]*?\[\/quote\]/gi, " "),
+    )
+        .split(/\s+/)
+        .filter(Boolean).length;
+    // A reply with no math, no boxed answer, and nothing to say. The older AMC 8
+    // / AJHSME threads are full of these ("This should really be in the AMC
+    // forum."), and until the known-author hint stopped vouching for content
+    // they all landed in production as official solutions.
+    const isChatter =
+        !echoesStatement &&
+        bodyWordCount < 12 &&
+        !hasMath &&
+        !/\\boxed\s*\{/.test(content);
+    // The AoPS wiki publishes "Video Solution" sections whose whole body is a
+    // YouTube link and a credit line. They are real solutions and a real source,
+    // just not text ones — worth their own type so they are neither mistaken for
+    // chatter nor silently exported as an official solution that reads as a URL.
+    // Everything outside the URLs. A video section is a link plus a credit
+    // ("~Math-X"), and a section listing several videos carries several credits
+    // — hence a word budget rather than "almost nothing". 40 sits on a natural
+    // plateau in this corpus (raising it to 60 reclassifies one more row), and
+    // the math guard is the real protection: a *written* solution that also
+    // links a video shows its work, so any TeX in the non-URL body keeps the
+    // row a text solution regardless of how short it is.
+    const videoBody = String(content).replace(ANY_URL_RE, " ");
+    const isVideoLink =
+        extractVideoUrls(content).length > 0 &&
+        !/\\(?:frac|sqrt|sum|prod|angle|triangle|boxed|begin|end|cdot|times)|\$[^$]+\$/.test(
+            videoBody,
+        ) &&
+        normalizeSolutionContent(videoBody).split(/\s+/).filter(Boolean).length <
+            40;
 
     if (sourceSummary.hasWiki || sourceSummary.hasOfficialHint) {
         score += 35;
@@ -479,19 +549,34 @@ function scoreSolutionContent(content, sourceSummary) {
     if (hasProofMarker) score += 10;
     if (hasMath) score += 5;
 
-    if (hasAnswerOnly) {
+    // Echo and chatter are tested before the length tiers, or a long restatement
+    // of a long problem scores as a "full" solution on word count alone.
+    if (echoesStatement) {
+        solutionType = "statement_echo";
+        score = 0;
+        flags.push("statement_echo");
+        reasons.push("restates the problem");
+    } else if (isVideoLink) {
+        solutionType = "video";
+        flags.push("video");
+        reasons.push("video link, no written solution");
+    } else if (hasAnswerOnly) {
         solutionType = "answer_only";
         score = Math.min(score, 35);
         flags.push("answer_only");
         reasons.push("looks like answer only");
+    } else if (
+        isChatter ||
+        (wordCount < 18 && /thanks|bump|typo|where did|can someone/i.test(content))
+    ) {
+        solutionType = "discussion";
+        score = Math.min(score, 30);
+        flags.push("discussion");
+        reasons.push("forum chatter, not a solution");
     } else if (wordCount >= 40 && hasProofMarker) {
         solutionType = "full";
     } else if (wordCount >= 18) {
         solutionType = "sketch";
-    } else if (/thanks|bump|typo|where did|can someone/i.test(content)) {
-        solutionType = "discussion";
-        score = Math.min(score, 30);
-        flags.push("discussion");
     }
 
     return {
@@ -1014,6 +1099,42 @@ function materializeSolutionFormatRepair(db, proposalRow, { approvedValue, revie
         .get(proposalId);
 }
 
+// Any URL, including the protocol-relative form MediaWiki external links use
+// (`[//youtu.be/VP7g-s8akMY ~hsnacademy]`). Requiring `https?:` here is what let
+// 103 of those through as "text" solutions whose whole body was raw link markup.
+const ANY_URL_RE = /(?:https?:)?\/\/\S+/gi;
+const VIDEO_HOST_RE = /^(?:https?:)?\/\/(?:www\.)?(?:youtu\.be|youtube\.com|m\.youtube\.com|vimeo\.com)\//i;
+
+/**
+ * The video URLs a solution body links to, used to recognize a wiki "Video
+ * Solution" section. Solutions are stored and exported verbatim, so this feeds
+ * `solution_type` only — it never rewrites content.
+ *
+ * The wiki writes these four ways — `[youtube]URL[/youtube]`, `[url]URL[/url]`,
+ * `[//URL credit]`, and a bare URL followed by the poster's credit
+ * ("~DSA_Catachu"). Three traps, all of which cost accuracy when missed: `\S+`
+ * swallows the closing `[/youtube]` (and the observed typo `[\youtube]`) into
+ * the match, so trailing BBCode and punctuation are trimmed; MediaWiki's
+ * external-link form omits the scheme (`//youtu.be/…`), and requiring `https?:`
+ * left 44 of those unrecognized; and these sections often also carry a sponsor
+ * link (`https://piacademyus.org/`), so only known video hosts count — a body
+ * whose only URL is a sponsor is not a video solution.
+ */
+export function extractVideoUrls(content) {
+    const found = String(content ?? "").match(ANY_URL_RE) ?? [];
+    const urls = [];
+    for (const raw of found) {
+        const trimmed = raw
+            .replace(/\[[\\/]?[a-z]+\].*$/i, "")
+            .replace(/[.,;:)\]]+$/, "")
+            .trim();
+        if (!VIDEO_HOST_RE.test(trimmed)) continue;
+        const url = trimmed.startsWith("//") ? `https:${trimmed}` : trimmed;
+        if (!urls.includes(url)) urls.push(url);
+    }
+    return urls;
+}
+
 export function classifySolutions(
     db,
     { version = SOLUTION_CLASSIFIER_VERSION, nearDuplicateThreshold = 0.92 } = {},
@@ -1024,11 +1145,12 @@ export function classifySolutions(
     db.transaction(() => {
         const rows = db
             .query(
-                `SELECT *
-                 FROM solutions
-                 WHERE status_source != 'manual'
-                   AND status != 'superseded'
-                 ORDER BY problem_id, id`,
+                `SELECT s.*, p.aops_post_id AS problem_post_id
+                 FROM solutions s
+                 JOIN problems p ON p.id = s.problem_id
+                 WHERE s.status_source != 'manual'
+                   AND s.status != 'superseded'
+                 ORDER BY s.problem_id, s.id`,
             )
             .all();
 
@@ -1039,7 +1161,7 @@ export function classifySolutions(
         for (const source of db
             .query(
                 `SELECT solution_id, source, is_official_hint, reliability_hint,
-                        aops_user_id, posted_at
+                        aops_user_id, aops_post_id, posted_at
                  FROM solution_sources`,
             )
             .all()) {
@@ -1075,15 +1197,35 @@ export function classifySolutions(
 
         for (const row of rows) {
             const summary = summaryFor(row.id);
-            const scored = scoreSolutionContent(row.content, summary);
+            const scored = scoreSolutionContent(
+                row.content,
+                summary,
+                row.problem_post_id,
+            );
             const isOfficial = row.is_official || summary.hasWiki || summary.hasOfficialHint;
             let status;
-            if (isOfficial || scored.score >= 70) {
+            // Content disqualifiers run first and no source overrides them. A
+            // curated source vouches for a solution being *right*; it cannot
+            // make a restated problem or a one-line forum aside into a
+            // solution, and letting it try is what put "This should really be
+            // in the AMC forum." into production as an official solution.
+            // `video` is deliberately NOT among them, and that is the whole
+            // reason the type exists: a wiki Video Solution is a link plus a
+            // credit line, so the `discussion` rule below (short, no math, no
+            // boxed answer) would otherwise reject it as chatter. Typing it
+            // first exempts it, and it then flows into `official_solutions`
+            // like any other accepted solution — consumers render it.
+            if (
+                scored.solutionType === "statement_echo" ||
+                scored.solutionType === "discussion" ||
+                scored.flags.includes("empty")
+            ) {
+                status = "rejected";
+            } else if (isOfficial || scored.score >= 70) {
                 status = "accepted";
             } else if (
                 scored.score < 40 ||
-                scored.solutionType === "answer_only" ||
-                scored.solutionType === "discussion"
+                scored.solutionType === "answer_only"
             ) {
                 status = "rejected";
             } else {
@@ -1236,6 +1378,45 @@ SELECT
 FROM problems_old;
             `);
             db.exec(`DROP TABLE problems_old;`);
+            db.exec(`PRAGMA foreign_keys = ON;`);
+        })();
+    }
+
+    // Migration: widen the solution_type vocabulary with 'statement_echo' and
+    // 'video'. SCHEMA's CREATE TABLE IF NOT EXISTS is a no-op on an existing
+    // `solutions`, so the old CHECK survives and the classifier's first write of
+    // either value aborts the whole transaction. Rebuild rather than patch: a
+    // CHECK cannot be altered in place. `id` is preserved because
+    // solution_sources.solution_id, solutions.duplicate_of_solution_id and the
+    // llm_* tables all point at it.
+    const solutionsDDL =
+        db
+            .query(
+                `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'solutions'`,
+            )
+            .get()?.sql ?? "";
+    if (solutionsDDL && !solutionsDDL.includes("statement_echo")) {
+        db.transaction(() => {
+            db.exec(`PRAGMA foreign_keys = OFF;`);
+            db.exec(`ALTER TABLE solutions RENAME TO solutions_old;`);
+            db.exec(`DROP INDEX IF EXISTS idx_solutions_problem_status;`);
+            db.exec(`DROP INDEX IF EXISTS idx_solutions_duplicate_of;`);
+            db.exec(SCHEMA);
+            db.exec(`
+INSERT INTO solutions (
+  id, problem_id, content, content_format, normalized_hash,
+  status, status_source, solution_type, quality_score, quality_flags,
+  classifier_version, classifier_reasons, is_official, duplicate_of_solution_id,
+  selected_rank, reviewed_by, reviewed_at, review_notes, created_at, updated_at
+)
+SELECT
+  id, problem_id, content, content_format, normalized_hash,
+  status, status_source, solution_type, quality_score, quality_flags,
+  classifier_version, classifier_reasons, is_official, duplicate_of_solution_id,
+  selected_rank, reviewed_by, reviewed_at, review_notes, created_at, updated_at
+FROM solutions_old;
+            `);
+            db.exec(`DROP TABLE solutions_old;`);
             db.exec(`PRAGMA foreign_keys = ON;`);
         })();
     }
@@ -1442,6 +1623,10 @@ FROM tests_old;
         prodCols.includes("acgn") ||
         !prodCols.includes("topic") ||
         !prodCols.includes("response_kind") ||
+        // Never shipped: video solutions are ordinary rows in
+        // official_solutions. Listed only so a DB built while that column
+        // briefly existed drops it instead of carrying a dead column forever.
+        prodCols.includes("video_solutions") ||
         prodCols.includes("section") ||
         (choicesCol && choicesCol.type !== "TEXT[]") ||
         (tagsCol && tagsCol.type !== "TEXT[]")

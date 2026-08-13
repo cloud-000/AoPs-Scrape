@@ -412,6 +412,28 @@ breaks the scrape twice over, and the second failure is the quiet one:
 Because `testName` drives type inference, it is the *stored* base — not the page base —
 that decides how a contest is parsed.
 
+**AJHSME is the same case, one contest over.** The AMC 8 was the AJHSME until 1999
+(`{ name: "AJHSME", years: [1985, 1998], testName: "AMC 8" }`). Before that variant existed
+the descriptor started at 1999, so 1985–1998 were never fetched at all — no wiki
+statements, no answer key, and no wiki solutions. That last one is not a cosmetic gap: it
+left those problems with nothing but their forum threads to draw solutions from, and the
+AJHSME-era threads are mostly moderator chatter, which is what put lines like *"This
+should really be in the AMC forum."* into production as official solutions.
+
+**The pre-2000 AIME shows the third failure mode: a redirect.** The I/II split began in
+2000, so 1983–1999 need `{ name: "AIME", years: [1983, 1999] }` while the suffixed
+variants start at 2000. Leaving `"AIME I"` to inherit the full range does *not* 404 —
+`1987 AIME I Problems` is a redirect, so the fetch succeeds, and the year is stored under
+`"1987 AIME I"`. That forks a second test alongside the forum's `"1987 AIME"`, and the
+fork is where all the answers land while the real row keeps showing them as missing.
+`WikiSession.getContest` still remaps a pre-2000 `"AIME I"` back to `"AIME"` defensively,
+for a hand-typed single-year run, but the registry is the fix.
+
+The general rule: when a contest is renamed or split, declare the old era as its own
+variant with its own `years`. A wrong range either silently fetches nothing (AJHSME) or
+silently fetches into a duplicate test (AIME) — and neither announces itself, because a
+404 sweep and a successful scrape both look like a normal run.
+
 ---
 
 # Notes

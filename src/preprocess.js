@@ -6,7 +6,6 @@ import {
     normalizePdfStatement,
     normalizeSolutionText,
 } from './textAudit.js';
-import { SOLUTIONS_USERS } from '../contest_id.js';
 import {
     classifySolutions,
     hashText,
@@ -351,42 +350,58 @@ function reclassifySolutions(db) {
     );
 }
 
+/**
+ * Step 6 used to promote every post by a SOLUTIONS_USERS member to
+ * `is_official_hint = 1` (+ reliability 90) and then set `solutions.is_official`
+ * from that hint. That conflated two different claims:
+ *
+ * - **This source is curated** — a wiki solution section, a hand-entered row, an
+ *   official contest's solution packet. `is_official_hint` means this, and the
+ *   classifier lets it bypass the score threshold.
+ * - **This author usually writes solutions** — true of these users, and useful
+ *   as a *score* input, but it says nothing about any particular post. They
+ *   also moderate these forums, so their one-line asides ("This should really
+ *   be in the AMC forum.") inherited the bypass and were promoted to official
+ *   solutions of the problems whose threads they appeared in.
+ *
+ * So the author signal now stays where it belongs: `KNOWN_SOLUTION_USER_IDS` in
+ * db.js reads `aops_user_id` directly and scores it. This function's remaining
+ * job is to undo the conflation in DBs written by the old pass — an AoPS post
+ * never earns `is_official_hint`/`reliability_hint` at ingest, so any it carries
+ * came from here.
+ */
 function detectOfficialSolutions(db) {
-    console.log("Step 6: Detecting official solution sources by known organizers...");
-
-    if (!SOLUTIONS_USERS || SOLUTIONS_USERS.length === 0) {
-        console.log("  No SOLUTIONS_USERS defined, skipping.");
-        return;
-    }
-
-    const userIds = SOLUTIONS_USERS.map(u => u.id);
-    const placeholders = userIds.map(() => '?').join(',');
+    console.log("Step 6: Un-conflating known-organizer hints...");
 
     const sourceResult = db.run(
         `UPDATE solution_sources
-         SET is_official_hint = 1,
-             reliability_hint = MAX(reliability_hint, 90),
+         SET is_official_hint = 0,
+             reliability_hint = 0,
              last_seen_at = datetime('now')
-         WHERE aops_user_id IN (${placeholders})
-           AND is_official_hint = 0`,
-        userIds
+         WHERE source = 'aops'
+           AND (is_official_hint = 1 OR reliability_hint > 0)`,
     );
 
+    // Only clears solutions left with no curated source at all; a row that also
+    // has a wiki/manual/import source keeps its officiality, and manual review
+    // state is never touched.
     const solutionResult = db.run(`
         UPDATE solutions
-        SET is_official = 1,
+        SET is_official = 0,
             updated_at = datetime('now')
         WHERE status_source != 'manual'
-          AND EXISTS (
+          AND is_official = 1
+          AND NOT EXISTS (
               SELECT 1
               FROM solution_sources ss
               WHERE ss.solution_id = solutions.id
+                AND ss.source != 'aops'
                 AND ss.is_official_hint = 1
           )
     `);
 
     console.log(
-        `  Marked ${sourceResult.changes} source(s) and ${solutionResult.changes} solution(s) as official hints.`,
+        `  Cleared author-only hints on ${sourceResult.changes} source(s) and de-officialized ${solutionResult.changes} solution(s).`,
     );
 }
 

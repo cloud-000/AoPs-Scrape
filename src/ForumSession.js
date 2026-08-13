@@ -825,6 +825,7 @@ export class ForumSession {
             item.post_data.topic_id,
             true,
             false,
+            item.post_data.post_id,
          );
          // Each problem's answers live in [hide=S<n>] blocks; keep them raw so
          // _finalizeComputationalAnswers can pick the right \boxed{} per problem.
@@ -857,6 +858,7 @@ export class ForumSession {
          processed,
          type,
          item.post_data.topic_id,
+         item.post_data.post_id,
       );
       problem.postId = item.post_data.post_id;
       problem.topicId = item.post_data.topic_id;
@@ -1037,7 +1039,7 @@ export class ForumSession {
       problem.answerIndex = -1;
    }
 
-   async _buildProblem(processed, type, topicId) {
+   async _buildProblem(processed, type, topicId, postId = null) {
       const problem = makeProblem({
          statement: CleanupText.cleanProblem(processed),
       });
@@ -1048,6 +1050,7 @@ export class ForumSession {
             topicId,
             false,
             true,
+            postId,
          );
          problem.solutions = topicData.solutions;
          problem.posts = topicData.posts;
@@ -1062,6 +1065,7 @@ export class ForumSession {
          topicId,
          false,
          false,
+         postId,
       );
       problem.solutions = topicData.solutions;
       problem._answerPosts = topicData.answerPosts;
@@ -1166,10 +1170,17 @@ export class ForumSession {
       if (/\[hide\s*=[^\]]*solution[^\]]*\]/i.test(content)) return true;
       // Rule 2: QED markers
       if (/Q\.?E\.?D\.?|\\blacksquare|\\square/.test(content)) return true;
-      // Rule 3: known solution poster
+      // Rule 3: known solution poster, *and* the post carries enough to be a
+      // solution. The author is evidence about the author, not about the post:
+      // the same prolific users moderate these forums, and in the older AJHSME
+      // threads their replies are mostly one-liners ("This should really be in
+      // the AMC forum."). Taking the author alone as the test admitted that
+      // chatter as a solution, and — since the classifier treats a known author
+      // as an official hint — auto-accepted it into production.
       if (
          post.poster_id &&
-         (SOLUTIONS_USERS ?? []).some((u) => u.id === post.poster_id)
+         (SOLUTIONS_USERS ?? []).some((u) => u.id === post.poster_id) &&
+         ForumSession._hasSolutionSubstance(content)
       )
          return true;
       // Rule 4: contains \boxed{} (computational answer marker)
@@ -1180,10 +1191,41 @@ export class ForumSession {
       return false;
    }
 
+   // Minimum bar for "this post argues something", used only to qualify Rule 3.
+   // Quoted text is another post, so it is stripped before measuring — a reply
+   // that quotes the problem and adds "lol" is a one-word post.
+   static _hasSolutionSubstance(content) {
+      const body = String(content ?? "")
+         .replace(/\[quote(?:=[^\]]*)?\][\s\S]*?\[\/quote\]/gi, " ")
+         .trim();
+      if (!body) return false;
+      if (/\\boxed\s*\{/.test(body)) return true;
+      const words = body.split(/\s+/).filter(Boolean).length;
+      const hasMath = /\\(?:frac|sqrt|sum|prod|cdot|times|angle|triangle|begin)|[=<>]/.test(
+         body,
+      );
+      return words >= 25 || (words >= 12 && hasMath);
+   }
+
+   /**
+    * Reads a problem's discussion topic and splits it into answer candidates,
+    * solution candidates, and (for OLY) the raw post list.
+    *
+    * `statementPostId` is the post the problem's own statement came from. It
+    * lives in the same topic as the replies, and normally announces itself with
+    * `post_type === "view_posts_text"` — but not in the older contest
+    * collections, where the statement was posted as an ordinary reply by a
+    * moderator who is also in SOLUTIONS_USERS. There the statement matched
+    * `_isSolutionPost` and was stored as a solution *of itself*, which is why
+    * hundreds of problems carried a "solution" that just restates the problem.
+    * Excluding it by id is structural: whatever a post looks like, a problem's
+    * own statement is never its solution.
+    */
    async searchTopicForSolutions(
       id,
       searchManyProblems = false,
       isOly = false,
+      statementPostId = null,
    ) {
       // id 0 means the problems came from a packed view_posts_text post that
       // has no backing discussion topic — nothing to fetch.
@@ -1251,6 +1293,10 @@ export class ForumSession {
 
          // Classify solution posts (skip post_type === 'view_posts_text' which is the problem statement)
          if (post.post_type === "view_posts_text") continue;
+         // …and skip the statement post itself when it came through as an
+         // ordinary reply; see the note on this method.
+         if (statementPostId != null && post.post_id === statementPostId)
+            continue;
          if (this._isSolutionPost(post, content)) {
             solutions.push({
                post_id: post.post_id,

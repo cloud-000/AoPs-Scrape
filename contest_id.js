@@ -69,7 +69,21 @@ export const CONTEST_IDS = {
             name: "AMC 8",
             id: 3413,
             is_official: true,
-            wiki: { variants: ["AMC 8"], years: [1999, 2026] },
+            wiki: {
+                variants: [
+                    // The AMC 8 was the AJHSME until 1999 — the same rename
+                    // story as AHSME → AMC 12 below, and it needs the same
+                    // `testName`. The wiki publishes those years as
+                    // "1985 AJHSME Problems"; the forum (and so the DB) stores
+                    // them as "1985 AMC 8". Without this variant the pre-1999
+                    // years get no wiki data at all: no answer key, and no wiki
+                    // solutions — which left the forum's chatter replies as the
+                    // only "solutions" those problems had.
+                    { name: "AJHSME", years: [1985, 1998], testName: "AMC 8" },
+                    { name: "AMC 8", years: [1999, 2026] },
+                ],
+                years: [1985, 2026],
+            },
         },
         {
             name: "AMC 10",
@@ -129,7 +143,22 @@ export const CONTEST_IDS = {
             name: "AIME",
             id: 3416,
             is_official: true,
-            wiki: { variants: ["AIME I", "AIME II"], years: [1983, 2026] },
+            wiki: {
+                variants: [
+                    // The I/II split began in 2000. Before that there was one
+                    // AIME a year, published and stored unsuffixed, so the
+                    // suffixed variants must not inherit the contest-level
+                    // range: "1987 AIME I Problems/Problem 1" is a 404, and
+                    // storing the year under "1987 AIME I" forks a second test
+                    // that never merges onto the forum's "1987 AIME".
+                    // WikiSession.getContest still remaps a pre-2000 "AIME I"
+                    // defensively, for a hand-typed single-year run.
+                    { name: "AIME", years: [1983, 1999] },
+                    { name: "AIME I", years: [2000, 2026] },
+                    { name: "AIME II", years: [2000, 2026] },
+                ],
+                years: [1983, 2026],
+            },
         },
         {
             name: "USAMTS",

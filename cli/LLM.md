@@ -530,7 +530,10 @@ Current solution ingestion remains unchanged:
 - `preprocess` classifies and deduplicates automatic solution candidates while
   preserving manual decisions.
 - `build` selects accepted, non-duplicate canonical solutions and serializes
-  them into `production_problems.official_solutions`.
+  them into `production_problems.official_solutions`. Video solutions
+  (`solution_type = 'video'`) are accepted like any other and included here as
+  their verbatim content; the type exists to exempt them from the `discussion`
+  rule, not to route them anywhere else.
 - `sync-export` carries `official_solutions` into `_import_problems`.
 
 Despite the column name, `official_solutions` currently means accepted canonical
