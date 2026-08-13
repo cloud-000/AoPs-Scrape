@@ -59,6 +59,7 @@ import {
     chmmcFormatMetadata,
     farmlFormatMetadata,
     omoSeasonMetadata,
+    nimoContestMetadata,
 } from "./testMetadata.js";
 
 const PURPLE_LEVELS = { HS: "High School", MS: "Middle School" };
@@ -68,6 +69,9 @@ const HMMT_MONTHS = { feb: "February", nov: "November" };
 // Per OCR-series-folder config. `seriesName` is the canonical DB series name
 // (must match an existing row exactly to reuse it). `parseTest` turns an OCR
 // test folder name into the DB test's { name, year, section, sectionName }.
+// Optional hooks: `splitTests` slices a bundled packet into one test per round
+// (see FARML), and `cleanStatement` strips boilerplate the series' source layout
+// prints inside the problem text (see NIMO's proposer byline).
 export const SERIES_CONFIG = {
     purplecomet: {
         seriesName: "Purple Comet",
@@ -422,6 +426,49 @@ export const SERIES_CONFIG = {
             };
         },
     },
+    nimo: {
+        seriesName: "NIMO",
+        isOfficial: true,
+        // Series default; the Winter Olympiad overrides it below (it is the one
+        // proof-based contest NIMO ran).
+        isComputational: true,
+        // The whole series is OCR'd out of one compendium, whose four sections
+        // are the four contests NIMO ran; the folder is "<year>_<contest>":
+        // "2012_september"       -> "2012 NIMO September"        (monthly)
+        // "2011_summer"          -> "2011 NIMO Summer"
+        // "2015_summer_2"        -> "2015 NIMO Summer 2"         (see below)
+        // "2013_april_fun"       -> "2013 NIMO April Fun Round"
+        // "2011_winter_olympiad" -> "2011 NIMO Winter Olympiad"
+        //
+        // The monthly contest's administration is its month, so the contest
+        // token is one axis (nimoContestMetadata) covering all four kinds. 2015
+        // ran two Summer contests, which comp-OCR distinguishes with a "_2"
+        // suffix; that is a distinct contest and must stay a distinct test, so
+        // the suffix rides into the division label and the name.
+        //
+        // The year is the year the contest was ADMINISTERED, from the
+        // compendium's own heading ("September 15, 2012").
+        parseTest(folder) {
+            const [yearStr, ...rest] = folder.split("_");
+            const year = Number(yearStr);
+            const token = rest.join("_");
+            if (!Number.isInteger(year) || !token) return null;
+            const contest = nimoContestMetadata(token);
+            if (!contest.division) return null;
+            return {
+                name: `${year} NIMO ${contest.division}`,
+                year,
+                section: -1,
+                sectionName: null,
+                // The Winter Olympiad is proof-based; its OCR folder also ships
+                // a test_profile.json declaring proof/not_applicable, and this
+                // raw flag must agree with it (mirrors MPFG's two contests).
+                isComputational: token.toLowerCase() !== NIMO_PROOF_CONTEST,
+                ...contest,
+            };
+        },
+        cleanStatement: stripNimoByline,
+    },
     farml: {
         seriesName: "FARML",
         // A mock ARML (the 2018 packet's own footnote: "F for Fake"), so the
@@ -500,6 +547,39 @@ const FARML_ROUNDS = [
     },
     { token: "tiebreaker", from: 27, to: Infinity },
 ];
+
+// NIMO's one proof contest, whose folder token also names it (see parseTest).
+const NIMO_PROOF_CONTEST = "winter_olympiad";
+
+// Every NIMO problem prints its proposer as a parenthesized byline: leading for
+// the short-answer contests ("*(Evan Chen)* Compute ..."), trailing on its own
+// line for the proof-based Winter Olympiads. That is not incidental OCR noise —
+// comp-OCR *requires* the byline to recognize a problem marker at all (see
+// NimoSeries.match_marker), so it is structurally present in all 407 statements,
+// and it is credit for the problem rather than part of it (the AoPS path strips
+// the same thing, see CleanupText.cleanProblem).
+//
+// The guard is the one the OCR side applies when it decides a parenthetical is a
+// byline: it must contain a letter and no math/digits. That keeps a trailing
+// clarification ("(Note that $1974 = 2 \cdot 3 \cdot 7 \cdot 47$.)", "(The empty
+// product is declared to be 1.)") from being read as a name, and the two sides
+// cannot drift apart on what counts as one.
+const NIMO_BYLINE_LEAD = /^[\s*_]*\(\s*([^)]{1,80}?)\s*\)[*_]*[ \t]*/;
+const NIMO_BYLINE_TRAIL = /\n[ \t]*[*_]*\(\s*([^)]{1,80}?)\s*\)[*_]*$/;
+
+function isNimoByline(text) {
+    return /[A-Za-z]/.test(text) && !/[=+\\^\d]/.test(text);
+}
+
+function stripNimoByline(statement) {
+    if (typeof statement !== "string") return statement;
+    const keepUnlessByline = (match, name) => (isNimoByline(name) ? "" : match);
+    return statement
+        .replace(NIMO_BYLINE_LEAD, keepUnlessByline)
+        .trimEnd()
+        .replace(NIMO_BYLINE_TRAIL, keepUnlessByline)
+        .trim();
+}
 
 // Confidence policy for auto-linking duplicate groups (matches the plan):
 //   similarity >= 1.0            -> auto-accept
@@ -899,7 +979,14 @@ function importTestGroup(db, ctx) {
             db,
             {
                 n,
-                statement: normalizePdfStatement(problems[key]),
+                // A series whose source layout prints boilerplate inside the
+                // problem text (NIMO's proposer byline) strips it first, so the
+                // generic normalizer sees the statement's real start and end.
+                statement: normalizePdfStatement(
+                    cfg.cleanStatement
+                        ? cfg.cleanStatement(problems[key])
+                        : problems[key],
+                ),
                 answer: answers[key] ?? null,
                 source: where,
                 is_computational: isComputational,

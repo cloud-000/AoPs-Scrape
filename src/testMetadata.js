@@ -188,6 +188,37 @@ const OMO_SEASONS = new Map([
     ["fall", { label: "Fall", order: 30 }],
 ]);
 
+// NIMO administrations (the "which division" axis). NIMO ran four kinds of
+// contest under one series: a monthly short-answer contest, a Summer Contest, an
+// April Fun Round, and the proof-based Winter Olympiad. For the monthly contest
+// the administration IS its month, so the months are registered here alongside
+// the three named contests and ordered by the calendar, which is the order a
+// year's contests were run in. Like OMO there is no format axis — every NIMO
+// contest is a single undivided round — so this is the series' only axis.
+const NIMO_CONTESTS = new Map([
+    ["january", { label: "January", order: 10 }],
+    ["february", { label: "February", order: 20 }],
+    ["march", { label: "March", order: 30 }],
+    ["april", { label: "April", order: 40 }],
+    ["may", { label: "May", order: 50 }],
+    ["june", { label: "June", order: 60 }],
+    ["july", { label: "July", order: 70 }],
+    ["august", { label: "August", order: 80 }],
+    ["september", { label: "September", order: 90 }],
+    ["october", { label: "October", order: 100 }],
+    ["november", { label: "November", order: 110 }],
+    ["december", { label: "December", order: 120 }],
+    ["summer", { label: "Summer", order: 130 }],
+    ["april_fun", { label: "April Fun Round", order: 140 }],
+    ["winter_olympiad", { label: "Winter Olympiad", order: 150 }],
+]);
+
+// A NIMO folder token repeated within one year carries a comp-OCR dedup suffix
+// ("2015_summer_2"), which is a real second contest rather than a spelling: the
+// compendium prints "5. Summer 2015" and "6. Summer 2015" as separate contests.
+// The suffix is part of the administration, so it rides into the label.
+const NIMO_REPEAT_RE = /^(.+)_(\d+)$/;
+
 // MPFG splits into two distinct contest types under one umbrella series family.
 // The type is the "which division" axis, so it maps to `division`. No format.
 const MPFG_CONTESTS = new Map([
@@ -558,6 +589,27 @@ export function omoSeasonMetadata(token) {
     return {
         ...emptyTestMetadata(),
         ...(fromEntry("division", OMO_SEASONS.get(token?.toLowerCase())) ?? {}),
+    };
+}
+
+// NIMO administration (a month for the monthly contest, else Summer / April Fun
+// Round / Winter Olympiad) is the "which division" axis, and the only axis NIMO
+// has. A repeated contest keeps its base label plus the repeat's ordinal
+// ("Summer 2") and sorts immediately after the first ("2015 NIMO Summer" then
+// "2015 NIMO Summer 2"). Full base + division.
+export function nimoContestMetadata(token) {
+    const t = token?.toLowerCase() ?? "";
+    const repeat = t.match(NIMO_REPEAT_RE);
+    const entry = NIMO_CONTESTS.get(repeat ? repeat[1] : t);
+    if (!entry) return emptyTestMetadata();
+    if (!repeat) {
+        return { ...emptyTestMetadata(), ...fromEntry("division", entry) };
+    }
+    const nth = Number(repeat[2]);
+    return {
+        ...emptyTestMetadata(),
+        division: `${entry.label} ${nth}`,
+        divisionOrder: entry.order + nth - 1,
     };
 }
 

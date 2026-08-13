@@ -513,5 +513,24 @@ export const RATING_POLICY = {
             range: [1500, 2400],
             curve: "linear",
         },
+
+        // NIMO (National Internet Math Olympiad)
+        // Monthly and Summer contests are computational (AIME to Olympiad-level);
+        // Winter Olympiad is proof-based.
+        {
+            id: "nimo-winter-olympiad",
+            series: "NIMO",
+            division: "Winter Olympiad",
+            range: [1700, 2600],
+            curve: "linear",
+            priority: 200,
+        },
+        {
+            id: "nimo",
+            series: "NIMO",
+            range: [1200, 2300],
+            curve: "linear",
+            priority: 100,
+        },
     ],
 };
